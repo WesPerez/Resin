@@ -174,7 +174,6 @@ func TestCompareLatencies_ComparableTargetDomain(t *testing.T) {
 		"example.com",
 		[]string{"cloudflare.com"},
 		10*time.Minute,
-		node.Zero,
 	)
 	if lat1 != 25*time.Millisecond || lat2 != 55*time.Millisecond {
 		t.Fatalf("unexpected comparable target-domain latencies: got=(%v,%v)", lat1, lat2)
