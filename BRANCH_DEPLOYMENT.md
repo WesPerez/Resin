@@ -16,7 +16,7 @@
 2. Go 格式检查与全量测试。
 3. `internal/proxy`、`internal/routing` race 测试。
 4. entrypoint shell 语法检查。
-5. 构建并推送 amd64/arm64 GHCR 镜像。
+5. 构建并推送生产服务器使用的 amd64 GHCR 镜像。
 
 发布标签：
 
