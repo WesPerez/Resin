@@ -43,6 +43,9 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    cap_add:
+      - SETUID
+      - SETGID
     stop_grace_period: 30s
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://${RESIN_LISTEN_ADDRESS:-172.17.0.1}:${RESIN_PORT:-10834}/healthz >/dev/null || exit 1"]
