@@ -98,6 +98,9 @@ func newControlPlaneTestServerWithBodyLimit(
 			DefaultPlatformReverseProxyEmptyAccountBehavior: "ACCOUNT_HEADER_RULE",
 			DefaultPlatformReverseProxyFixedAccountHeader:   "Authorization",
 			DefaultPlatformAllocationPolicy:                 "BALANCED",
+			ProxyConnectTimeout:                             10 * time.Second,
+			ProxyConnectRetries:                             1,
+			ProxyTunnelFirstByteTimeout:                     12 * time.Second,
 		},
 	}
 
@@ -1155,6 +1158,18 @@ func TestAPIContract_SystemEnvConfigSnapshot(t *testing.T) {
 		t.Fatalf(
 			"default_platform_allocation_policy: got %v, want BALANCED",
 			body["default_platform_allocation_policy"],
+		)
+	}
+	if body["proxy_connect_timeout"] != "10s" {
+		t.Fatalf("proxy_connect_timeout: got %v, want 10s", body["proxy_connect_timeout"])
+	}
+	if body["proxy_connect_retries"] != float64(1) {
+		t.Fatalf("proxy_connect_retries: got %v, want 1", body["proxy_connect_retries"])
+	}
+	if body["proxy_tunnel_first_byte_timeout"] != "12s" {
+		t.Fatalf(
+			"proxy_tunnel_first_byte_timeout: got %v, want 12s",
+			body["proxy_tunnel_first_byte_timeout"],
 		)
 	}
 	if body["admin_token_set"] != false {
