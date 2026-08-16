@@ -375,6 +375,8 @@ RESIN_PORT=2260 \
   - **A**: `LEGACY_V0` is no longer supported. Remove `RESIN_AUTH_VERSION` or set it to `V1`. If you are upgrading from a release that used legacy authentication, see the [v1.0.0 auth migration guide](doc/v1.0.0-migration-guide.md).
 - **Q: Why can't my SOCKS5 client connect?**
   - **A**: If `RESIN_PROXY_TOKEN` is non-empty, the client must send SOCKS5 username/password authentication. If it is explicitly set to an empty string, `NO AUTH` is also allowed.
+- **Q: How can a bad node be replaced during the current connection setup?**
+  - **A**: Set `RESIN_PROXY_CONNECT_TIMEOUT=10s`, `RESIN_PROXY_CONNECT_RETRIES=1`, and `RESIN_PROXY_TUNNEL_FIRST_BYTE_TIMEOUT=10s`. A dial failure excludes the failed node and reselects once before CONNECT/SOCKS reports success. If the client has sent tunnel data but the target returns no bytes for 10 seconds, Resin closes the tunnel and invalidates only the matching sticky lease. The first byte is usually a TLS `ServerHello`, not an LLM token; after any upstream byte arrives, model thinking time does not trigger this timeout. Resin does not buffer or replay encrypted application requests inside the tunnel.
 - **Q: How to write reverse-proxy paths for WebSocket (ws/wss)?**
   - **A**: In the URL path, the protocol field must still be `http` or `https` (not `ws`/`wss`). Resin auto-detects and handles WebSocket upgrade.
 

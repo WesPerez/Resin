@@ -3,6 +3,7 @@ package proxy
 import (
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -203,5 +204,166 @@ func TestPumpPreparedTunnelReader_ClientReadResetAfterIngressDoesNotFail(t *test
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected upstream side to finish")
+	}
+}
+
+func TestPumpPreparedTunnelReader_FirstByteTimeoutClosesTunnel(t *testing.T) {
+	clientConn, clientPeer := net.Pipe()
+	upstreamConn, upstreamPeer := net.Pipe()
+	defer clientPeer.Close()
+	defer upstreamPeer.Close()
+
+	timeoutCh := make(chan struct{}, 1)
+	resultCh := make(chan tunnelRelayResult, 1)
+	go func() {
+		resultCh <- pumpPreparedTunnelReader(
+			clientConn,
+			clientConn,
+			&preparedTunnel{upstreamConn: upstreamConn, recordResult: func(bool) {}},
+			tunnelPumpOptions{
+				firstByteTimeout: 40 * time.Millisecond,
+				onFirstByteTimeout: func() {
+					timeoutCh <- struct{}{}
+				},
+			},
+		)
+	}()
+
+	requestRead := make(chan struct{})
+	go func() {
+		buf := make([]byte, len("client-hello"))
+		_, _ = io.ReadFull(upstreamPeer, buf)
+		close(requestRead)
+	}()
+	if _, err := clientPeer.Write([]byte("client-hello")); err != nil {
+		t.Fatalf("write client payload: %v", err)
+	}
+	<-requestRead
+
+	select {
+	case result := <-resultCh:
+		if result.netOK || result.proxyErr != ErrUpstreamTimeout {
+			t.Fatalf("timeout result: netOK=%v proxyErr=%v", result.netOK, result.proxyErr)
+		}
+		if result.upstreamStage != "connect_first_byte_timeout" {
+			t.Fatalf("timeout stage: got %q", result.upstreamStage)
+		}
+		if result.egressBytes != int64(len("client-hello")) || result.ingressBytes != 0 {
+			t.Fatalf("timeout bytes: ingress=%d egress=%d", result.ingressBytes, result.egressBytes)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first-byte timeout did not close tunnel")
+	}
+
+	select {
+	case <-timeoutCh:
+	default:
+		t.Fatal("expected first-byte timeout callback")
+	}
+}
+
+func TestPumpPreparedTunnelReader_FirstIngressStopsTimeout(t *testing.T) {
+	clientConn, clientPeer := net.Pipe()
+	upstreamConn, upstreamPeer := net.Pipe()
+	defer clientPeer.Close()
+	defer upstreamPeer.Close()
+
+	var firstIngressCalls atomic.Int32
+	var timeoutCalls atomic.Int32
+	resultCh := make(chan tunnelRelayResult, 1)
+	go func() {
+		resultCh <- pumpPreparedTunnelReader(
+			clientConn,
+			clientConn,
+			&preparedTunnel{upstreamConn: upstreamConn, recordResult: func(bool) {}},
+			tunnelPumpOptions{
+				firstByteTimeout:   40 * time.Millisecond,
+				onFirstIngressByte: func() { firstIngressCalls.Add(1) },
+				onFirstByteTimeout: func() { timeoutCalls.Add(1) },
+			},
+		)
+	}()
+
+	go func() {
+		buf := make([]byte, len("request"))
+		_, _ = io.ReadFull(upstreamPeer, buf)
+		_, _ = upstreamPeer.Write([]byte("a"))
+		time.Sleep(90 * time.Millisecond)
+		_, _ = upstreamPeer.Write([]byte("b"))
+		_ = upstreamPeer.Close()
+	}()
+
+	if _, err := clientPeer.Write([]byte("request")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	response, err := io.ReadAll(clientPeer)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if string(response) != "ab" {
+		t.Fatalf("response: got %q, want %q", string(response), "ab")
+	}
+
+	select {
+	case result := <-resultCh:
+		if !result.netOK || result.proxyErr != nil {
+			t.Fatalf("result after first ingress: netOK=%v proxyErr=%v stage=%q", result.netOK, result.proxyErr, result.upstreamStage)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("tunnel did not finish")
+	}
+	if got := firstIngressCalls.Load(); got != 1 {
+		t.Fatalf("first ingress callbacks: got %d, want 1", got)
+	}
+	if got := timeoutCalls.Load(); got != 0 {
+		t.Fatalf("timeout callbacks after ingress: got %d, want 0", got)
+	}
+}
+
+func TestPumpPreparedTunnelReader_FirstByteTimeoutWaitsForClientData(t *testing.T) {
+	clientConn, clientPeer := net.Pipe()
+	upstreamConn, upstreamPeer := net.Pipe()
+	defer clientPeer.Close()
+	defer upstreamPeer.Close()
+
+	var timeoutCalls atomic.Int32
+	resultCh := make(chan tunnelRelayResult, 1)
+	go func() {
+		resultCh <- pumpPreparedTunnelReader(
+			clientConn,
+			clientConn,
+			&preparedTunnel{upstreamConn: upstreamConn, recordResult: func(bool) {}},
+			tunnelPumpOptions{
+				firstByteTimeout:   30 * time.Millisecond,
+				onFirstByteTimeout: func() { timeoutCalls.Add(1) },
+			},
+		)
+	}()
+
+	time.Sleep(70 * time.Millisecond)
+	if got := timeoutCalls.Load(); got != 0 {
+		t.Fatalf("timeout fired before client data: %d", got)
+	}
+
+	go func() {
+		buf := make([]byte, len("request"))
+		_, _ = io.ReadFull(upstreamPeer, buf)
+		_, _ = upstreamPeer.Write([]byte("response"))
+		_ = upstreamPeer.Close()
+	}()
+	if _, err := clientPeer.Write([]byte("request")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	if _, err := io.ReadAll(clientPeer); err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+
+	select {
+	case result := <-resultCh:
+		if !result.netOK {
+			t.Fatalf("idle-before-request tunnel failed: stage=%q err=%v", result.upstreamStage, result.upstreamErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("tunnel did not finish")
 	}
 }

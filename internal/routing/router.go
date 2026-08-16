@@ -78,6 +78,16 @@ const (
 )
 
 func (r *Router) RouteRequest(platName, account, target string) (RouteResult, error) {
+	return r.routeRequest(platName, account, target, node.Zero)
+}
+
+// RouteRequestExcluding routes one request while excluding a node that failed
+// earlier in the same connection attempt.
+func (r *Router) RouteRequestExcluding(platName, account, target string, excluded node.Hash) (RouteResult, error) {
+	return r.routeRequest(platName, account, target, excluded)
+}
+
+func (r *Router) routeRequest(platName, account, target string, excluded node.Hash) (RouteResult, error) {
 	plat, err := r.resolvePlatform(platName)
 	if err != nil {
 		return RouteResult{}, err
@@ -87,9 +97,9 @@ func (r *Router) RouteRequest(platName, account, target string) (RouteResult, er
 	state := r.ensurePlatformState(plat.ID)
 	var result RouteResult
 	if account == "" {
-		result, err = r.routeRandom(plat, state, targetDomain)
+		result, err = r.routeRandom(plat, state, targetDomain, excluded)
 	} else {
-		result, err = r.routeSticky(plat, state, account, targetDomain, time.Now())
+		result, err = r.routeSticky(plat, state, account, targetDomain, time.Now(), excluded)
 	}
 	if err != nil {
 		return RouteResult{}, err
@@ -132,8 +142,9 @@ func (r *Router) routeRandom(
 	plat *platform.Platform,
 	state *PlatformRoutingState,
 	targetDomain string,
+	excluded node.Hash,
 ) (RouteResult, error) {
-	h, entry, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain)
+	h, entry, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain, excluded)
 	if err != nil {
 		return RouteResult{}, err
 	}
@@ -150,6 +161,7 @@ func (r *Router) routeSticky(
 	account string,
 	targetDomain string,
 	now time.Time,
+	excluded node.Hash,
 ) (RouteResult, error) {
 	nowNs := now.UnixNano()
 	var result RouteResult
@@ -165,6 +177,7 @@ func (r *Router) routeSticky(
 			nowNs,
 			current,
 			loaded,
+			excluded,
 		)
 		if err != nil {
 			routeErr = err
@@ -186,6 +199,7 @@ func (r *Router) decideStickyLease(
 	nowNs int64,
 	current Lease,
 	loaded bool,
+	excluded node.Hash,
 ) (Lease, xsync.ComputeOp, RouteResult, error) {
 	hadPreviousLease := loaded
 	invalidation := leaseInvalidationNone
@@ -196,10 +210,10 @@ func (r *Router) decideStickyLease(
 	}
 
 	if loaded {
-		if newLease, hitResult, ok := r.tryLeaseHit(plat, account, current, nowNs); ok {
+		if newLease, hitResult, ok := r.tryLeaseHit(plat, account, current, nowNs, excluded); ok {
 			return newLease, xsync.UpdateOp, hitResult, nil
 		}
-		if newLease, rotatedResult, ok := r.tryLeaseSameIPRotation(plat, account, current, targetDomain, nowNs); ok {
+		if newLease, rotatedResult, ok := r.tryLeaseSameIPRotation(plat, account, current, targetDomain, nowNs, excluded); ok {
 			return newLease, xsync.UpdateOp, rotatedResult, nil
 		}
 		invalidation = leaseInvalidationRemove
@@ -215,6 +229,7 @@ func (r *Router) decideStickyLease(
 		current,
 		hadPreviousLease,
 		invalidation,
+		excluded,
 	)
 }
 
@@ -228,8 +243,9 @@ func (r *Router) createOrAbortStickyLease(
 	previous Lease,
 	hadPreviousLease bool,
 	invalidation leaseInvalidationReason,
+	excluded node.Hash,
 ) (Lease, xsync.ComputeOp, RouteResult, error) {
-	newLease, createdResult, err := r.createLease(plat, state, targetDomain, now, nowNs)
+	newLease, createdResult, err := r.createLease(plat, state, targetDomain, now, nowNs, excluded)
 	if err != nil {
 		r.cleanupPreviousLease(state, previous, hadPreviousLease, invalidation, plat.ID, account)
 		lease, op := abortLeaseCreate(previous, hadPreviousLease)
@@ -253,7 +269,11 @@ func (r *Router) tryLeaseHit(
 	account string,
 	current Lease,
 	nowNs int64,
+	excluded node.Hash,
 ) (Lease, RouteResult, bool) {
+	if current.NodeHash == excluded {
+		return Lease{}, RouteResult{}, false
+	}
 	entry, ok := r.pool.GetEntry(current.NodeHash)
 	if !ok || !plat.View().Contains(current.NodeHash) || entry.GetEgressIP() != current.EgressIP {
 		return Lease{}, RouteResult{}, false
@@ -281,6 +301,7 @@ func (r *Router) tryLeaseSameIPRotation(
 	current Lease,
 	targetDomain string,
 	nowNs int64,
+	excluded node.Hash,
 ) (Lease, RouteResult, bool) {
 	bestHash, ok := chooseSameIPRotationCandidate(
 		plat,
@@ -289,6 +310,7 @@ func (r *Router) tryLeaseSameIPRotation(
 		targetDomain,
 		r.authorities(),
 		r.p2cWindow(),
+		excluded,
 	)
 	if !ok {
 		return Lease{}, RouteResult{}, false
@@ -317,8 +339,9 @@ func (r *Router) createLease(
 	targetDomain string,
 	now time.Time,
 	nowNs int64,
+	excluded node.Hash,
 ) (Lease, RouteResult, error) {
-	h, entry, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain)
+	h, entry, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain, excluded)
 	if err != nil {
 		return Lease{}, RouteResult{}, err
 	}
@@ -392,10 +415,11 @@ func (r *Router) selectLiveRandomRoute(
 	plat *platform.Platform,
 	stats *IPLoadStats,
 	targetDomain string,
+	excluded node.Hash,
 ) (node.Hash, *node.NodeEntry, error) {
 	var lastMissing node.Hash
 	for i := 0; i < livePickAttempts; i++ {
-		h, err := randomRoute(plat, stats, r.pool, targetDomain, r.authorities(), r.p2cWindow())
+		h, err := randomRouteExcluding(plat, stats, r.pool, targetDomain, r.authorities(), r.p2cWindow(), excluded)
 		if err != nil {
 			return node.Zero, nil, err
 		}
@@ -418,12 +442,16 @@ func chooseSameIPRotationCandidate(
 	targetDomain string,
 	authorities []string,
 	window time.Duration,
+	excluded node.Hash,
 ) (node.Hash, bool) {
 	bestKnownHash := node.Zero
 	bestKnownLatency := time.Duration(math.MaxInt64)
 	fallbackHash := node.Zero
 
 	plat.View().Range(func(h node.Hash) bool {
+		if h == excluded {
+			return true
+		}
 		entry, ok := pool.GetEntry(h)
 		if !ok || entry.GetEgressIP() != targetIP {
 			return true
@@ -594,6 +622,28 @@ func (r *Router) DeleteLease(platformID, account string) bool {
 		return false
 	}
 	lease, deleted := state.Leases.DeleteLease(account)
+	if !deleted {
+		return false
+	}
+	r.emitLeaseEvent(LeaseEvent{
+		Type:        LeaseRemove,
+		PlatformID:  platformID,
+		Account:     account,
+		NodeHash:    lease.NodeHash,
+		EgressIP:    lease.EgressIP,
+		CreatedAtNs: lease.CreatedAtNs,
+	})
+	return true
+}
+
+// DeleteLeaseIfNode removes a lease only if it still references expectedNode.
+// Returns false when another request has already replaced the lease.
+func (r *Router) DeleteLeaseIfNode(platformID, account string, expectedNode node.Hash) bool {
+	state, ok := r.states.Load(platformID)
+	if !ok {
+		return false
+	}
+	lease, deleted := state.Leases.DeleteLeaseIfNode(account, expectedNode)
 	if !deleted {
 		return false
 	}

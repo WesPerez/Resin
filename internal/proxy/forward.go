@@ -9,6 +9,7 @@ import (
 	"net/http/httptrace"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/outbound"
@@ -26,6 +27,9 @@ type ForwardProxyConfig struct {
 	OutboundTransport OutboundTransportConfig
 	TransportPool     *OutboundTransportPool
 	ProxyBypassRules  []string
+	ConnectTimeout    time.Duration
+	ConnectRetries    int
+	FirstByteTimeout  time.Duration
 }
 
 // ForwardProxy implements an HTTP forward proxy with Proxy-Authorization
@@ -43,6 +47,9 @@ type ForwardProxy struct {
 	directTransport   *http.Transport
 	directOnce        sync.Once
 	bypass            *TargetBypassMatcher
+	connectTimeout    time.Duration
+	connectRetries    int
+	firstByteTimeout  time.Duration
 }
 
 // NewForwardProxy creates a new forward proxy handler.
@@ -66,6 +73,9 @@ func NewForwardProxy(cfg ForwardProxyConfig) *ForwardProxy {
 		transportConfig: transportCfg,
 		transportPool:   transportPool,
 		bypass:          NewTargetBypassMatcher(cfg.ProxyBypassRules),
+		connectTimeout:  cfg.ConnectTimeout,
+		connectRetries:  cfg.ConnectRetries,
+		firstByteTimeout: cfg.FirstByteTimeout,
 	}
 }
 
@@ -327,11 +337,14 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 	prepare := prepareConnectTunnel(
 		r.Context(),
 		tunnelDeps{
-			router:      p.router,
-			pool:        p.pool,
-			health:      p.health,
-			metricsSink: p.metricsSink,
-			bypass:      p.bypass,
+			router:           p.router,
+			pool:             p.pool,
+			health:           p.health,
+			metricsSink:      p.metricsSink,
+			bypass:           p.bypass,
+			connectTimeout:   p.connectTimeout,
+			connectRetries:   p.connectRetries,
+			firstByteTimeout: p.firstByteTimeout,
 		},
 		platName,
 		account,
@@ -396,7 +409,14 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 	relay := pumpPreparedTunnel(clientConn, clientBuf.Reader, prepare.session, tunnelPumpOptions{
 		requireBidirectionalTraffic: true,
 		onFirstIngressByte:          lifecycle.markFirstByteReceived,
+		firstByteTimeout:            p.firstByteTimeout,
+		onFirstByteTimeout: func() {
+			invalidateTunnelLease(p.router, prepare.route, account)
+		},
 	})
+	if shouldInvalidateTunnelLease(relay) {
+		invalidateTunnelLease(p.router, prepare.route, account)
+	}
 	lifecycle.addIngressBytes(relay.ingressBytes)
 	lifecycle.addEgressBytes(relay.egressBytes)
 	if relay.proxyErr != nil {

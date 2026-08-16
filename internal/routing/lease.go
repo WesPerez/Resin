@@ -85,6 +85,23 @@ func (t *LeaseTable) DeleteLease(account string) (Lease, bool) {
 	return deleted, ok
 }
 
+// DeleteLeaseIfNode removes a lease only when it still points at expectedNode.
+// This prevents an older failed request from deleting a concurrently replaced lease.
+func (t *LeaseTable) DeleteLeaseIfNode(account string, expectedNode node.Hash) (Lease, bool) {
+	var deleted Lease
+	ok := false
+	t.leases.Compute(account, func(oldVal Lease, loaded bool) (Lease, xsync.ComputeOp) {
+		if !loaded || oldVal.NodeHash != expectedNode {
+			return oldVal, xsync.CancelOp
+		}
+		t.stats.Dec(oldVal.EgressIP)
+		deleted = oldVal
+		ok = true
+		return oldVal, xsync.DeleteOp
+	})
+	return deleted, ok
+}
+
 // Size returns the number of leases in the table.
 func (t *LeaseTable) Size() int {
 	return t.leases.Size()

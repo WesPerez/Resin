@@ -422,6 +422,9 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		OutboundTransport: outboundTransportCfg,
 		TransportPool:     a.transportPool,
 		ProxyBypassRules:  a.envCfg.ProxyBypassRules,
+		ConnectTimeout:    a.envCfg.ProxyConnectTimeout,
+		ConnectRetries:    a.envCfg.ProxyConnectRetries,
+		FirstByteTimeout:  a.envCfg.ProxyTunnelFirstByteTimeout,
 	})
 
 	reverseProxy := proxy.NewReverseProxy(proxy.ReverseProxyConfig{
@@ -445,6 +448,9 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		Events:           proxyEvents,
 		MetricsSink:      a.metricsManager,
 		ProxyBypassRules: a.envCfg.ProxyBypassRules,
+		ConnectTimeout:   a.envCfg.ProxyConnectTimeout,
+		ConnectRetries:   a.envCfg.ProxyConnectRetries,
+		FirstByteTimeout: a.envCfg.ProxyTunnelFirstByteTimeout,
 	})
 
 	endpointManager := newEndpointRuntimeManager(

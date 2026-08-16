@@ -44,6 +44,9 @@ type EnvConfig struct {
 	ProxyTransportMaxIdleConns                      int
 	ProxyTransportMaxIdleConnsPerHost               int
 	ProxyTransportIdleConnTimeout                   time.Duration
+	ProxyConnectTimeout                             time.Duration
+	ProxyConnectRetries                             int
+	ProxyTunnelFirstByteTimeout                     time.Duration
 	ProxyBypassRules                                []string
 
 	// Request log
@@ -125,6 +128,9 @@ func LoadEnvConfig() (*EnvConfig, error) {
 	cfg.ProxyTransportMaxIdleConns = envInt("RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS", 1024, &errs)
 	cfg.ProxyTransportMaxIdleConnsPerHost = envInt("RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS_PER_HOST", 64, &errs)
 	cfg.ProxyTransportIdleConnTimeout = envDuration("RESIN_PROXY_TRANSPORT_IDLE_CONN_TIMEOUT", 90*time.Second, &errs)
+	cfg.ProxyConnectTimeout = envDuration("RESIN_PROXY_CONNECT_TIMEOUT", 0, &errs)
+	cfg.ProxyConnectRetries = envInt("RESIN_PROXY_CONNECT_RETRIES", 0, &errs)
+	cfg.ProxyTunnelFirstByteTimeout = envDuration("RESIN_PROXY_TUNNEL_FIRST_BYTE_TIMEOUT", 0, &errs)
 	cfg.ProxyBypassRules = envDelimitedStringSlice("RESIN_PROXY_BYPASS", []string{})
 
 	// --- Request log ---
@@ -283,6 +289,15 @@ func LoadEnvConfig() (*EnvConfig, error) {
 			errs,
 			"RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS_PER_HOST must be less than or equal to RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS",
 		)
+	}
+	if cfg.ProxyConnectTimeout < 0 {
+		errs = append(errs, "RESIN_PROXY_CONNECT_TIMEOUT must be non-negative")
+	}
+	if cfg.ProxyConnectRetries < 0 || cfg.ProxyConnectRetries > 1 {
+		errs = append(errs, "RESIN_PROXY_CONNECT_RETRIES must be 0 or 1")
+	}
+	if cfg.ProxyTunnelFirstByteTimeout < 0 {
+		errs = append(errs, "RESIN_PROXY_TUNNEL_FIRST_BYTE_TIMEOUT must be non-negative")
 	}
 	validatePositive("RESIN_REQUEST_LOG_QUEUE_SIZE", cfg.RequestLogQueueSize, &errs)
 	validatePositive("RESIN_REQUEST_LOG_QUEUE_FLUSH_BATCH_SIZE", cfg.RequestLogQueueFlushBatchSize, &errs)
