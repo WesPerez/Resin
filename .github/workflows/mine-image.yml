@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -43,7 +45,11 @@ jobs:
       - name: Check Go formatting
         shell: bash
         run: |
-          mapfile -t go_files < <(git ls-files '*.go')
+          git fetch origin master:refs/remotes/origin/master
+          mapfile -t go_files < <(git diff --name-only --diff-filter=ACMR origin/master...HEAD -- '*.go')
+          if (( ${#go_files[@]} == 0 )); then
+            exit 0
+          fi
           mapfile -t unformatted < <(gofmt -l "${go_files[@]}")
           if (( ${#unformatted[@]} > 0 )); then
             printf '%s\n' "${unformatted[@]}"

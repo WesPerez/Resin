@@ -64,17 +64,17 @@ func NewForwardProxy(cfg ForwardProxyConfig) *ForwardProxy {
 		transportPool = NewOutboundTransportPool(transportCfg)
 	}
 	return &ForwardProxy{
-		token:           cfg.ProxyToken,
-		router:          cfg.Router,
-		pool:            cfg.Pool,
-		health:          cfg.Health,
-		events:          ev,
-		metricsSink:     cfg.MetricsSink,
-		transportConfig: transportCfg,
-		transportPool:   transportPool,
-		bypass:          NewTargetBypassMatcher(cfg.ProxyBypassRules),
-		connectTimeout:  cfg.ConnectTimeout,
-		connectRetries:  cfg.ConnectRetries,
+		token:            cfg.ProxyToken,
+		router:           cfg.Router,
+		pool:             cfg.Pool,
+		health:           cfg.Health,
+		events:           ev,
+		metricsSink:      cfg.MetricsSink,
+		transportConfig:  transportCfg,
+		transportPool:    transportPool,
+		bypass:           NewTargetBypassMatcher(cfg.ProxyBypassRules),
+		connectTimeout:   cfg.ConnectTimeout,
+		connectRetries:   cfg.ConnectRetries,
 		firstByteTimeout: cfg.FirstByteTimeout,
 	}
 }
