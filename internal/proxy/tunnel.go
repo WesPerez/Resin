@@ -202,7 +202,7 @@ func prepareConnectTunnel(
 				upstreamStage: "connect_dial",
 				upstreamErr:   err,
 			}
-		excluded = append(excluded, routed.Route.NodeHash)
+			excluded = append(excluded, routed.Route.NodeHash)
 			if attempt+1 < attempts {
 				log.Printf(
 					"proxy connect retry: platform_id=%s failed_node_hash=%s next_attempt=%d/%d",
