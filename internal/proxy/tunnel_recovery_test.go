@@ -106,6 +106,55 @@ func TestPrepareConnectTunnel_TwoFailuresAreBoundedAndDistinct(t *testing.T) {
 	}
 }
 
+func TestPrepareConnectTunnel_ThreeAttemptsExcludeEveryFailedNode(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	firstRaw := json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":1}`)
+	firstHash := node.HashFromRawOptions(firstRaw)
+
+	var calls atomic.Int32
+	calledNodes := make(chan node.Hash, 3)
+	upstreamConn, upstreamPeer := net.Pipe()
+	defer upstreamPeer.Close()
+	dialFor := func(hash node.Hash) func(context.Context, string, M.Socksaddr) (net.Conn, error) {
+		return func(context.Context, string, M.Socksaddr) (net.Conn, error) {
+			calledNodes <- hash
+			if calls.Add(1) < 3 {
+				return nil, errors.New("dial failed")
+			}
+			return upstreamConn, nil
+		}
+	}
+	setProxyE2EOutboundDialFunc(t, env, dialFor(firstHash))
+	secondRaw := json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":2}`)
+	secondHash := node.HashFromRawOptions(secondRaw)
+	addProxyE2ENode(t, env, secondRaw, "203.0.113.11", dialFor(secondHash))
+	thirdRaw := json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":3}`)
+	thirdHash := node.HashFromRawOptions(thirdRaw)
+	addProxyE2ENode(t, env, thirdRaw, "203.0.113.12", dialFor(thirdHash))
+
+	result := prepareConnectTunnel(context.Background(), tunnelDeps{
+		router:         env.router,
+		pool:           env.pool,
+		health:         env.pool,
+		connectRetries: 2,
+	}, "plat", "acct-three-attempts", "example.com:443")
+	if result.session == nil {
+		t.Fatalf("expected third attempt to succeed, got error=%v stage=%q", result.upstreamErr, result.upstreamStage)
+	}
+	defer result.session.upstreamConn.Close()
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("dial calls: got %d, want 3", got)
+	}
+
+	seen := make(map[node.Hash]struct{}, 3)
+	for i := 0; i < 3; i++ {
+		seen[<-calledNodes] = struct{}{}
+	}
+	if len(seen) != 3 {
+		t.Fatalf("attempts reused a failed node: distinct=%d, want 3", len(seen))
+	}
+}
+
 func TestPrepareConnectTunnel_ContextCanceledDoesNotRetry(t *testing.T) {
 	env := newProxyE2EEnv(t)
 	var calls atomic.Int32

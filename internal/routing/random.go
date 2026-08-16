@@ -46,8 +46,8 @@ func randomRoute(
 	return pickRandomRoute(size, pick, plat, stats, pool, targetDomain, authorities, p2cWindow)
 }
 
-// randomRouteExcluding selects from the routable view while skipping one
-// request-local failed node. The normal hot path remains allocation-free.
+// randomRouteExcluding selects from the routable view while skipping the
+// request-local failed nodes. The normal hot path remains allocation-free.
 func randomRouteExcluding(
 	plat *platform.Platform,
 	stats *IPLoadStats,
@@ -55,15 +55,15 @@ func randomRouteExcluding(
 	targetDomain string,
 	authorities []string,
 	p2cWindow time.Duration,
-	excluded node.Hash,
+	excluded nodeExclusionSet,
 ) (node.Hash, error) {
-	if excluded.IsZero() {
+	if len(excluded) == 0 {
 		return randomRoute(plat, stats, pool, targetDomain, authorities, p2cWindow)
 	}
 
 	candidates := make([]node.Hash, 0, plat.View().Size())
 	plat.View().Range(func(h node.Hash) bool {
-		if h != excluded {
+		if !excluded.contains(h) {
 			candidates = append(candidates, h)
 		}
 		return true

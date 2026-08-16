@@ -150,14 +150,14 @@ func prepareConnectTunnel(
 	}
 
 	domain := netutil.ExtractDomain(target)
-	excluded := node.Zero
 	retries := deps.connectRetries
 	if retries < 0 {
 		retries = 0
 	}
-	if retries > 1 {
-		retries = 1
+	if retries > 2 {
+		retries = 2
 	}
+	excluded := make([]node.Hash, 0, retries)
 	attempts := retries + 1
 	var lastFailure tunnelPrepareResult
 	for attempt := 0; attempt < attempts; attempt++ {
@@ -202,7 +202,7 @@ func prepareConnectTunnel(
 				upstreamStage: "connect_dial",
 				upstreamErr:   err,
 			}
-			excluded = routed.Route.NodeHash
+		excluded = append(excluded, routed.Route.NodeHash)
 			if attempt+1 < attempts {
 				log.Printf(
 					"proxy connect retry: platform_id=%s failed_node_hash=%s next_attempt=%d/%d",

@@ -293,8 +293,8 @@ func LoadEnvConfig() (*EnvConfig, error) {
 	if cfg.ProxyConnectTimeout < 0 {
 		errs = append(errs, "RESIN_PROXY_CONNECT_TIMEOUT must be non-negative")
 	}
-	if cfg.ProxyConnectRetries < 0 || cfg.ProxyConnectRetries > 1 {
-		errs = append(errs, "RESIN_PROXY_CONNECT_RETRIES must be 0 or 1")
+	if cfg.ProxyConnectRetries < 0 || cfg.ProxyConnectRetries > 2 {
+		errs = append(errs, "RESIN_PROXY_CONNECT_RETRIES must be between 0 and 2")
 	}
 	if cfg.ProxyTunnelFirstByteTimeout < 0 {
 		errs = append(errs, "RESIN_PROXY_TUNNEL_FIRST_BYTE_TIMEOUT must be non-negative")

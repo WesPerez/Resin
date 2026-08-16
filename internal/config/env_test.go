@@ -122,7 +122,7 @@ func TestLoadEnvConfig_EnvOverrides(t *testing.T) {
 	envs["RESIN_PROXY_TRANSPORT_MAX_IDLE_CONNS_PER_HOST"] = "128"
 	envs["RESIN_PROXY_TRANSPORT_IDLE_CONN_TIMEOUT"] = "2m"
 	envs["RESIN_PROXY_CONNECT_TIMEOUT"] = "10s"
-	envs["RESIN_PROXY_CONNECT_RETRIES"] = "1"
+	envs["RESIN_PROXY_CONNECT_RETRIES"] = "2"
 	envs["RESIN_PROXY_TUNNEL_FIRST_BYTE_TIMEOUT"] = "10s"
 	envs["RESIN_PROXY_BYPASS"] = "localhost;127.*; 192.168.*\n<local>,10.0.0.0/8"
 	envs["RESIN_REQUEST_LOG_QUEUE_FLUSH_INTERVAL"] = "10m"
@@ -168,7 +168,7 @@ func TestLoadEnvConfig_EnvOverrides(t *testing.T) {
 	assertEqual(t, "ProxyTransportMaxIdleConnsPerHost", cfg.ProxyTransportMaxIdleConnsPerHost, 128)
 	assertEqual(t, "ProxyTransportIdleConnTimeout", cfg.ProxyTransportIdleConnTimeout, 2*time.Minute)
 	assertEqual(t, "ProxyConnectTimeout", cfg.ProxyConnectTimeout, 10*time.Second)
-	assertEqual(t, "ProxyConnectRetries", cfg.ProxyConnectRetries, 1)
+	assertEqual(t, "ProxyConnectRetries", cfg.ProxyConnectRetries, 2)
 	assertEqual(t, "ProxyTunnelFirstByteTimeout", cfg.ProxyTunnelFirstByteTimeout, 10*time.Second)
 	assertEqual(t, "ProxyBypassRulesLength", len(cfg.ProxyBypassRules), 5)
 	assertEqual(t, "ProxyBypassRules[0]", cfg.ProxyBypassRules[0], "localhost")
@@ -603,7 +603,7 @@ func TestLoadEnvConfig_InvalidProxyRecoverySettings(t *testing.T) {
 		value string
 	}{
 		{name: "negative connect timeout", key: "RESIN_PROXY_CONNECT_TIMEOUT", value: "-1s"},
-		{name: "too many retries", key: "RESIN_PROXY_CONNECT_RETRIES", value: "2"},
+		{name: "too many retries", key: "RESIN_PROXY_CONNECT_RETRIES", value: "3"},
 		{name: "negative first byte timeout", key: "RESIN_PROXY_TUNNEL_FIRST_BYTE_TIMEOUT", value: "-1s"},
 	}
 

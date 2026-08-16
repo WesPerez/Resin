@@ -237,7 +237,7 @@ func TestChooseSameIPRotationCandidate_PicksLowestLatency(t *testing.T) {
 		"example.com",
 		[]string{"cloudflare.com"},
 		10*time.Minute,
-		node.Zero,
+		nil,
 	)
 	if !ok {
 		t.Fatal("expected same-ip rotation candidate")

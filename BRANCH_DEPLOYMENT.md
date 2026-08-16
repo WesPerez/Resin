@@ -48,12 +48,12 @@ Token 通过 `RESIN_ADMIN_TOKEN_FILE`、`RESIN_PROXY_TOKEN_FILE` 读取，不写
 
 ```dotenv
 RESIN_PROXY_CONNECT_TIMEOUT=10s
-RESIN_PROXY_CONNECT_RETRIES=1
+RESIN_PROXY_CONNECT_RETRIES=2
 RESIN_PROXY_TUNNEL_FIRST_BYTE_TIMEOUT=10s
 ```
 
-- 拨号失败只在 CONNECT/SOCKS 成功响应前重选一次，不缓存请求体。
-- 重选保留 Platform/Account 逻辑身份，并排除本次失败的物理节点。
+- 拨号失败只在 CONNECT/SOCKS 成功响应前最多重选两次，总计三个物理节点，不缓存请求体。
+- 重选保留 Platform/Account 逻辑身份，并排除本次连接中所有已经失败的物理节点。
 - lease 删除使用 expected `node_hash` 比较，旧失败请求不能删除并发产生的新 lease。
 - 客户端开始发送隧道数据后，10 秒没有任何上游字节才关闭连接并失效旧 lease。
 - 收到任意上游字节后不再使用该超时；模型首 token 或长推理不属于 Resin 的判断范围。

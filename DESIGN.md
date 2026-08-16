@@ -2340,7 +2340,7 @@ GeoIP 与订阅的下载都有错误重试的需求。
   * 默认端口由传输类型决定：UDP/TCP 为 53，DoT/DoQ 为 853，DoH/H3 为 443；DoH/H3 默认路径为 `/dns-query`。
 * `RESIN_PROXY_BYPASS`：不走代理节点的目标规则，默认空。用分号、逗号或换行分隔；命中规则的 HTTP 正向代理、SOCKS5 正向代理与反向代理请求会由 Resin 本机直连目标。支持精确主机、`*`/`?` 通配符、CIDR 网段与 `<local>`（无点号本地域名），例如 `localhost;127.*;10.*;172.16.0.0/12;192.168.*;<local>`。
 * `RESIN_PROXY_CONNECT_TIMEOUT`：HTTP CONNECT 与 SOCKS5 上游节点单次拨号上限，默认 `0`（关闭）。超时只覆盖隧道成功响应之前的拨号阶段。
-* `RESIN_PROXY_CONNECT_RETRIES`：拨号失败后排除该节点并重新选择的次数，只允许 `0` 或 `1`，默认 `0`。重选发生在 CONNECT/SOCKS 成功响应之前，不缓存或重放业务请求体。
+* `RESIN_PROXY_CONNECT_RETRIES`：拨号失败后排除本次连接中全部已失败节点并重新选择的次数，只允许 `0` 到 `2`，默认 `0`。重选发生在 CONNECT/SOCKS 成功响应之前，不缓存或重放业务请求体。
 * `RESIN_PROXY_TUNNEL_FIRST_BYTE_TIMEOUT`：客户端开始向已建立隧道发送数据后，等待目标返回第一批字节的上限，默认 `0`（关闭）。超时会关闭隧道并按预期 `node_hash` 精确失效旧粘性租约，但 Resin 不重放加密数据；收到任意上游字节后永久解除本次隧道的该超时。
 
 日志相关配置：

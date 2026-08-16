@@ -19,7 +19,7 @@ func resolveRoutedOutbound(
 	account string,
 	target string,
 ) (routedOutbound, *ProxyError) {
-	return resolveRoutedOutboundExcluding(router, pool, platformName, account, target, node.Zero)
+	return resolveRoutedOutboundExcluding(router, pool, platformName, account, target, nil)
 }
 
 func resolveRoutedOutboundExcluding(
@@ -28,9 +28,9 @@ func resolveRoutedOutboundExcluding(
 	platformName string,
 	account string,
 	target string,
-	excluded node.Hash,
+	excluded []node.Hash,
 ) (routedOutbound, *ProxyError) {
-	result, err := router.RouteRequestExcluding(platformName, account, target, excluded)
+	result, err := router.RouteRequestExcludingNodes(platformName, account, target, excluded)
 	if err != nil {
 		return routedOutbound{}, mapRouteError(err)
 	}

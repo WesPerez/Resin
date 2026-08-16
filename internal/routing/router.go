@@ -78,16 +78,48 @@ const (
 )
 
 func (r *Router) RouteRequest(platName, account, target string) (RouteResult, error) {
-	return r.routeRequest(platName, account, target, node.Zero)
+	return r.routeRequest(platName, account, target, nil)
 }
 
 // RouteRequestExcluding routes one request while excluding a node that failed
 // earlier in the same connection attempt.
 func (r *Router) RouteRequestExcluding(platName, account, target string, excluded node.Hash) (RouteResult, error) {
-	return r.routeRequest(platName, account, target, excluded)
+	if excluded.IsZero() {
+		return r.routeRequest(platName, account, target, nil)
+	}
+	return r.routeRequest(platName, account, target, nodeExclusionSet{excluded: struct{}{}})
 }
 
-func (r *Router) routeRequest(platName, account, target string, excluded node.Hash) (RouteResult, error) {
+// RouteRequestExcludingNodes routes one request while excluding every node
+// that already failed during the same bounded connection attempt.
+func (r *Router) RouteRequestExcludingNodes(platName, account, target string, excluded []node.Hash) (RouteResult, error) {
+	return r.routeRequest(platName, account, target, newNodeExclusionSet(excluded))
+}
+
+type nodeExclusionSet map[node.Hash]struct{}
+
+func newNodeExclusionSet(nodes []node.Hash) nodeExclusionSet {
+	if len(nodes) == 0 {
+		return nil
+	}
+	excluded := make(nodeExclusionSet, len(nodes))
+	for _, hash := range nodes {
+		if !hash.IsZero() {
+			excluded[hash] = struct{}{}
+		}
+	}
+	return excluded
+}
+
+func (s nodeExclusionSet) contains(hash node.Hash) bool {
+	if len(s) == 0 || hash.IsZero() {
+		return false
+	}
+	_, ok := s[hash]
+	return ok
+}
+
+func (r *Router) routeRequest(platName, account, target string, excluded nodeExclusionSet) (RouteResult, error) {
 	plat, err := r.resolvePlatform(platName)
 	if err != nil {
 		return RouteResult{}, err
@@ -142,7 +174,7 @@ func (r *Router) routeRandom(
 	plat *platform.Platform,
 	state *PlatformRoutingState,
 	targetDomain string,
-	excluded node.Hash,
+	excluded nodeExclusionSet,
 ) (RouteResult, error) {
 	h, entry, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain, excluded)
 	if err != nil {
@@ -161,7 +193,7 @@ func (r *Router) routeSticky(
 	account string,
 	targetDomain string,
 	now time.Time,
-	excluded node.Hash,
+	excluded nodeExclusionSet,
 ) (RouteResult, error) {
 	nowNs := now.UnixNano()
 	var result RouteResult
@@ -199,7 +231,7 @@ func (r *Router) decideStickyLease(
 	nowNs int64,
 	current Lease,
 	loaded bool,
-	excluded node.Hash,
+	excluded nodeExclusionSet,
 ) (Lease, xsync.ComputeOp, RouteResult, error) {
 	hadPreviousLease := loaded
 	invalidation := leaseInvalidationNone
@@ -243,7 +275,7 @@ func (r *Router) createOrAbortStickyLease(
 	previous Lease,
 	hadPreviousLease bool,
 	invalidation leaseInvalidationReason,
-	excluded node.Hash,
+	excluded nodeExclusionSet,
 ) (Lease, xsync.ComputeOp, RouteResult, error) {
 	newLease, createdResult, err := r.createLease(plat, state, targetDomain, now, nowNs, excluded)
 	if err != nil {
@@ -269,9 +301,9 @@ func (r *Router) tryLeaseHit(
 	account string,
 	current Lease,
 	nowNs int64,
-	excluded node.Hash,
+	excluded nodeExclusionSet,
 ) (Lease, RouteResult, bool) {
-	if current.NodeHash == excluded {
+	if excluded.contains(current.NodeHash) {
 		return Lease{}, RouteResult{}, false
 	}
 	entry, ok := r.pool.GetEntry(current.NodeHash)
@@ -301,7 +333,7 @@ func (r *Router) tryLeaseSameIPRotation(
 	current Lease,
 	targetDomain string,
 	nowNs int64,
-	excluded node.Hash,
+	excluded nodeExclusionSet,
 ) (Lease, RouteResult, bool) {
 	bestHash, ok := chooseSameIPRotationCandidate(
 		plat,
@@ -339,7 +371,7 @@ func (r *Router) createLease(
 	targetDomain string,
 	now time.Time,
 	nowNs int64,
-	excluded node.Hash,
+	excluded nodeExclusionSet,
 ) (Lease, RouteResult, error) {
 	h, entry, err := r.selectLiveRandomRoute(plat, state.IPLoadStats, targetDomain, excluded)
 	if err != nil {
@@ -415,7 +447,7 @@ func (r *Router) selectLiveRandomRoute(
 	plat *platform.Platform,
 	stats *IPLoadStats,
 	targetDomain string,
-	excluded node.Hash,
+	excluded nodeExclusionSet,
 ) (node.Hash, *node.NodeEntry, error) {
 	var lastMissing node.Hash
 	for i := 0; i < livePickAttempts; i++ {
@@ -442,14 +474,14 @@ func chooseSameIPRotationCandidate(
 	targetDomain string,
 	authorities []string,
 	window time.Duration,
-	excluded node.Hash,
+	excluded nodeExclusionSet,
 ) (node.Hash, bool) {
 	bestKnownHash := node.Zero
 	bestKnownLatency := time.Duration(math.MaxInt64)
 	fallbackHash := node.Zero
 
 	plat.View().Range(func(h node.Hash) bool {
-		if h == excluded {
+		if excluded.contains(h) {
 			return true
 		}
 		entry, ok := pool.GetEntry(h)
