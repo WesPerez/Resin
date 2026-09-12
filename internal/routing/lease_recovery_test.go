@@ -84,15 +84,22 @@ func TestDeleteLeaseIfGeneration_DoesNotDeleteReusedNode(t *testing.T) {
 func TestRotateLease_ExcludesOldNodeAndEgressIP(t *testing.T) {
 	pool, subMgr := setupPool(t)
 	h1 := makeRoutableNode(t, pool, subMgr, `{"node":"1"}`, "198.51.100.10", "cloudflare.com", 10*time.Millisecond)
-	h2 := makeRoutableNode(t, pool, subMgr, `{"node":"2"}`, "198.51.100.10", "cloudflare.com", 20*time.Millisecond)
+	makeRoutableNode(t, pool, subMgr, `{"node":"2"}`, "198.51.100.10", "cloudflare.com", 20*time.Millisecond)
 	h3 := makeRoutableNode(t, pool, subMgr, `{"node":"3"}`, "198.51.100.20", "cloudflare.com", 50*time.Millisecond)
 
 	router := makeRouter(pool, nil)
+	now := time.Now().UnixNano()
+	if err := router.UpsertLease(model.Lease{
+		PlatformID: platID, Account: "acct-egress", NodeHash: h1.Hex(), EgressIP: "198.51.100.10",
+		CreatedAtNs: now, ExpiryNs: now + int64(time.Hour), LastAccessedNs: now,
+	}); err != nil {
+		t.Fatalf("seed initial lease: %v", err)
+	}
 	res, err := router.RouteRequest(platName, "acct-egress", "cloudflare.com")
 	if err != nil {
 		t.Fatalf("initial route failed: %v", err)
 	}
-	if res.NodeHash != h1 && res.NodeHash != h2 {
+	if res.NodeHash != h1 {
 		t.Fatalf("expected initial node with egress IP 198.51.100.10, got %s", res.NodeHash.Hex())
 	}
 
