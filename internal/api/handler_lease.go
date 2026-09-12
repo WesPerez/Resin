@@ -149,6 +149,38 @@ func HandleDeleteLease(cp *service.ControlPlaneService) http.HandlerFunc {
 	}
 }
 
+func HandleRotateLease(cp *service.ControlPlaneService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		platformID, ok := requireUUIDPathParam(w, r, "id", "platform_id")
+		if !ok {
+			return
+		}
+		account, err := validateAccountPath(r)
+		if err != nil {
+			writeServiceError(w, err)
+			return
+		}
+		var req service.RotateLeaseRequest
+		if err := DecodeBody(r, &req); err != nil {
+			writeDecodeBodyError(w, err)
+			return
+		}
+		result, err := cp.RotateLease(platformID, account, req)
+		if err != nil {
+			writeServiceError(w, err)
+			return
+		}
+		status := http.StatusOK
+		switch result.Status {
+		case "stale_lease":
+			status = http.StatusConflict
+		case "no_alternative":
+			status = http.StatusUnprocessableEntity
+		}
+		WriteJSON(w, status, result)
+	}
+}
+
 // HandleDeleteAllLeases returns a handler for DELETE /api/v1/platforms/{id}/leases.
 func HandleDeleteAllLeases(cp *service.ControlPlaneService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {

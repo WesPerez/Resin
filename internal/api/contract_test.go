@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,7 @@ import (
 	"github.com/Resinat/Resin/internal/metrics"
 	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/outbound"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/proxy"
 	"github.com/Resinat/Resin/internal/requestlog"
@@ -181,6 +183,57 @@ func mustCreatePlatform(t *testing.T, srv *Server, name string) string {
 		t.Fatalf("create platform missing id: body=%s", rec.Body.String())
 	}
 	return id
+}
+
+func addRoutableLeaseNode(
+	t *testing.T,
+	cp *service.ControlPlaneService,
+	sub *subscription.Subscription,
+	raw json.RawMessage,
+	ip string,
+	latency time.Duration,
+) node.Hash {
+	t.Helper()
+	hash := node.HashFromRawOptions(raw)
+	sub.ManagedNodes().StoreNode(hash, subscription.ManagedNode{Tags: []string{"tag"}})
+	cp.Pool.AddNodeFromSub(hash, raw, sub.ID)
+	entry, ok := cp.Pool.GetEntry(hash)
+	if !ok {
+		t.Fatalf("node %s not in pool after add", hash.Hex())
+	}
+	outbound.NewOutboundManager(cp.Pool, &testutil.StubOutboundBuilder{}).EnsureNodeOutbound(hash)
+	entry.SetEgressIP(netip.MustParseAddr(ip))
+	entry.LatencyTable.Update("cloudflare.com", latency, 10*time.Minute)
+	cp.Pool.RecordResult(hash, true)
+	cp.Pool.NotifyNodeDirty(hash)
+	return hash
+}
+
+func seedRotateLease(
+	t *testing.T,
+	srv *Server,
+	cp *service.ControlPlaneService,
+	name string,
+	nodeCount int,
+) (string, string, service.LeaseResponse) {
+	t.Helper()
+	platformID := mustCreatePlatform(t, srv, name)
+	sub := subscription.NewSubscription("sub-"+name, "Sub "+name, "https://example.com/"+name, true, false)
+	cp.SubMgr.Register(sub)
+	for i := 0; i < nodeCount; i++ {
+		raw := json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":` + strconv.Itoa(10000+i) + `}`)
+		addRoutableLeaseNode(t, cp, sub, raw, "198.51.100."+strconv.Itoa(10+i), time.Duration(i+1)*time.Millisecond)
+	}
+	cp.Pool.RebuildAllPlatforms()
+	account := "acct-rotate"
+	if _, err := cp.Router.RouteRequest(name, account, "cloudflare.com:443"); err != nil {
+		t.Fatalf("seed route: %v", err)
+	}
+	lease, err := cp.GetLease(platformID, account)
+	if err != nil {
+		t.Fatalf("get seeded lease: %v", err)
+	}
+	return platformID, account, *lease
 }
 
 type contractRuntimeStats struct {
@@ -417,6 +470,133 @@ func TestAPIContract_RequestBodyTooLarge(t *testing.T) {
 		t.Fatalf("status: got %d, want %d, body=%s", rec.Code, http.StatusRequestEntityTooLarge, rec.Body.String())
 	}
 	assertErrorCode(t, rec, "PAYLOAD_TOO_LARGE")
+}
+
+func TestAPIContract_RotateLease(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		srv, cp, _ := newControlPlaneTestServer(t)
+		platformID, account, before := seedRotateLease(t, srv, cp, "rotate-success", 2)
+		rec := doJSONRequest(t, srv, http.MethodPost, "/api/v1/platforms/"+platformID+"/leases/"+account+"/rotate", map[string]any{
+			"expected_node_hash":     before.NodeHash,
+			"expected_created_at_ns": before.CreatedAtNs,
+			"target_host":            "cloudflare.com:443",
+			"exclude_egress_ip":      true,
+		}, true)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status: got %d, want %d, body=%s", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		body := decodeJSONMap(t, rec)
+		if body["status"] != "rotated" {
+			t.Fatalf("status body: got %v, body=%s", body["status"], rec.Body.String())
+		}
+		lease, ok := body["lease"].(map[string]any)
+		if !ok {
+			t.Fatalf("lease body: got %T, body=%s", body["lease"], rec.Body.String())
+		}
+		if lease["node_hash"] == before.NodeHash || lease["egress_ip"] == before.EgressIP {
+			t.Fatalf("rotation did not change node and egress IP: before=%+v body=%s", before, rec.Body.String())
+		}
+		if lease["created_at_ns"] == before.CreatedAtNs {
+			t.Fatalf("rotation did not change lease generation: body=%s", rec.Body.String())
+		}
+	})
+
+	t.Run("stale lease is conflict", func(t *testing.T) {
+		srv, cp, _ := newControlPlaneTestServer(t)
+		platformID, account, before := seedRotateLease(t, srv, cp, "rotate-stale", 2)
+		rec := doJSONRequest(t, srv, http.MethodPost, "/api/v1/platforms/"+platformID+"/leases/"+account+"/rotate", map[string]any{
+			"expected_node_hash":     before.NodeHash,
+			"expected_created_at_ns": "1",
+			"target_host":            "cloudflare.com",
+		}, true)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("status: got %d, want %d, body=%s", rec.Code, http.StatusConflict, rec.Body.String())
+		}
+		if body := decodeJSONMap(t, rec); body["status"] != "stale_lease" {
+			t.Fatalf("status body: got %v, body=%s", body["status"], rec.Body.String())
+		}
+	})
+
+	t.Run("no alternative is unprocessable and retains lease", func(t *testing.T) {
+		srv, cp, _ := newControlPlaneTestServer(t)
+		platformID, account, before := seedRotateLease(t, srv, cp, "rotate-single", 1)
+		rec := doJSONRequest(t, srv, http.MethodPost, "/api/v1/platforms/"+platformID+"/leases/"+account+"/rotate", map[string]any{
+			"expected_node_hash":     before.NodeHash,
+			"expected_created_at_ns": before.CreatedAtNs,
+			"target_host":            "cloudflare.com",
+		}, true)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status: got %d, want %d, body=%s", rec.Code, http.StatusUnprocessableEntity, rec.Body.String())
+		}
+		if body := decodeJSONMap(t, rec); body["status"] != "no_alternative" {
+			t.Fatalf("status body: got %v, body=%s", body["status"], rec.Body.String())
+		}
+		after, err := cp.GetLease(platformID, account)
+		if err != nil || after.NodeHash != before.NodeHash || after.CreatedAtNs != before.CreatedAtNs {
+			t.Fatalf("original lease was not retained: before=%+v after=%+v err=%v", before, after, err)
+		}
+	})
+}
+
+func TestAPIContract_RotateLeaseNotFoundAndValidation(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+	platformID := mustCreatePlatform(t, srv, "rotate-errors")
+	validHash := node.HashFromRawOptions([]byte(`{"node":"valid"}`)).Hex()
+	validBody := map[string]any{
+		"expected_node_hash":     validHash,
+		"expected_created_at_ns": "1",
+		"target_host":            "cloudflare.com",
+	}
+
+	tests := []struct {
+		name    string
+		path    string
+		body    any
+		want    int
+		code    string
+		message string
+	}{
+		{name: "platform absent", path: "/api/v1/platforms/00000000-0000-0000-0000-000000000001/leases/acct/rotate", body: validBody, want: http.StatusNotFound, code: "NOT_FOUND", message: "platform not found"},
+		{name: "lease absent", path: "/api/v1/platforms/" + platformID + "/leases/acct/rotate", body: validBody, want: http.StatusNotFound, code: "NOT_FOUND", message: "lease not found"},
+		{name: "invalid platform id", path: "/api/v1/platforms/not-a-uuid/leases/acct/rotate", body: validBody, want: http.StatusBadRequest, code: "INVALID_ARGUMENT"},
+		{name: "empty account", path: "/api/v1/platforms/" + platformID + "/leases/%20/rotate", body: validBody, want: http.StatusBadRequest, code: "INVALID_ARGUMENT"},
+		{name: "malformed json", path: "/api/v1/platforms/" + platformID + "/leases/acct/rotate", body: `{`, want: http.StatusBadRequest, code: "INVALID_ARGUMENT"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := doJSONRequest(t, srv, http.MethodPost, tc.path, tc.body, true)
+			if rec.Code != tc.want {
+				t.Fatalf("status: got %d, want %d, body=%s", rec.Code, tc.want, rec.Body.String())
+			}
+			assertErrorCode(t, rec, tc.code)
+			if tc.message != "" {
+				var er ErrorResponse
+				if err := json.Unmarshal(rec.Body.Bytes(), &er); err != nil {
+					t.Fatalf("unmarshal error response: %v", err)
+				}
+				if er.Error.Message != tc.message {
+					t.Fatalf("message: got %q, want %q", er.Error.Message, tc.message)
+				}
+			}
+		})
+	}
+
+	now := time.Now().UnixNano()
+	cp.Router.RestoreLeases([]model.Lease{{PlatformID: platformID, Account: "acct", NodeHash: validHash, EgressIP: "198.51.100.10", CreatedAtNs: now, ExpiryNs: now + int64(time.Hour), LastAccessedNs: now}})
+	path := "/api/v1/platforms/" + platformID + "/leases/acct/rotate"
+	invalidBodies := []any{
+		map[string]any{"expected_node_hash": "bad", "expected_created_at_ns": strconv.FormatInt(now, 10), "target_host": "cloudflare.com"},
+		map[string]any{"expected_node_hash": validHash, "expected_created_at_ns": 123, "target_host": "cloudflare.com"},
+		map[string]any{"expected_node_hash": validHash, "expected_created_at_ns": strconv.FormatInt(now, 10), "target_host": "https://cloudflare.com"},
+		map[string]any{"expected_node_hash": validHash, "expected_created_at_ns": strconv.FormatInt(now, 10), "target_host": "cloudflare.com", "unknown": true},
+	}
+	for i, body := range invalidBodies {
+		rec := doJSONRequest(t, srv, http.MethodPost, path, body, true)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("invalid body %d status: got %d, body=%s", i, rec.Code, rec.Body.String())
+		}
+		assertErrorCode(t, rec, "INVALID_ARGUMENT")
+	}
 }
 
 func TestAPIContract_GetLease_AccountPathEncoding(t *testing.T) {

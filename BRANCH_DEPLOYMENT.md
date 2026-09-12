@@ -24,6 +24,13 @@
 - `ghcr.io/wesperez/resin:mine-<短SHA>`：便于人工识别。
 - `ghcr.io/wesperez/resin:mine`：Watchtower 使用的生产浮动标签。
 
+候选分支构建（`candidate-*`）：
+
+- 仅在全部 verify 通过后发布候选镜像，用于隔离金丝雀验证。
+- 候选镜像仅包含分支名标签（如 `ghcr.io/wesperez/resin:candidate-*`）及分支名前缀的短 SHA 标签（`candidate-*-sha-<短SHA>`）。
+- 候选发布绝对禁止打 `:mine` 或生产 `:mine-sha-*` 标签，避免触发生产 Watchtower 自动升级。
+- 候选与生产构建使用各自的并发组和缓存域，候选运行不会取消生产发布，也不会写生产缓存。
+
 镜像发布只发生在全部验证通过之后。服务器不安装 Go/Node，也不在生产机编译镜像。
 
 ## 生产部署

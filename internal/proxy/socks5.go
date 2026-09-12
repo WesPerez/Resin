@@ -147,6 +147,11 @@ func (s *Socks5Inbound) ServeConnContext(baseCtx context.Context, conn net.Conn)
 		return
 	}
 
+	unregister, registered := registerPreparedTunnel(s.tunnel.router, prepare.route, handshake.account, conn, prepare.session)
+	defer unregister()
+	if !registered {
+		return
+	}
 	if err := writeSocks5Reply(conn, socks5ReplySucceeded, prepare.session.upstreamConn.LocalAddr()); err != nil {
 		prepare.session.upstreamConn.Close()
 		lifecycle.setProxyError(ErrUpstreamRequestFailed)
@@ -162,7 +167,7 @@ func (s *Socks5Inbound) ServeConnContext(baseCtx context.Context, conn net.Conn)
 			invalidateTunnelLease(s.tunnel.router, prepare.route, handshake.account)
 		},
 	})
-	if shouldInvalidateTunnelLease(relay) {
+	if !prepare.session.recoveryClosed.Load() && shouldInvalidateTunnelLease(relay) {
 		invalidateTunnelLease(s.tunnel.router, prepare.route, handshake.account)
 	}
 	lifecycle.addIngressBytes(relay.ingressBytes)
@@ -172,7 +177,9 @@ func (s *Socks5Inbound) ServeConnContext(baseCtx context.Context, conn net.Conn)
 		lifecycle.setUpstreamError(relay.upstreamStage, relay.upstreamErr)
 	}
 	lifecycle.setNetOK(relay.netOK)
-	prepare.session.recordResult(relay.netOK)
+	if !prepare.session.recoveryClosed.Load() {
+		prepare.session.recordResult(relay.netOK)
+	}
 }
 
 func (s *Socks5Inbound) performHandshake(conn net.Conn, reader *bufio.Reader, requireAuthInfo bool) socks5HandshakeResult {
