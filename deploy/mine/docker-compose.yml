@@ -1,9 +1,9 @@
-name: resin-prod
+name: ${RESIN_COMPOSE_PROJECT:-resin-prod}
 
 services:
   resin:
     image: ${RESIN_IMAGE:-ghcr.io/wesperez/resin:mine}
-    container_name: resin-apps
+    container_name: ${RESIN_CONTAINER_NAME:-resin-apps}
     restart: unless-stopped
     network_mode: host
     pull_policy: always
@@ -29,6 +29,8 @@ services:
       RESIN_PROXY_CONNECT_TIMEOUT: ${RESIN_PROXY_CONNECT_TIMEOUT:-10s}
       RESIN_PROXY_CONNECT_RETRIES: ${RESIN_PROXY_CONNECT_RETRIES:-2}
       RESIN_PROXY_TUNNEL_FIRST_BYTE_TIMEOUT: ${RESIN_PROXY_TUNNEL_FIRST_BYTE_TIMEOUT:-10s}
+      RESIN_SHUTDOWN_PRESERVE_CONNECTIONS: ${RESIN_SHUTDOWN_PRESERVE_CONNECTIONS:-0}
+      RESIN_DRAIN_TIMEOUT: ${RESIN_DRAIN_TIMEOUT:-10m}
     volumes:
       - ${RESIN_STATE_HOST_DIR:-/var/lib/resin-apps}:/var/lib/resin
       - ${RESIN_CACHE_HOST_DIR:-/var/cache/resin-apps}:/var/cache/resin
@@ -46,7 +48,7 @@ services:
     cap_add:
       - SETUID
       - SETGID
-    stop_grace_period: 30s
+    stop_grace_period: ${RESIN_STOP_GRACE_PERIOD:-11m}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://${RESIN_LISTEN_ADDRESS:-172.17.0.1}:${RESIN_PORT:-10834}/healthz >/dev/null || exit 1"]
       interval: 30s

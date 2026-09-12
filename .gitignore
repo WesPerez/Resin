@@ -4,6 +4,7 @@ sing-box-reference
 .agents
 .devcontainer
 start-instance.sh
+webui/dist/
 
 # Claude Code / OMC tooling and local runtime data
 .claude/
