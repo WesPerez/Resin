@@ -1,6 +1,9 @@
 package service
 
 import (
+	"errors"
+	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +25,7 @@ type LeaseResponse struct {
 	EgressIP     string `json:"egress_ip"`
 	Expiry       string `json:"expiry"`
 	LastAccessed string `json:"last_accessed"`
+	CreatedAtNs  string `json:"created_at_ns"`
 }
 
 func leaseToResponse(lease model.Lease, nodeTag string) LeaseResponse {
@@ -33,6 +37,7 @@ func leaseToResponse(lease model.Lease, nodeTag string) LeaseResponse {
 		EgressIP:     lease.EgressIP,
 		Expiry:       time.Unix(0, lease.ExpiryNs).UTC().Format(time.RFC3339Nano),
 		LastAccessed: time.Unix(0, lease.LastAccessedNs).UTC().Format(time.RFC3339Nano),
+		CreatedAtNs:  strconv.FormatInt(lease.CreatedAtNs, 10),
 	}
 }
 
@@ -65,6 +70,7 @@ func (s *ControlPlaneService) ListLeases(platformID string) ([]LeaseResponse, er
 			EgressIP:       lease.EgressIP.String(),
 			ExpiryNs:       lease.ExpiryNs,
 			LastAccessedNs: lease.LastAccessedNs,
+			CreatedAtNs:    lease.CreatedAtNs,
 		}, s.resolveLeaseNodeTag(lease.NodeHash)))
 		return true
 	})
@@ -72,6 +78,61 @@ func (s *ControlPlaneService) ListLeases(platformID string) ([]LeaseResponse, er
 		result = []LeaseResponse{}
 	}
 	return result, nil
+}
+
+type RotateLeaseRequest struct {
+	ExpectedNodeHash    string `json:"expected_node_hash"`
+	ExpectedCreatedAtNs string `json:"expected_created_at_ns"`
+	TargetHost          string `json:"target_host"`
+	ExcludeEgressIP     bool   `json:"exclude_egress_ip"`
+}
+
+type RotateLeaseResponse struct {
+	Status            string         `json:"status"`
+	Lease             *LeaseResponse `json:"lease,omitempty"`
+	ClosedConnections int            `json:"closed_connections"`
+}
+
+func (s *ControlPlaneService) RotateLease(platformID, account string, req RotateLeaseRequest) (*RotateLeaseResponse, error) {
+	if _, ok := s.Pool.GetPlatform(platformID); !ok {
+		return nil, notFound("platform not found")
+	}
+
+	hash, err := node.ParseHex(req.ExpectedNodeHash)
+	if err != nil || hash.IsZero() {
+		return nil, invalidArg("expected_node_hash: invalid node hash")
+	}
+	created, err := strconv.ParseInt(req.ExpectedCreatedAtNs, 10, 64)
+	if err != nil || created <= 0 {
+		return nil, invalidArg("expected_created_at_ns: must be a positive nanosecond timestamp string")
+	}
+	target := strings.TrimSpace(req.TargetHost)
+	if target == "" || len(target) > 253 || strings.ContainsAny(target, "/\\?#@ \t\r\n") {
+		return nil, invalidArg("target_host: must be a hostname or host:port")
+	}
+	if strings.Contains(target, ":") {
+		if _, _, err := net.SplitHostPort(target); err != nil {
+			return nil, invalidArg("target_host: invalid host:port")
+		}
+	}
+	lease, closed, err := s.Router.RotateLease(platformID, account, hash, created, target, req.ExcludeEgressIP)
+	if errors.Is(err, routing.ErrLeaseChanged) {
+		if s.Router.ReadLease(model.LeaseKey{PlatformID: platformID, Account: account}) == nil {
+			return nil, notFound("lease not found")
+		}
+		return &RotateLeaseResponse{Status: "stale_lease"}, nil
+	}
+	if errors.Is(err, routing.ErrNoAvailableNodes) {
+		return &RotateLeaseResponse{Status: "no_alternative"}, nil
+	}
+	if errors.Is(err, routing.ErrPlatformNotFound) {
+		return nil, notFound("platform not found")
+	}
+	if err != nil {
+		return nil, internal("rotate lease", err)
+	}
+	response := leaseToResponse(*lease, s.resolveLeaseNodeTagFromHex(lease.NodeHash))
+	return &RotateLeaseResponse{Status: "rotated", Lease: &response, ClosedConnections: closed}, nil
 }
 
 // GetLease returns a single lease.

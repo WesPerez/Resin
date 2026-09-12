@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -30,8 +31,9 @@ type tunnelDeps struct {
 }
 
 type preparedTunnel struct {
-	upstreamConn net.Conn
-	recordResult func(bool)
+	upstreamConn   net.Conn
+	recordResult   func(bool)
+	recoveryClosed atomic.Bool
 }
 
 type tunnelPrepareResult struct {
@@ -44,12 +46,26 @@ type tunnelPrepareResult struct {
 }
 
 type tunnelRelayResult struct {
-	ingressBytes  int64
-	egressBytes   int64
-	netOK         bool
-	proxyErr      *ProxyError
-	upstreamStage string
-	upstreamErr   error
+	ingressBytes       int64
+	egressBytes        int64
+	netOK              bool
+	proxyErr           *ProxyError
+	upstreamStage      string
+	upstreamErr        error
+	upstreamReadFailed bool
+}
+
+type tunnelCopyObserver struct {
+	reader  io.Reader
+	readErr error
+}
+
+func (o *tunnelCopyObserver) Read(p []byte) (int, error) {
+	n, err := o.reader.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		o.readErr = err
+	}
+	return n, err
 }
 
 type tunnelPumpOptions struct {
@@ -299,10 +315,10 @@ func dialTunnelWithTimeout(
 }
 
 func invalidateTunnelLease(router *routing.Router, route routing.RouteResult, account string) bool {
-	if router == nil || account == "" || route.PlatformID == "" || route.NodeHash.IsZero() {
+	if router == nil || account == "" || route.PlatformID == "" || route.NodeHash.IsZero() || route.LeaseCreatedAtNs == 0 {
 		return false
 	}
-	deleted := router.DeleteLeaseIfNode(route.PlatformID, account, route.NodeHash)
+	deleted := router.DeleteLeaseIfGeneration(route.PlatformID, account, route.NodeHash, route.LeaseCreatedAtNs)
 	if deleted {
 		log.Printf(
 			"proxy sticky lease invalidated: platform_id=%s node_hash=%s",
@@ -311,6 +327,19 @@ func invalidateTunnelLease(router *routing.Router, route routing.RouteResult, ac
 		)
 	}
 	return deleted
+}
+
+func registerPreparedTunnel(router *routing.Router, route routing.RouteResult, account string, client net.Conn, session *preparedTunnel) (func(), bool) {
+	closeForRecovery := func() {
+		session.recoveryClosed.Store(true)
+		_ = client.Close()
+		_ = session.upstreamConn.Close()
+	}
+	unregister, ok := router.RegisterLeaseConnection(route, account, closeForRecovery)
+	if !ok {
+		closeForRecovery()
+	}
+	return unregister, ok
 }
 
 func pumpPreparedTunnel(
@@ -347,8 +376,9 @@ func pumpPreparedTunnelReader(
 	}
 
 	type copyResult struct {
-		n   int64
-		err error
+		n       int64
+		err     error
+		readErr error
 	}
 	var closeBothOnce sync.Once
 	closeBoth := func() {
@@ -380,10 +410,11 @@ func pumpPreparedTunnelReader(
 		egressBytesCh <- copyResult{n: n, err: copyErr}
 	}()
 	go func() {
-		var upstreamReader io.Reader = session.upstreamConn
+		observedUpstream := &tunnelCopyObserver{reader: session.upstreamConn}
+		var upstreamReader io.Reader = observedUpstream
 		if opts.onFirstIngressByte != nil || opts.firstByteTimeout > 0 {
 			// 隧道首字耗时以目标站点返回的第一批字节为准，而不是 CONNECT/SOCKS 握手完成。
-			upstreamReader = &firstByteReader{reader: session.upstreamConn, onFirstByte: func() {
+			upstreamReader = &firstByteReader{reader: observedUpstream, onFirstByte: func() {
 				if firstByteWatch.receive() && opts.onFirstIngressByte != nil {
 					opts.onFirstIngressByte()
 				}
@@ -393,7 +424,10 @@ func pumpPreparedTunnelReader(
 		if !isBenignTunnelCopyError(copyErr) || !closeWriteConn(clientConn) {
 			closeBoth()
 		}
-		ingressBytesCh <- copyResult{n: n, err: copyErr}
+		// io.Copy reports destination write errors through copyErr too. Retain
+		// the source read error separately so a client-side write failure cannot
+		// be mistaken for an upstream transport failure.
+		ingressBytesCh <- copyResult{n: n, err: copyErr, readErr: observedUpstream.readErr}
 	}()
 
 	ingressResult := <-ingressBytesCh
@@ -411,9 +445,10 @@ func pumpPreparedTunnelReader(
 	}
 
 	result := tunnelRelayResult{
-		ingressBytes: ingressResult.n,
-		egressBytes:  egressResult.n,
-		netOK:        true,
+		ingressBytes:       ingressResult.n,
+		egressBytes:        egressResult.n,
+		netOK:              true,
+		upstreamReadFailed: ingressResult.readErr != nil,
 	}
 	switch {
 	case firstByteWatch.timedOut():
@@ -453,7 +488,16 @@ func pumpPreparedTunnelReader(
 }
 
 func shouldInvalidateTunnelLease(result tunnelRelayResult) bool {
-	if result.netOK || result.ingressBytes > 0 {
+	if result.netOK {
+		return false
+	}
+	if result.upstreamReadFailed {
+		return true
+	}
+	if result.upstreamStage == "connect_upstream_to_client_copy" {
+		return false
+	}
+	if result.ingressBytes > 0 {
 		return false
 	}
 	switch result.upstreamStage {

@@ -4,11 +4,12 @@ on:
   push:
     branches:
       - mine
+      - 'candidate-*'
   workflow_dispatch:
 
 concurrency:
-  group: resin-mine-image
-  cancel-in-progress: true
+  group: resin-image-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -69,7 +70,7 @@ jobs:
   publish:
     name: Build and publish GHCR image
     needs: verify
-    if: github.repository == 'WesPerez/Resin' && github.ref == 'refs/heads/mine'
+    if: github.repository == 'WesPerez/Resin' && (github.ref == 'refs/heads/mine' || startsWith(github.ref, 'refs/heads/candidate-'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -99,13 +100,15 @@ jobs:
         with:
           images: ghcr.io/wesperez/resin
           tags: |
-            type=raw,value=mine
-            type=sha,prefix=mine-,format=short
-            type=sha,prefix=mine-sha-,format=long
+            type=raw,value=mine,enable=${{ github.ref == 'refs/heads/mine' }}
+            type=sha,prefix=mine-,format=short,enable=${{ github.ref == 'refs/heads/mine' }}
+            type=sha,prefix=mine-sha-,format=long,enable=${{ github.ref == 'refs/heads/mine' }}
+            type=raw,value={{branch}},enable=${{ startsWith(github.ref, 'refs/heads/candidate-') }}
+            type=sha,prefix={{branch}}-,format=short,enable=${{ startsWith(github.ref, 'refs/heads/candidate-') }}
           labels: |
             org.opencontainers.image.source=https://github.com/WesPerez/Resin
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.ref.name=mine
+            org.opencontainers.image.ref.name=${{ github.ref_name }}
 
       - name: Build and push image
         uses: docker/build-push-action@v6
@@ -117,10 +120,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VERSION=mine
+            VERSION=${{ github.ref_name }}
             GIT_COMMIT=${{ github.sha }}
             BUILD_TIME=${{ steps.build_time.outputs.value }}
-          cache-from: type=gha,scope=resin-mine
-          cache-to: type=gha,mode=max,scope=resin-mine
+          cache-from: type=gha,scope=resin-${{ github.ref_name }}
+          cache-to: type=gha,mode=max,scope=resin-${{ github.ref_name }}
           provenance: mode=max
           sbom: true

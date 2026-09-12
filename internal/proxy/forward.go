@@ -388,6 +388,11 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	unregister, registered := registerPreparedTunnel(p.router, prepare.route, account, clientConn, prepare.session)
+	defer unregister()
+	if !registered {
+		return
+	}
 	// Write the raw CONNECT success line with proper reason phrase.
 	if _, err := clientBuf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		prepare.session.upstreamConn.Close()
@@ -414,7 +419,7 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 			invalidateTunnelLease(p.router, prepare.route, account)
 		},
 	})
-	if shouldInvalidateTunnelLease(relay) {
+	if !prepare.session.recoveryClosed.Load() && shouldInvalidateTunnelLease(relay) {
 		invalidateTunnelLease(p.router, prepare.route, account)
 	}
 	lifecycle.addIngressBytes(relay.ingressBytes)
@@ -424,7 +429,9 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 		lifecycle.setUpstreamError(relay.upstreamStage, relay.upstreamErr)
 	}
 	lifecycle.setNetOK(relay.netOK)
-	prepare.session.recordResult(relay.netOK)
+	if !prepare.session.recoveryClosed.Load() {
+		prepare.session.recordResult(relay.netOK)
+	}
 }
 
 // shouldRecordForwardCopyFailure decides whether an HTTP response body copy

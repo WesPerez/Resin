@@ -102,6 +102,23 @@ func (t *LeaseTable) DeleteLeaseIfNode(account string, expectedNode node.Hash) (
 	return deleted, ok
 }
 
+// DeleteLeaseIfGeneration removes only the exact lease generation observed by
+// the caller. Node hashes may be reused by a later generation.
+func (t *LeaseTable) DeleteLeaseIfGeneration(account string, expectedNode node.Hash, expectedCreatedAtNs int64) (Lease, bool) {
+	var deleted Lease
+	ok := false
+	t.leases.Compute(account, func(oldVal Lease, loaded bool) (Lease, xsync.ComputeOp) {
+		if !loaded || oldVal.NodeHash != expectedNode || oldVal.CreatedAtNs != expectedCreatedAtNs {
+			return oldVal, xsync.CancelOp
+		}
+		t.stats.Dec(oldVal.EgressIP)
+		deleted = oldVal
+		ok = true
+		return oldVal, xsync.DeleteOp
+	})
+	return deleted, ok
+}
+
 // Size returns the number of leases in the table.
 func (t *LeaseTable) Size() int {
 	return t.leases.Size()

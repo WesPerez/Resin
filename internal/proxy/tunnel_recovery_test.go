@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -12,6 +13,41 @@ import (
 	"github.com/Resinat/Resin/internal/node"
 	M "github.com/sagernet/sing/common/metadata"
 )
+
+type tunnelFaultConn struct {
+	readData []byte
+	readErr  error
+	writeErr error
+	closed   atomic.Bool
+}
+
+func (c *tunnelFaultConn) Read(p []byte) (int, error) {
+	if len(c.readData) > 0 {
+		n := copy(p, c.readData)
+		c.readData = c.readData[n:]
+		return n, nil
+	}
+	return 0, c.readErr
+}
+
+func (c *tunnelFaultConn) Write(p []byte) (int, error) {
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
+	return len(p), nil
+}
+
+func (c *tunnelFaultConn) Close() error                     { c.closed.Store(true); return nil }
+func (c *tunnelFaultConn) LocalAddr() net.Addr              { return tunnelFaultAddr("local") }
+func (c *tunnelFaultConn) RemoteAddr() net.Addr             { return tunnelFaultAddr("remote") }
+func (c *tunnelFaultConn) SetDeadline(time.Time) error      { return nil }
+func (c *tunnelFaultConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *tunnelFaultConn) SetWriteDeadline(time.Time) error { return nil }
+
+type tunnelFaultAddr string
+
+func (a tunnelFaultAddr) Network() string { return string(a) }
+func (a tunnelFaultAddr) String() string  { return string(a) }
 
 func TestPrepareConnectTunnel_RetriesWithDifferentNode(t *testing.T) {
 	env := newProxyE2EEnv(t)
@@ -202,4 +238,93 @@ func TestDialTunnelWithTimeout_BoundsBlockingDial(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
 		t.Fatalf("dial timeout took too long: %v", elapsed)
 	}
+}
+
+func TestShouldInvalidateTunnelLease_UpstreamReadFailed(t *testing.T) {
+	// Upstream read error should invalidate even if ingress > 0
+	res := tunnelRelayResult{
+		ingressBytes:       1024,
+		upstreamReadFailed: true,
+		upstreamStage:      "connect_upstream_to_client_copy",
+		netOK:              false,
+	}
+	if !shouldInvalidateTunnelLease(res) {
+		t.Fatal("expected lease invalidation on upstream read failure with ingress bytes")
+	}
+
+	// Downstream client write error (upstreamReadFailed is false) must NOT invalidate
+	resClientErr := tunnelRelayResult{
+		ingressBytes:       1024,
+		upstreamReadFailed: false,
+		upstreamStage:      "connect_upstream_to_client_copy",
+		netOK:              false,
+	}
+	if shouldInvalidateTunnelLease(resClientErr) {
+		t.Fatal("client write error unexpectedly invalidated lease")
+	}
+
+	// NetOK = true must NOT invalidate
+	resOK := tunnelRelayResult{
+		ingressBytes:       1024,
+		upstreamReadFailed: false,
+		netOK:              true,
+	}
+	if shouldInvalidateTunnelLease(resOK) {
+		t.Fatal("netOK unexpectedly invalidated lease")
+	}
+}
+
+func TestPumpPreparedTunnelReader_ObserverClassifiesFailureSide(t *testing.T) {
+	t.Run("upstream read failure invalidates after ingress", func(t *testing.T) {
+		upstreamErr := errors.New("upstream read reset")
+		client := &tunnelFaultConn{readErr: io.EOF}
+		upstream := &tunnelFaultConn{readData: []byte("partial"), readErr: upstreamErr}
+		result := pumpPreparedTunnelReader(client, client, &preparedTunnel{upstreamConn: upstream, recordResult: func(bool) {}}, tunnelPumpOptions{})
+		if !result.upstreamReadFailed || result.ingressBytes != int64(len("partial")) {
+			t.Fatalf("result did not capture upstream read failure: %+v", result)
+		}
+		if !shouldInvalidateTunnelLease(result) {
+			t.Fatalf("upstream read failure should invalidate: %+v", result)
+		}
+	})
+
+	t.Run("downstream write failure does not invalidate after ingress", func(t *testing.T) {
+		downstreamErr := errors.New("downstream write reset")
+		client := &tunnelFaultConn{readErr: io.EOF, writeErr: downstreamErr}
+		upstream := &tunnelFaultConn{readData: []byte("partial"), readErr: io.EOF}
+		result := pumpPreparedTunnelReader(client, client, &preparedTunnel{upstreamConn: upstream, recordResult: func(bool) {}}, tunnelPumpOptions{})
+		if result.upstreamReadFailed {
+			t.Fatalf("downstream write failure was misclassified as upstream read failure: %+v", result)
+		}
+		if shouldInvalidateTunnelLease(result) {
+			t.Fatalf("downstream write failure should not invalidate after ingress: %+v", result)
+		}
+	})
+
+	t.Run("upstream read failure remains visible with production first byte options", func(t *testing.T) {
+		upstreamErr := errors.New("upstream read reset after first byte")
+		client := &tunnelFaultConn{readErr: io.EOF}
+		upstream := &tunnelFaultConn{readData: []byte("partial"), readErr: upstreamErr}
+		var firstByteObserved atomic.Bool
+		result := pumpPreparedTunnelReader(
+			client,
+			client,
+			&preparedTunnel{upstreamConn: upstream, recordResult: func(bool) {}},
+			tunnelPumpOptions{
+				firstByteTimeout: time.Second,
+				onFirstIngressByte: func() {
+					firstByteObserved.Store(true)
+				},
+			},
+		)
+		if !firstByteObserved.Load() {
+			t.Fatal("production first-byte callback was not invoked")
+		}
+		if !result.upstreamReadFailed || result.ingressBytes != int64(len("partial")) {
+			t.Fatalf("first-byte wrapper hid upstream read failure: %+v", result)
+		}
+		if !shouldInvalidateTunnelLease(result) {
+			t.Fatalf("upstream read failure should invalidate with production options: %+v", result)
+		}
+	})
 }

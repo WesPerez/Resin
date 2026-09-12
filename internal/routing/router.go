@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Resinat/Resin/internal/model"
@@ -28,12 +29,14 @@ type PoolAccessor interface {
 
 // Router handles route selection and lease management.
 type Router struct {
-	pool            PoolAccessor
-	states          *xsync.Map[string, *PlatformRoutingState]
-	authorities     func() []string
-	p2cWindow       func() time.Duration
-	onLeaseEvent    LeaseEventFunc
-	nodeTagResolver func(node.Hash) string
+	pool             PoolAccessor
+	states           *xsync.Map[string, *PlatformRoutingState]
+	authorities      func() []string
+	p2cWindow        func() time.Duration
+	onLeaseEvent     LeaseEventFunc
+	nodeTagResolver  func(node.Hash) string
+	recoveryMu       sync.RWMutex
+	leaseConnections map[leaseConnectionKey]map[*leaseConnection]struct{}
 }
 
 type RouterConfig struct {
@@ -59,12 +62,13 @@ func NewRouter(cfg RouterConfig) *Router {
 }
 
 type RouteResult struct {
-	PlatformID   string
-	PlatformName string
-	NodeHash     node.Hash
-	EgressIP     netip.Addr
-	NodeTag      string // display tag: "<Subscription>/<Tag>" (DESIGN.md §601)
-	LeaseCreated bool
+	PlatformID       string
+	PlatformName     string
+	NodeHash         node.Hash
+	EgressIP         netip.Addr
+	NodeTag          string // display tag: "<Subscription>/<Tag>" (DESIGN.md §601)
+	LeaseCreated     bool
+	LeaseCreatedAtNs int64
 }
 
 const livePickAttempts = 2 // first pick + one retry
@@ -195,9 +199,11 @@ func (r *Router) routeSticky(
 	now time.Time,
 	excluded nodeExclusionSet,
 ) (RouteResult, error) {
+	r.recoveryMu.RLock()
 	nowNs := now.UnixNano()
 	var result RouteResult
 	var routeErr error
+	var events []LeaseEvent
 
 	_, _ = state.Leases.leases.Compute(account, func(current Lease, loaded bool) (Lease, xsync.ComputeOp) {
 		newLease, op, routeResult, err := r.decideStickyLease(
@@ -210,6 +216,7 @@ func (r *Router) routeSticky(
 			current,
 			loaded,
 			excluded,
+			&events,
 		)
 		if err != nil {
 			routeErr = err
@@ -218,6 +225,10 @@ func (r *Router) routeSticky(
 		result = routeResult
 		return newLease, op
 	})
+	r.recoveryMu.RUnlock()
+	for _, event := range events {
+		r.emitLeaseEvent(event)
+	}
 
 	return result, routeErr
 }
@@ -232,6 +243,7 @@ func (r *Router) decideStickyLease(
 	current Lease,
 	loaded bool,
 	excluded nodeExclusionSet,
+	events *[]LeaseEvent,
 ) (Lease, xsync.ComputeOp, RouteResult, error) {
 	hadPreviousLease := loaded
 	invalidation := leaseInvalidationNone
@@ -242,10 +254,10 @@ func (r *Router) decideStickyLease(
 	}
 
 	if loaded {
-		if newLease, hitResult, ok := r.tryLeaseHit(plat, account, current, nowNs, excluded); ok {
+		if newLease, hitResult, ok := r.tryLeaseHit(plat, account, current, nowNs, excluded, events); ok {
 			return newLease, xsync.UpdateOp, hitResult, nil
 		}
-		if newLease, rotatedResult, ok := r.tryLeaseSameIPRotation(plat, account, current, targetDomain, nowNs, excluded); ok {
+		if newLease, rotatedResult, ok := r.tryLeaseSameIPRotation(plat, account, current, targetDomain, nowNs, excluded, events); ok {
 			return newLease, xsync.UpdateOp, rotatedResult, nil
 		}
 		invalidation = leaseInvalidationRemove
@@ -262,6 +274,7 @@ func (r *Router) decideStickyLease(
 		hadPreviousLease,
 		invalidation,
 		excluded,
+		events,
 	)
 }
 
@@ -276,17 +289,18 @@ func (r *Router) createOrAbortStickyLease(
 	hadPreviousLease bool,
 	invalidation leaseInvalidationReason,
 	excluded nodeExclusionSet,
+	events *[]LeaseEvent,
 ) (Lease, xsync.ComputeOp, RouteResult, error) {
 	newLease, createdResult, err := r.createLease(plat, state, targetDomain, now, nowNs, excluded)
 	if err != nil {
-		r.cleanupPreviousLease(state, previous, hadPreviousLease, invalidation, plat.ID, account)
+		r.cleanupPreviousLease(state, previous, hadPreviousLease, invalidation, plat.ID, account, events)
 		lease, op := abortLeaseCreate(previous, hadPreviousLease)
 		return lease, op, RouteResult{}, err
 	}
 
-	r.cleanupPreviousLease(state, previous, hadPreviousLease, invalidation, plat.ID, account)
+	r.cleanupPreviousLease(state, previous, hadPreviousLease, invalidation, plat.ID, account, events)
 	state.IPLoadStats.Inc(newLease.EgressIP)
-	r.emitLeaseEvent(LeaseEvent{
+	*events = append(*events, LeaseEvent{
 		Type:       LeaseCreate,
 		PlatformID: plat.ID,
 		Account:    account,
@@ -302,6 +316,7 @@ func (r *Router) tryLeaseHit(
 	current Lease,
 	nowNs int64,
 	excluded nodeExclusionSet,
+	events *[]LeaseEvent,
 ) (Lease, RouteResult, bool) {
 	if excluded.contains(current.NodeHash) {
 		return Lease{}, RouteResult{}, false
@@ -313,7 +328,7 @@ func (r *Router) tryLeaseHit(
 
 	newLease := current
 	newLease.LastAccessedNs = nowNs
-	r.emitLeaseEvent(LeaseEvent{
+	*events = append(*events, LeaseEvent{
 		Type:       LeaseTouch,
 		PlatformID: plat.ID,
 		Account:    account,
@@ -321,9 +336,10 @@ func (r *Router) tryLeaseHit(
 		EgressIP:   current.EgressIP,
 	})
 	return newLease, RouteResult{
-		NodeHash:     current.NodeHash,
-		EgressIP:     current.EgressIP,
-		LeaseCreated: false,
+		NodeHash:         current.NodeHash,
+		EgressIP:         current.EgressIP,
+		LeaseCreated:     false,
+		LeaseCreatedAtNs: current.CreatedAtNs,
 	}, true
 }
 
@@ -334,6 +350,7 @@ func (r *Router) tryLeaseSameIPRotation(
 	targetDomain string,
 	nowNs int64,
 	excluded nodeExclusionSet,
+	events *[]LeaseEvent,
 ) (Lease, RouteResult, bool) {
 	bestHash, ok := chooseSameIPRotationCandidate(
 		plat,
@@ -351,7 +368,7 @@ func (r *Router) tryLeaseSameIPRotation(
 	newLease := current
 	newLease.NodeHash = bestHash
 	newLease.LastAccessedNs = nowNs
-	r.emitLeaseEvent(LeaseEvent{
+	*events = append(*events, LeaseEvent{
 		Type:       LeaseReplace,
 		PlatformID: plat.ID,
 		Account:    account,
@@ -359,9 +376,10 @@ func (r *Router) tryLeaseSameIPRotation(
 		EgressIP:   current.EgressIP,
 	})
 	return newLease, RouteResult{
-		NodeHash:     bestHash,
-		EgressIP:     current.EgressIP,
-		LeaseCreated: false,
+		NodeHash:         bestHash,
+		EgressIP:         current.EgressIP,
+		LeaseCreated:     false,
+		LeaseCreatedAtNs: current.CreatedAtNs,
 	}, true
 }
 
@@ -390,9 +408,10 @@ func (r *Router) createLease(
 		LastAccessedNs: nowNs,
 	}
 	return lease, RouteResult{
-		NodeHash:     lease.NodeHash,
-		EgressIP:     lease.EgressIP,
-		LeaseCreated: true,
+		NodeHash:         lease.NodeHash,
+		EgressIP:         lease.EgressIP,
+		LeaseCreated:     true,
+		LeaseCreatedAtNs: lease.CreatedAtNs,
 	}, nil
 }
 
@@ -403,6 +422,7 @@ func (r *Router) cleanupPreviousLease(
 	invalidation leaseInvalidationReason,
 	platformID string,
 	account string,
+	events *[]LeaseEvent,
 ) {
 	if !hadPreviousLease {
 		return
@@ -410,7 +430,7 @@ func (r *Router) cleanupPreviousLease(
 	state.Leases.stats.Dec(lease.EgressIP)
 	switch invalidation {
 	case leaseInvalidationExpire:
-		r.emitLeaseEvent(LeaseEvent{
+		*events = append(*events, LeaseEvent{
 			Type:        LeaseExpire,
 			PlatformID:  platformID,
 			Account:     account,
@@ -419,7 +439,7 @@ func (r *Router) cleanupPreviousLease(
 			CreatedAtNs: lease.CreatedAtNs,
 		})
 	case leaseInvalidationRemove:
-		r.emitLeaseEvent(LeaseEvent{
+		*events = append(*events, LeaseEvent{
 			Type:        LeaseRemove,
 			PlatformID:  platformID,
 			Account:     account,
@@ -568,6 +588,8 @@ func (r *Router) UpsertLease(ml model.Lease) error {
 		return fmt.Errorf("parse egress_ip: %w", err)
 	}
 
+	r.recoveryMu.RLock()
+
 	state := r.ensurePlatformState(platformID)
 	lease := Lease{
 		NodeHash:       h,
@@ -586,6 +608,7 @@ func (r *Router) UpsertLease(ml model.Lease) error {
 		state.Leases.stats.Inc(lease.EgressIP)
 		return lease, xsync.UpdateOp
 	})
+	r.recoveryMu.RUnlock()
 
 	r.emitLeaseEvent(LeaseEvent{
 		Type:       eventType,
@@ -609,6 +632,9 @@ func (r *Router) SnapshotIPLoad(platformID string) map[netip.Addr]int64 {
 
 // RestoreLeases restores leases from persistence during bootstrap.
 func (r *Router) RestoreLeases(leases []model.Lease) {
+	r.recoveryMu.RLock()
+	defer r.recoveryMu.RUnlock()
+
 	for _, ml := range leases {
 		h, err := node.ParseHex(ml.NodeHash)
 		if err != nil {
@@ -649,11 +675,14 @@ func (r *Router) RangeLeases(platformID string, fn func(account string, lease Le
 // DeleteLease removes a single lease by platform and account.
 // Returns true if a lease was deleted. Emits a LeaseRemove event.
 func (r *Router) DeleteLease(platformID, account string) bool {
+	r.recoveryMu.RLock()
 	state, ok := r.states.Load(platformID)
 	if !ok {
+		r.recoveryMu.RUnlock()
 		return false
 	}
 	lease, deleted := state.Leases.DeleteLease(account)
+	r.recoveryMu.RUnlock()
 	if !deleted {
 		return false
 	}
@@ -670,12 +699,40 @@ func (r *Router) DeleteLease(platformID, account string) bool {
 
 // DeleteLeaseIfNode removes a lease only if it still references expectedNode.
 // Returns false when another request has already replaced the lease.
-func (r *Router) DeleteLeaseIfNode(platformID, account string, expectedNode node.Hash) bool {
+func (r *Router) DeleteLeaseIfGeneration(platformID, account string, expectedNode node.Hash, expectedCreatedAtNs int64) bool {
+	r.recoveryMu.RLock()
 	state, ok := r.states.Load(platformID)
 	if !ok {
+		r.recoveryMu.RUnlock()
+		return false
+	}
+	lease, deleted := state.Leases.DeleteLeaseIfGeneration(account, expectedNode, expectedCreatedAtNs)
+	r.recoveryMu.RUnlock()
+	if !deleted {
+		return false
+	}
+	r.emitLeaseEvent(LeaseEvent{
+		Type:        LeaseRemove,
+		PlatformID:  platformID,
+		Account:     account,
+		NodeHash:    lease.NodeHash,
+		EgressIP:    lease.EgressIP,
+		CreatedAtNs: lease.CreatedAtNs,
+	})
+	return true
+}
+
+// DeleteLeaseIfNode removes a lease only if it still references expectedNode.
+// Callers that observed a full lease generation should use DeleteLeaseIfGeneration.
+func (r *Router) DeleteLeaseIfNode(platformID, account string, expectedNode node.Hash) bool {
+	r.recoveryMu.RLock()
+	state, ok := r.states.Load(platformID)
+	if !ok {
+		r.recoveryMu.RUnlock()
 		return false
 	}
 	lease, deleted := state.Leases.DeleteLeaseIfNode(account, expectedNode)
+	r.recoveryMu.RUnlock()
 	if !deleted {
 		return false
 	}
@@ -693,15 +750,18 @@ func (r *Router) DeleteLeaseIfNode(platformID, account string, expectedNode node
 // DeleteAllLeases removes all leases for a platform.
 // Returns the number of leases deleted. Emits a LeaseRemove event for each.
 func (r *Router) DeleteAllLeases(platformID string) int {
+	r.recoveryMu.RLock()
 	state, ok := r.states.Load(platformID)
 	if !ok {
+		r.recoveryMu.RUnlock()
 		return 0
 	}
 	count := 0
+	var events []LeaseEvent
 	state.Leases.Range(func(account string, _ Lease) bool {
 		removed, deleted := state.Leases.DeleteLease(account)
 		if deleted {
-			r.emitLeaseEvent(LeaseEvent{
+			events = append(events, LeaseEvent{
 				Type:        LeaseRemove,
 				PlatformID:  platformID,
 				Account:     account,
@@ -713,5 +773,9 @@ func (r *Router) DeleteAllLeases(platformID string) int {
 		}
 		return true
 	})
+	r.recoveryMu.RUnlock()
+	for _, event := range events {
+		r.emitLeaseEvent(event)
+	}
 	return count
 }
