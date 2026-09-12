@@ -45,9 +45,24 @@
 Token 通过 `RESIN_ADMIN_TOKEN_FILE`、`RESIN_PROXY_TOKEN_FILE` 读取，不写入 Git 或镜像。
 容器通过 `RESIN_RUNTIME_UID`、`RESIN_RUNTIME_GID` 使用宿主机 `resin-apps` 身份。
 
-首次迁移必须先使用精确 `mine-sha-*` 镜像并禁用 Watchtower 标签完成 canary。状态库在线备份、
-`integrity_check`、入口健康、节点数、Platform、lease 和自然传输事件均验收后，才切换到 `:mine`
-并启用 `com.centurylinklabs.watchtower.enable=true`。
+蓝绿部署时，固定入口 `172.17.0.1:10834` 由 conntrack DNAT 转发到两个槽位端口；
+下游应用仍使用原地址。两槽必须使用独立的 state/cache/log 目录，inactive 槽启动前从
+active 槽制作 SQLite 一致性快照。槽位必须显式设置：
+
+```dotenv
+RESIN_SHUTDOWN_PRESERVE_CONNECTIONS=1
+RESIN_DRAIN_TIMEOUT=0
+RESIN_STOP_GRACE_PERIOD=11m
+```
+
+`RESIN_DRAIN_TIMEOUT=0` 表示无限排空。双槽部署器先关闭旧槽自动重启，再发送 SIGTERM；
+不用 Compose 的固定 stop timeout。旧槽停止接收新连接后保留已建立隧道，重复 SIGTERM
+不会中断排空。若显式配置有限 drain timeout，Docker stop timeout 应大于该值。
+旧槽不执行最终 cache flush；Watchtower 不得自动 recreate 任一槽位。
+
+首次迁移使用声明 `io.resin.unlimited-drain=1` 的不可变候选镜像，保持 Watchtower 禁用。
+在线快照、库校验、真实 CONNECT 与容器侧入口验证通过后，才把新连接切入 Blue。
+旧版 Resin 在既有连接归零前保持运行；之后所有更新均通过双槽部署器执行。
 
 ## 个性化恢复边界
 

@@ -171,6 +171,39 @@ func TestFlushWorker_StopFinalFlush(t *testing.T) {
 	}
 }
 
+func TestFlushWorker_DiscardSkipsFinalFlush(t *testing.T) {
+	engine, _, _ := newTestEngine(t)
+	nodeStore := map[string]*model.NodeStatic{
+		"n1": {Hash: "n1", RawOptions: json.RawMessage(`{}`), CreatedAtNs: 1},
+	}
+	readers := CacheReaders{
+		ReadNodeStatic:       func(h string) *model.NodeStatic { return nodeStore[h] },
+		ReadNodeDynamic:      func(string) *model.NodeDynamic { return nil },
+		ReadNodeLatency:      func(NodeLatencyDirtyKey) *model.NodeLatency { return nil },
+		ReadLease:            func(LeaseDirtyKey) *model.Lease { return nil },
+		ReadSubscriptionNode: func(SubscriptionNodeDirtyKey) *model.SubscriptionNode { return nil },
+	}
+	w := NewCacheFlushWorker(
+		engine, readers, func() int { return 10000 },
+		func() time.Duration { return time.Hour }, time.Hour,
+	)
+	w.Start()
+	engine.MarkNodeStatic("n1")
+	w.Discard()
+	w.Stop()
+
+	if got := engine.DirtyCount(); got != 1 {
+		t.Fatalf("dirty count after discard = %d, want 1", got)
+	}
+	nodes, err := engine.LoadAllNodesStatic()
+	if err != nil {
+		t.Fatalf("LoadAllNodesStatic: %v", err)
+	}
+	if len(nodes) != 0 {
+		t.Fatalf("persisted nodes after discard = %d, want 0", len(nodes))
+	}
+}
+
 func TestFlushWorker_DynamicConfigPulled(t *testing.T) {
 	engine, _, _ := newTestEngine(t)
 

@@ -119,7 +119,6 @@ func (m *endpointRuntimeManager) ApplyEndpoint(endpoint model.Endpoint) error {
 		&http.Server{Handler: httpHandler},
 		&endpointSocksGate{current: currentConfig, next: m.socks5},
 	)
-
 	old := m.runtimes[endpoint.ID]
 	m.runtimes[endpoint.ID] = runtime
 	m.statuses[endpoint.ID] = service.EndpointRuntimeStatus{State: "starting"}
@@ -216,7 +215,7 @@ func (m *endpointRuntimeManager) handleRuntimeError(runtime *managedEndpointRunt
 	}
 }
 
-func (m *endpointRuntimeManager) Shutdown(ctx context.Context) error {
+func (m *endpointRuntimeManager) Shutdown(ctx context.Context, preserveConnections bool) error {
 	if m == nil {
 		return nil
 	}
@@ -235,7 +234,7 @@ func (m *endpointRuntimeManager) Shutdown(ctx context.Context) error {
 		wg.Add(1)
 		go func(runtime *managedEndpointRuntime) {
 			defer wg.Done()
-			if err := runtime.server.Shutdown(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			if err := runtime.server.Shutdown(ctx, preserveConnections); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				errCh <- err
 			}
 			_ = runtime.listener.Close()
@@ -256,7 +255,7 @@ func stopManagedEndpoint(runtime *managedEndpointRuntime, timeout time.Duration)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	_ = runtime.server.Shutdown(ctx)
+	_ = runtime.server.Shutdown(ctx, false)
 	_ = runtime.listener.Close()
 }
 

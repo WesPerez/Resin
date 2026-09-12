@@ -3,6 +3,7 @@ package state
 import (
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,9 +20,10 @@ type CacheFlushWorker struct {
 	intervalFn  func() time.Duration
 	checkTick   time.Duration // how often to check conditions
 
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
-	stopOnce sync.Once
+	stopCh            chan struct{}
+	discardFinalFlush atomic.Bool
+	wg                sync.WaitGroup
+	stopOnce          sync.Once
 }
 
 // NewCacheFlushWorker creates a flush worker that pulls threshold/interval
@@ -67,6 +69,15 @@ func (w *CacheFlushWorker) Stop() {
 	w.wg.Wait()
 }
 
+// Discard prevents the final flush performed by Stop. Use it only when the
+// process is draining a blue/green slot that must not overwrite a newer
+// state snapshot owned by the active slot.
+func (w *CacheFlushWorker) Discard() {
+	w.discardFinalFlush.Store(true)
+	w.stopOnce.Do(func() { close(w.stopCh) })
+	w.wg.Wait()
+}
+
 func (w *CacheFlushWorker) run() {
 	defer w.wg.Done()
 
@@ -79,7 +90,9 @@ func (w *CacheFlushWorker) run() {
 		select {
 		case <-w.stopCh:
 			// Final flush before exit.
-			w.doFlush()
+			if !w.discardFinalFlush.Load() {
+				w.doFlush()
+			}
 			return
 		case <-ticker.C:
 			dirty := w.engine.DirtyCount()
