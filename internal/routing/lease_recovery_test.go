@@ -2,6 +2,8 @@ package routing_test
 
 import (
 	"errors"
+	"io"
+	"net"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -29,17 +31,17 @@ func TestRotateLease_CASSuccessAndStale(t *testing.T) {
 	if res1.NodeHash == h1 {
 		wrongHash = h2
 	}
-	_, _, err = router.RotateLease(platID, "acct-cas", wrongHash, res1.LeaseCreatedAtNs, "cloudflare.com", false)
+	_, _, err = router.RotateLease(platID, "acct-cas", wrongHash, res1.LeaseCreatedAtNs, "cloudflare.com", routing.RotateLeaseOptions{})
 	if !errors.Is(err, routing.ErrLeaseChanged) {
 		t.Fatalf("expected ErrLeaseChanged on wrong node hash, got %v", err)
 	}
 
-	_, _, err = router.RotateLease(platID, "acct-cas", res1.NodeHash, res1.LeaseCreatedAtNs+100, "cloudflare.com", false)
+	_, _, err = router.RotateLease(platID, "acct-cas", res1.NodeHash, res1.LeaseCreatedAtNs+100, "cloudflare.com", routing.RotateLeaseOptions{})
 	if !errors.Is(err, routing.ErrLeaseChanged) {
 		t.Fatalf("expected ErrLeaseChanged on wrong createdAtNs, got %v", err)
 	}
 
-	newLease, closedCount, err := router.RotateLease(platID, "acct-cas", res1.NodeHash, res1.LeaseCreatedAtNs, "cloudflare.com", false)
+	newLease, closedCount, err := router.RotateLease(platID, "acct-cas", res1.NodeHash, res1.LeaseCreatedAtNs, "cloudflare.com", routing.RotateLeaseOptions{})
 	if err != nil {
 		t.Fatalf("rotate failed: %v", err)
 	}
@@ -94,7 +96,7 @@ func TestRotateLease_ExcludesOldNodeAndEgressIP(t *testing.T) {
 		t.Fatalf("expected initial node with egress IP 198.51.100.10, got %s", res.NodeHash.Hex())
 	}
 
-	newLease, _, err := router.RotateLease(platID, "acct-egress", res.NodeHash, res.LeaseCreatedAtNs, "cloudflare.com", true)
+	newLease, _, err := router.RotateLease(platID, "acct-egress", res.NodeHash, res.LeaseCreatedAtNs, "cloudflare.com", routing.RotateLeaseOptions{ExcludeEgressIP: true})
 	if err != nil {
 		t.Fatalf("rotate failed: %v", err)
 	}
@@ -116,7 +118,7 @@ func TestRotateLease_NoAlternativeRetainsOriginalLease(t *testing.T) {
 		t.Fatalf("initial route failed: %v", err)
 	}
 
-	_, _, err = router.RotateLease(platID, "acct-single", h1, res.LeaseCreatedAtNs, "cloudflare.com", false)
+	_, _, err = router.RotateLease(platID, "acct-single", h1, res.LeaseCreatedAtNs, "cloudflare.com", routing.RotateLeaseOptions{})
 	if !errors.Is(err, routing.ErrNoAvailableNodes) {
 		t.Fatalf("expected ErrNoAvailableNodes, got %v", err)
 	}
@@ -164,7 +166,7 @@ func TestRotateLease_IPLoadStatsAndActiveTunnelClosed(t *testing.T) {
 	}
 	defer unregister()
 
-	_, closedCount, err := router.RotateLease(platID, "acct-load", res.NodeHash, res.LeaseCreatedAtNs, "cloudflare.com", false)
+	_, closedCount, err := router.RotateLease(platID, "acct-load", res.NodeHash, res.LeaseCreatedAtNs, "cloudflare.com", routing.RotateLeaseOptions{})
 	if err != nil {
 		t.Fatalf("rotate failed: %v", err)
 	}
@@ -192,7 +194,7 @@ func TestRegisterLeaseConnection_RejectsLateRegistration(t *testing.T) {
 		t.Fatalf("initial route failed: %v", err)
 	}
 
-	_, _, err = router.RotateLease(platID, "acct-late", res.NodeHash, res.LeaseCreatedAtNs, "cloudflare.com", false)
+	_, _, err = router.RotateLease(platID, "acct-late", res.NodeHash, res.LeaseCreatedAtNs, "cloudflare.com", routing.RotateLeaseOptions{})
 	if err != nil {
 		t.Fatalf("rotate failed: %v", err)
 	}
@@ -204,6 +206,110 @@ func TestRegisterLeaseConnection_RejectsLateRegistration(t *testing.T) {
 	}
 	if closed.Load() {
 		t.Fatal("router invoked the rejected registration callback; caller owns late-connection close")
+	}
+}
+
+func TestRotateLease_PreservesEstablishedConnections(t *testing.T) {
+	pool, subMgr := setupPool(t)
+	makeRoutableNode(t, pool, subMgr, `{"preserve":"1"}`, "198.51.100.1", "cloudflare.com", 10*time.Millisecond)
+	makeRoutableNode(t, pool, subMgr, `{"preserve":"2"}`, "198.51.100.2", "cloudflare.com", 20*time.Millisecond)
+	router := makeRouter(pool, nil)
+	before, err := router.RouteRequest(platName, "acct-preserve", "cloudflare.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var closed atomic.Int32
+	for range 3 {
+		unregister, ok := router.RegisterLeaseConnection(before, "acct-preserve", func() { closed.Add(1) })
+		if !ok {
+			t.Fatal("register established connection")
+		}
+		defer unregister()
+	}
+	lease, count, err := router.RotateLease(platID, "acct-preserve", before.NodeHash, before.LeaseCreatedAtNs,
+		"cloudflare.com", routing.RotateLeaseOptions{ExcludeEgressIP: true, PreserveConnections: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 || closed.Load() != 0 {
+		t.Fatalf("rotation aborted established connections: count=%d closed=%d", count, closed.Load())
+	}
+	after, err := router.RouteRequest(platName, "acct-preserve", "cloudflare.com")
+	if err != nil || after.NodeHash.Hex() != lease.NodeHash || after.NodeHash == before.NodeHash || after.EgressIP == before.EgressIP {
+		t.Fatalf("new route must use replacement node and IP: before=%+v after=%+v err=%v", before, after, err)
+	}
+	if _, ok := router.RegisterLeaseConnection(before, "acct-preserve", func() { closed.Add(1) }); ok {
+		t.Fatal("late dial registered on replaced lease")
+	}
+	if router.DeleteLeaseIfGeneration(platID, "acct-preserve", before.NodeHash, before.LeaseCreatedAtNs) {
+		t.Fatal("old connection failure deleted replacement lease")
+	}
+	var newClosed atomic.Bool
+	unregister, ok := router.RegisterLeaseConnection(after, "acct-preserve", func() { newClosed.Store(true) })
+	if !ok {
+		t.Fatal("register replacement connection")
+	}
+	defer unregister()
+	_, count, err = router.RotateLease(platID, "acct-preserve", after.NodeHash, after.LeaseCreatedAtNs,
+		"cloudflare.com", routing.RotateLeaseOptions{})
+	if err != nil || count != 1 || !newClosed.Load() || closed.Load() != 0 {
+		t.Fatalf("later forced rotation crossed generations: count=%d oldClosed=%d newClosed=%v err=%v", count, closed.Load(), newClosed.Load(), err)
+	}
+}
+
+func TestRotateLease_PreservesConcurrentTransfers(t *testing.T) {
+	pool, subMgr := setupPool(t)
+	makeRoutableNode(t, pool, subMgr, `{"transfer":"1"}`, "198.51.100.1", "cloudflare.com", 10*time.Millisecond)
+	makeRoutableNode(t, pool, subMgr, `{"transfer":"2"}`, "198.51.100.2", "cloudflare.com", 20*time.Millisecond)
+	router := makeRouter(pool, nil)
+	before, err := router.RouteRequest(platName, "acct-transfer", "cloudflare.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const count = 3
+	peers := make([]net.Conn, 0, count)
+	ready := make(chan struct{}, count)
+	finished := make(chan error, count)
+	for range count {
+		connection, peer := net.Pipe()
+		t.Cleanup(func() { connection.Close(); peer.Close() })
+		if err := connection.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if err := peer.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		unregister, ok := router.RegisterLeaseConnection(before, "acct-transfer", func() { connection.Close() })
+		if !ok {
+			t.Fatal("register transfer connection")
+		}
+		t.Cleanup(unregister)
+		peers = append(peers, peer)
+		go func() {
+			ready <- struct{}{}
+			_, err := connection.Write([]byte("in-flight"))
+			finished <- err
+		}()
+	}
+	for range count {
+		<-ready
+	}
+	// Pipe writes remain in flight until their peers read after the rotation.
+	_, closed, err := router.RotateLease(platID, "acct-transfer", before.NodeHash, before.LeaseCreatedAtNs,
+		"cloudflare.com", routing.RotateLeaseOptions{ExcludeEgressIP: true, PreserveConnections: true})
+	if err != nil || closed != 0 {
+		t.Fatalf("rotation: closed=%d err=%v", closed, err)
+	}
+	for _, peer := range peers {
+		data := make([]byte, len("in-flight"))
+		if _, err := io.ReadFull(peer, data); err != nil || string(data) != "in-flight" {
+			t.Fatalf("transfer interrupted: data=%q err=%v", data, err)
+		}
+	}
+	for range count {
+		if err := <-finished; err != nil {
+			t.Fatalf("in-flight write failed: %v", err)
+		}
 	}
 }
 
@@ -222,7 +328,7 @@ func TestRotateLease_ClosesOnlyExpectedGeneration(t *testing.T) {
 		t.Fatal("failed to register old generation")
 	}
 	defer oldUnregister()
-	newLease, _, err := router.RotateLease(platID, "acct-generation", oldRoute.NodeHash, oldRoute.LeaseCreatedAtNs, "cloudflare.com", false)
+	newLease, _, err := router.RotateLease(platID, "acct-generation", oldRoute.NodeHash, oldRoute.LeaseCreatedAtNs, "cloudflare.com", routing.RotateLeaseOptions{})
 	if err != nil {
 		t.Fatalf("first rotate failed: %v", err)
 	}
@@ -265,7 +371,7 @@ func TestRotateLease_CloseCallbackRunsOutsideRecoveryLock(t *testing.T) {
 	defer unregister()
 	rotateDone := make(chan error, 1)
 	go func() {
-		_, _, rotateErr := router.RotateLease(platID, "acct-callback", res.NodeHash, res.LeaseCreatedAtNs, "cloudflare.com", false)
+		_, _, rotateErr := router.RotateLease(platID, "acct-callback", res.NodeHash, res.LeaseCreatedAtNs, "cloudflare.com", routing.RotateLeaseOptions{})
 		rotateDone <- rotateErr
 	}()
 	select {
@@ -307,7 +413,7 @@ func TestRotateLease_EventCallbackRunsOutsideRecoveryLock(t *testing.T) {
 	}
 	rotateDone := make(chan error, 1)
 	go func() {
-		_, _, rotateErr := router.RotateLease(platID, "acct-event-callback", res.NodeHash, res.LeaseCreatedAtNs, "cloudflare.com", false)
+		_, _, rotateErr := router.RotateLease(platID, "acct-event-callback", res.NodeHash, res.LeaseCreatedAtNs, "cloudflare.com", routing.RotateLeaseOptions{})
 		rotateDone <- rotateErr
 	}()
 	select {
@@ -345,7 +451,7 @@ func TestRotateLease_ConcurrentReplay(t *testing.T) {
 	for i := 0; i < concurrency; i++ {
 		go func() {
 			defer wg.Done()
-			_, _, err := router.RotateLease(platID, "acct-conc", res.NodeHash, res.LeaseCreatedAtNs, "cloudflare.com", false)
+			_, _, err := router.RotateLease(platID, "acct-conc", res.NodeHash, res.LeaseCreatedAtNs, "cloudflare.com", routing.RotateLeaseOptions{})
 			if err == nil {
 				successes.Add(1)
 			} else if errors.Is(err, routing.ErrLeaseChanged) {

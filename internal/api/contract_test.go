@@ -473,6 +473,49 @@ func TestAPIContract_RequestBodyTooLarge(t *testing.T) {
 }
 
 func TestAPIContract_RotateLease(t *testing.T) {
+	t.Run("connection preservation is explicit and optional", func(t *testing.T) {
+		for _, preserve := range []bool{false, true} {
+			srv, cp, _ := newControlPlaneTestServer(t)
+			platformID, account, before := seedRotateLease(t, srv, cp, "rotate-preserve", 2)
+			hash, err := node.ParseHex(before.NodeHash)
+			if err != nil {
+				t.Fatal(err)
+			}
+			created, err := strconv.ParseInt(before.CreatedAtNs, 10, 64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var closed atomic.Int32
+			for range 2 {
+				unregister, ok := cp.Router.RegisterLeaseConnection(routing.RouteResult{
+					PlatformID: platformID, NodeHash: hash, LeaseCreatedAtNs: created,
+				}, account, func() { closed.Add(1) })
+				if !ok {
+					t.Fatal("register connection")
+				}
+				defer unregister()
+			}
+			payload := map[string]any{
+				"expected_node_hash": before.NodeHash, "expected_created_at_ns": before.CreatedAtNs,
+				"target_host": "cloudflare.com", "exclude_egress_ip": true,
+			}
+			if preserve {
+				payload["preserve_connections"] = true
+			}
+			rec := doJSONRequest(t, srv, http.MethodPost, "/api/v1/platforms/"+platformID+"/leases/"+account+"/rotate", payload, true)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("rotation status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			wantClosed := int32(2)
+			if preserve {
+				wantClosed = 0
+			}
+			if closed.Load() != wantClosed || decodeJSONMap(t, rec)["closed_connections"] != float64(wantClosed) {
+				t.Fatalf("preserve=%v closed=%d body=%s", preserve, closed.Load(), rec.Body.String())
+			}
+		}
+	})
+
 	t.Run("success", func(t *testing.T) {
 		srv, cp, _ := newControlPlaneTestServer(t)
 		platformID, account, before := seedRotateLease(t, srv, cp, "rotate-success", 2)

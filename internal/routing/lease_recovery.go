@@ -54,9 +54,14 @@ func (r *Router) RegisterLeaseConnection(route RouteResult, account string, clos
 	}, true
 }
 
+type RotateLeaseOptions struct {
+	ExcludeEgressIP     bool
+	PreserveConnections bool
+}
+
 // RotateLease replaces exactly the observed lease. No candidate leaves it intact.
-// Existing tunnels for that version are closed before the caller receives success.
-func (r *Router) RotateLease(platformID, account string, expectedNode node.Hash, expectedCreatedAtNs int64, target string, excludeEgressIP bool) (*model.Lease, int, error) {
+// HTTP-level failures can preserve established tunnels; new dials use the new lease.
+func (r *Router) RotateLease(platformID, account string, expectedNode node.Hash, expectedCreatedAtNs int64, target string, options RotateLeaseOptions) (*model.Lease, int, error) {
 	plat, ok := r.pool.GetPlatform(platformID)
 	if !ok {
 		return nil, 0, ErrPlatformNotFound
@@ -74,7 +79,7 @@ func (r *Router) RotateLease(platformID, account string, expectedNode node.Hash,
 			return current, xsync.CancelOp
 		}
 		excluded := nodeExclusionSet{expectedNode: struct{}{}}
-		if excludeEgressIP {
+		if options.ExcludeEgressIP {
 			plat.View().Range(func(hash node.Hash) bool {
 				if entry, exists := r.pool.GetEntry(hash); exists && entry.GetEgressIP() == current.EgressIP {
 					excluded[hash] = struct{}{}
@@ -89,7 +94,7 @@ func (r *Router) RotateLease(platformID, account string, expectedNode node.Hash,
 			return current, xsync.CancelOp
 		}
 		// Recheck the selected IP because an egress probe can update it concurrently.
-		if replacement.NodeHash == current.NodeHash || (excludeEgressIP && replacement.EgressIP == current.EgressIP) {
+		if replacement.NodeHash == current.NodeHash || (options.ExcludeEgressIP && replacement.EgressIP == current.EgressIP) {
 			rotateErr = ErrNoAvailableNodes
 			return current, xsync.CancelOp
 		}
@@ -105,7 +110,7 @@ func (r *Router) RotateLease(platformID, account string, expectedNode node.Hash,
 		return replacement, xsync.UpdateOp
 	})
 	var connections []*leaseConnection
-	if rotateErr == nil {
+	if rotateErr == nil && !options.PreserveConnections {
 		for connection := range r.leaseConnections[key] {
 			connections = append(connections, connection)
 		}

@@ -85,6 +85,7 @@ type RotateLeaseRequest struct {
 	ExpectedCreatedAtNs string `json:"expected_created_at_ns"`
 	TargetHost          string `json:"target_host"`
 	ExcludeEgressIP     bool   `json:"exclude_egress_ip"`
+	PreserveConnections bool   `json:"preserve_connections"`
 }
 
 type RotateLeaseResponse struct {
@@ -115,7 +116,9 @@ func (s *ControlPlaneService) RotateLease(platformID, account string, req Rotate
 			return nil, invalidArg("target_host: invalid host:port")
 		}
 	}
-	lease, closed, err := s.Router.RotateLease(platformID, account, hash, created, target, req.ExcludeEgressIP)
+	lease, closed, err := s.Router.RotateLease(platformID, account, hash, created, target, routing.RotateLeaseOptions{
+		ExcludeEgressIP: req.ExcludeEgressIP, PreserveConnections: req.PreserveConnections,
+	})
 	if errors.Is(err, routing.ErrLeaseChanged) {
 		if s.Router.ReadLease(model.LeaseKey{PlatformID: platformID, Account: account}) == nil {
 			return nil, notFound("lease not found")
