@@ -44,6 +44,11 @@ var (
 		ResinError: "INVALID_HOST",
 		Message:    "Invalid or empty host",
 	}
+	ErrInvalidTLSProfile = &ProxyError{
+		HTTPCode:   http.StatusBadRequest,
+		ResinError: "INVALID_TLS_PROFILE",
+		Message:    "Invalid account TLS profile",
+	}
 	ErrPlatformNotFound = &ProxyError{
 		HTTPCode:   http.StatusNotFound,
 		ResinError: "PLATFORM_NOT_FOUND",

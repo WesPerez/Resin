@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/Resinat/Resin/internal/netutil"
+	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/outbound"
 	"github.com/Resinat/Resin/internal/platform"
 	"github.com/Resinat/Resin/internal/routing"
@@ -80,13 +81,15 @@ func NewReverseProxy(cfg ReverseProxyConfig) *ReverseProxy {
 	}
 }
 
-func (p *ReverseProxy) outboundHTTPTransport(routed routedOutbound) *http.Transport {
+func (p *ReverseProxy) outboundHTTPTransport(routed routedOutbound, profile accountTLSProfile) *http.Transport {
 	p.transportPoolOnce.Do(func() {
 		if p.transportPool == nil {
 			p.transportPool = NewOutboundTransportPool(p.transportConfig)
 		}
 	})
-	return p.transportPool.Get(routed.Route.NodeHash, routed.Outbound, p.metricsSink)
+	return p.transportPool.getForIdentity(routed.Route.NodeHash, routed.Outbound, p.metricsSink, outboundIdentity{
+		Platform: routed.Route.PlatformID, Account: routed.Account, TLS: profile,
+	})
 }
 
 func (p *ReverseProxy) directHTTPTransport() *http.Transport {
@@ -98,10 +101,11 @@ func (p *ReverseProxy) directHTTPTransport() *http.Transport {
 
 // parsedPath holds the result of parsing a reverse proxy request path.
 type parsedPath struct {
-	PlatformName string
-	Account      string
-	Protocol     string
-	Host         string
+	PlatformName       string
+	Account            string
+	Protocol           string
+	Host               string
+	RequiresTLSProfile bool
 	// Path preserves the original escaped remaining path after host (may be
 	// empty), e.g. "v1/users/team%2Fa/profile".
 	Path string
@@ -112,6 +116,7 @@ type parsedPath struct {
 var forwardingIdentityHeaders = []string{
 	// Internal account override header must not leak to upstream services.
 	"X-Resin-Account",
+	accountTLSProfileHeader,
 	"Forwarded",
 	"X-Forwarded-For",
 	"X-Forwarded-Host",
@@ -184,6 +189,10 @@ func (p *ReverseProxy) parsePathV1(rawPath string) (*parsedPath, *ProxyError) {
 		return nil, perr
 	}
 	protocol := strings.ToLower(protocolSeg)
+	requiresTLSProfile := strings.HasSuffix(protocol, "+tls-v1")
+	if requiresTLSProfile {
+		protocol = strings.TrimSuffix(protocol, "+tls-v1")
+	}
 	if protocol != "http" && protocol != "https" {
 		return nil, ErrInvalidProtocol
 	}
@@ -205,11 +214,12 @@ func (p *ReverseProxy) parsePathV1(rawPath string) (*parsedPath, *ProxyError) {
 	}
 
 	return &parsedPath{
-		PlatformName: platName,
-		Account:      account,
-		Protocol:     protocol,
-		Host:         host,
-		Path:         remainingPath,
+		PlatformName:       platName,
+		Account:            account,
+		Protocol:           protocol,
+		Host:               host,
+		Path:               remainingPath,
+		RequiresTLSProfile: requiresTLSProfile,
 	}, nil
 }
 
@@ -247,6 +257,10 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeProxyError(w, perr)
 		return
 	}
+	if parsed.RequiresTLSProfile && r.Header.Get(accountTLSProfileHeader) == "" {
+		writeProxyError(w, ErrInvalidTLSProfile)
+		return
+	}
 
 	lifecycle := newRequestLifecycle(p.events, r, ProxyTypeReverse, false)
 	lifecycle.setTarget(parsed.Host, "")
@@ -278,6 +292,13 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	behaviorPlatform := p.resolvePlatformForAccountBehavior(parsed.PlatformName)
 	account, _, extractionFailed := p.resolveReverseProxyAccount(parsed, r, behaviorPlatform)
 	lifecycle.setAccount(account)
+	profile, profileErr := resolveAccountTLSProfile(r.Header.Get(accountTLSProfileHeader), parsed.PlatformName, account, p.token != "")
+	if profileErr != nil {
+		lifecycle.setProxyError(profileErr)
+		lifecycle.setHTTPStatus(profileErr.HTTPCode)
+		writeProxyError(w, profileErr)
+		return
+	}
 
 	if shouldRejectReverseProxyAccountExtractionFailure(extractionFailed, behaviorPlatform) {
 		lifecycle.setProxyError(ErrAccountRejected)
@@ -301,7 +322,13 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var nodeHashRaw = route.NodeHash
 	domain := netutil.ExtractDomain(parsed.Host)
 	if p.bypass != nil && p.bypass.ShouldBypass(parsed.Host) {
-		transport = p.directHTTPTransport()
+		if account != "" || profile.ID != "" {
+			transport = p.transportPool.getForIdentity(node.Hash{}, nil, p.metricsSink, outboundIdentity{
+				Platform: parsed.PlatformName, Account: account, TLS: profile,
+			})
+		} else {
+			transport = p.directHTTPTransport()
+		}
 	} else {
 		routed, routeErr := resolveRoutedOutbound(p.router, p.pool, parsed.PlatformName, account, parsed.Host)
 		if routeErr != nil {
@@ -317,7 +344,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if p.health != nil {
 			go p.health.RecordLatency(nodeHashRaw, domain, nil)
 		}
-		transport = p.outboundHTTPTransport(routed)
+		transport = p.outboundHTTPTransport(routed, profile)
 	}
 
 	proxy := &httputil.ReverseProxy{
@@ -358,6 +385,11 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeProxyError(rw, proxyErr)
 		},
 		ModifyResponse: func(resp *http.Response) error {
+			resp.Header.Del("X-Resin-Error")
+			resp.Header.Del(accountTLSProfileHeader)
+			if r.Header.Get(accountTLSProfileHeader) != "" {
+				resp.Header.Set(accountTLSProfileHeader, profile.ID)
+			}
 			lifecycle.setHTTPStatus(resp.StatusCode)
 			lifecycle.addIngressBytes(headerWireLen(resp.Header))
 			if resp.StatusCode == http.StatusSwitchingProtocols {

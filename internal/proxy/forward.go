@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Resinat/Resin/internal/netutil"
+	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/outbound"
 	"github.com/Resinat/Resin/internal/routing"
 )
@@ -79,13 +80,15 @@ func NewForwardProxy(cfg ForwardProxyConfig) *ForwardProxy {
 	}
 }
 
-func (p *ForwardProxy) outboundHTTPTransport(routed routedOutbound) *http.Transport {
+func (p *ForwardProxy) outboundHTTPTransport(routed routedOutbound, profile accountTLSProfile) *http.Transport {
 	p.transportPoolOnce.Do(func() {
 		if p.transportPool == nil {
 			p.transportPool = NewOutboundTransportPool(p.transportConfig)
 		}
 	})
-	return p.transportPool.Get(routed.Route.NodeHash, routed.Outbound, p.metricsSink)
+	return p.transportPool.getForIdentity(routed.Route.NodeHash, routed.Outbound, p.metricsSink, outboundIdentity{
+		Platform: routed.Route.PlatformID, Account: routed.Account, TLS: profile,
+	})
 }
 
 func (p *ForwardProxy) directHTTPTransport() *http.Transport {
@@ -221,6 +224,7 @@ func prepareForwardOutboundRequest(in *http.Request) *http.Request {
 	// Do not propagate client-side close semantics to upstream transport reuse.
 	req.Close = false
 	stripHopByHopHeaders(req.Header)
+	req.Header.Del(accountTLSProfileHeader)
 	return req
 }
 
@@ -235,12 +239,25 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	lifecycle.setTarget(r.Host, r.URL.String())
 	defer lifecycle.finish()
 	lifecycle.setAccount(account)
+	profile, profileErr := resolveAccountTLSProfile(r.Header.Get(accountTLSProfileHeader), platName, account, p.token != "")
+	if profileErr != nil {
+		lifecycle.setProxyError(profileErr)
+		lifecycle.setHTTPStatus(profileErr.HTTPCode)
+		writeProxyError(w, profileErr)
+		return
+	}
 
 	var route routing.RouteResult
 	var hasRoute bool
 	var transport *http.Transport
 	if p.bypass != nil && p.bypass.ShouldBypass(r.Host) {
-		transport = p.directHTTPTransport()
+		if account != "" || profile.ID != "" {
+			transport = p.transportPool.getForIdentity(node.Hash{}, nil, p.metricsSink, outboundIdentity{
+				Platform: platName, Account: account, TLS: profile,
+			})
+		} else {
+			transport = p.directHTTPTransport()
+		}
 	} else {
 		routed, routeErr := resolveRoutedOutbound(p.router, p.pool, platName, account, r.Host)
 		if routeErr != nil {
@@ -255,7 +272,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		if p.health != nil {
 			go p.health.RecordLatency(route.NodeHash, netutil.ExtractDomain(r.Host), nil)
 		}
-		transport = p.outboundHTTPTransport(routed)
+		transport = p.outboundHTTPTransport(routed, profile)
 	}
 	outReq := prepareForwardOutboundRequest(r)
 	upstreamTrace := newUpstreamRequestTrace(lifecycle.markFirstByteReceived)
@@ -299,6 +316,11 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	lifecycle.setNetOK(true)
 
 	// Copy end-to-end response headers and body.
+	resp.Header.Del("X-Resin-Error")
+	resp.Header.Del(accountTLSProfileHeader)
+	if r.Header.Get(accountTLSProfileHeader) != "" {
+		resp.Header.Set(accountTLSProfileHeader, profile.ID)
+	}
 	lifecycle.addIngressBytes(copyEndToEndHeaders(w.Header(), resp.Header))
 	w.WriteHeader(resp.StatusCode)
 	copiedBytes, copyErr := io.Copy(w, resp.Body)

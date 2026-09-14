@@ -10,6 +10,7 @@ import (
 type routedOutbound struct {
 	Route    routing.RouteResult
 	Outbound adapter.Outbound
+	Account  string
 }
 
 func resolveRoutedOutbound(
@@ -47,5 +48,6 @@ func resolveRoutedOutboundExcluding(
 	return routedOutbound{
 		Route:    result,
 		Outbound: *obPtr,
+		Account:  account,
 	}, nil
 }
