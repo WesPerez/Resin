@@ -103,7 +103,8 @@ func (r *Router) RotateLease(platformID, account string, expectedNode node.Hash,
 				return current, xsync.CancelOp
 			}
 			replacement = leaseForNode(plat, options.PreferredNode, entry.GetEgressIP(), now, nowNs)
-			if replacement.EgressIP != options.ExpectedTargetIP || !entry.IsHealthy() || !plat.View().Contains(options.PreferredNode) {
+			if replacement.EgressIP != options.ExpectedTargetIP || entry.GetEgressIP() != options.ExpectedTargetIP ||
+				!entry.IsHealthy() || !plat.View().Contains(options.PreferredNode) {
 				rotateErr = ErrNoAvailableNodes
 				return current, xsync.CancelOp
 			}
