@@ -473,6 +473,56 @@ func TestAPIContract_RequestBodyTooLarge(t *testing.T) {
 }
 
 func TestAPIContract_RotateLease(t *testing.T) {
+	t.Run("explicit candidate needs no parent lease", func(t *testing.T) {
+		srv, cp, _ := newControlPlaneTestServer(t)
+		platformID, account, before := seedRotateLease(t, srv, cp, "rotate-preferred", 3)
+		plat, _ := cp.Pool.GetPlatform(platformID)
+		var preferred node.Hash
+		var expectedIP string
+		plat.View().Range(func(hash node.Hash) bool {
+			if hash.Hex() == before.NodeHash {
+				return true
+			}
+			entry, _ := cp.Pool.GetEntry(hash)
+			preferred, expectedIP = hash, entry.GetEgressIP().String()
+			return false
+		})
+		if preferred.IsZero() {
+			t.Fatal("fixture has no preferred candidate")
+		}
+		rec := doJSONRequest(t, srv, http.MethodPost, "/api/v1/platforms/"+platformID+"/leases/"+account+"/rotate", map[string]any{
+			"expected_node_hash": before.NodeHash, "expected_created_at_ns": before.CreatedAtNs,
+			"target_host": "credit.linux.do", "exclude_egress_ip": true, "preserve_connections": true,
+			"preferred_node_hash": preferred.Hex(), "expected_target_ip": expectedIP,
+		}, true)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("preferred rotation status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		body := decodeJSONMap(t, rec)
+		lease, ok := body["lease"].(map[string]any)
+		if !ok || body["status"] != "rotated" || lease["node_hash"] != preferred.Hex() || lease["egress_ip"] != expectedIP {
+			t.Fatalf("preferred rotation did not use the exact candidate: body=%s", rec.Body.String())
+		}
+	})
+
+	t.Run("unavailable explicit candidate never falls back to random", func(t *testing.T) {
+		srv, cp, _ := newControlPlaneTestServer(t)
+		platformID, account, before := seedRotateLease(t, srv, cp, "rotate-preferred-missing", 3)
+		rec := doJSONRequest(t, srv, http.MethodPost, "/api/v1/platforms/"+platformID+"/leases/"+account+"/rotate", map[string]any{
+			"expected_node_hash": before.NodeHash, "expected_created_at_ns": before.CreatedAtNs,
+			"target_host": "credit.linux.do", "exclude_egress_ip": true,
+			"preferred_node_hash": node.HashFromRawOptions([]byte(`{"absent":"preferred"}`)).Hex(),
+			"expected_target_ip":  "198.51.100.40",
+		}, true)
+		if rec.Code != http.StatusUnprocessableEntity || decodeJSONMap(t, rec)["status"] != "no_alternative" {
+			t.Fatalf("missing candidate status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		after, err := cp.GetLease(platformID, account)
+		if err != nil || after.NodeHash != before.NodeHash || after.CreatedAtNs != before.CreatedAtNs {
+			t.Fatalf("original lease changed: before=%+v after=%+v err=%v", before, after, err)
+		}
+	})
+
 	t.Run("connection preservation is explicit and optional", func(t *testing.T) {
 		for _, preserve := range []bool{false, true} {
 			srv, cp, _ := newControlPlaneTestServer(t)
@@ -632,6 +682,23 @@ func TestAPIContract_RotateLeaseNotFoundAndValidation(t *testing.T) {
 		map[string]any{"expected_node_hash": validHash, "expected_created_at_ns": 123, "target_host": "cloudflare.com"},
 		map[string]any{"expected_node_hash": validHash, "expected_created_at_ns": strconv.FormatInt(now, 10), "target_host": "https://cloudflare.com"},
 		map[string]any{"expected_node_hash": validHash, "expected_created_at_ns": strconv.FormatInt(now, 10), "target_host": "cloudflare.com", "unknown": true},
+	}
+	for _, candidate := range []map[string]any{
+		{"preferred_node_hash": validHash},
+		{"expected_target_ip": "198.51.100.2"},
+		{"preferred_node_hash": "bad", "expected_target_ip": "198.51.100.2"},
+		{"preferred_node_hash": node.Zero.Hex(), "expected_target_ip": "198.51.100.2"},
+		{"preferred_node_hash": validHash, "expected_target_ip": "not-an-ip"},
+		{"preferred_node_hash": validHash, "expected_target_ip": "fe80::1%eth0"},
+		{"preferred_node_hash": validHash, "expected_target_ip": "224.0.0.1"},
+		{"preferred_node_hash": validHash, "expected_target_ip": "0.0.0.0"},
+		{"preferred_node_hash": validHash, "expected_target_ip": 123},
+	} {
+		body := map[string]any{"expected_node_hash": validHash, "expected_created_at_ns": strconv.FormatInt(now, 10), "target_host": "cloudflare.com"}
+		for name, value := range candidate {
+			body[name] = value
+		}
+		invalidBodies = append(invalidBodies, body)
 	}
 	for i, body := range invalidBodies {
 		rec := doJSONRequest(t, srv, http.MethodPost, path, body, true)

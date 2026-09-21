@@ -81,6 +81,19 @@ RESIN_PROXY_TUNNEL_FIRST_BYTE_TIMEOUT=10s
 - 收到任意上游字节后不再使用该超时；模型首 token 或长推理不属于 Resin 的判断范围。
 - Resin 不重放已进入加密隧道的业务请求。安全业务重放由拥有 L7 语义的上层服务负责。
 
+### 已审核节点的单账号租约轮换
+
+管理接口 `POST /api/v1/platforms/{id}/leases/{account}/rotate` 可同时传入
+`preferred_node_hash` 和 `expected_target_ip`，将已审核的候选用于本次轮换。
+`expected_node_hash` 与 `expected_created_at_ns` 仍断言旧租约，不能用候选值替代。
+
+指定候选必须属于原平台当前可路由视图、健康、具有相同的已审核出口 IP，且满足
+原有的节点/IP 排除条件。没有父租约也可选择；候选失效返回 `no_alternative`，
+保留原租约及连接，不静默改选随机节点。旧租约已变更仍返回 `stale_lease`。
+`preserve_connections`、租约 TTL 和 IP 负载统计沿用原语义；未传入这两个字段的
+调用保持原选择行为。该接口不会修改平台策略，也不代表候选已通过目标站点验证。
+调用方仍须在使用账号登录态前核验实际出口及站点响应。
+
 ## 回滚
 
 生产始终记录当前镜像 digest、二进制版本和状态库备份。更新失败时：

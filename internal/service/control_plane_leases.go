@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -86,6 +87,8 @@ type RotateLeaseRequest struct {
 	TargetHost          string `json:"target_host"`
 	ExcludeEgressIP     bool   `json:"exclude_egress_ip"`
 	PreserveConnections bool   `json:"preserve_connections"`
+	PreferredNodeHash   string `json:"preferred_node_hash,omitempty"`
+	ExpectedTargetIP    string `json:"expected_target_ip,omitempty"`
 }
 
 type RotateLeaseResponse struct {
@@ -116,9 +119,22 @@ func (s *ControlPlaneService) RotateLease(platformID, account string, req Rotate
 			return nil, invalidArg("target_host: invalid host:port")
 		}
 	}
-	lease, closed, err := s.Router.RotateLease(platformID, account, hash, created, target, routing.RotateLeaseOptions{
+	options := routing.RotateLeaseOptions{
 		ExcludeEgressIP: req.ExcludeEgressIP, PreserveConnections: req.PreserveConnections,
-	})
+	}
+	if req.PreferredNodeHash != "" || req.ExpectedTargetIP != "" {
+		preferred, err := node.ParseHex(req.PreferredNodeHash)
+		if err != nil || preferred.IsZero() {
+			return nil, invalidArg("preferred_node_hash: must name a node when expected_target_ip is supplied")
+		}
+		ip, err := netip.ParseAddr(req.ExpectedTargetIP)
+		if err != nil || ip.Zone() != "" || !ip.IsGlobalUnicast() {
+			return nil, invalidArg("expected_target_ip: must be an unscoped unicast IP when preferred_node_hash is supplied")
+		}
+		options.PreferredNode = preferred
+		options.ExpectedTargetIP = ip.Unmap()
+	}
+	lease, closed, err := s.Router.RotateLease(platformID, account, hash, created, target, options)
 	if errors.Is(err, routing.ErrLeaseChanged) {
 		if s.Router.ReadLease(model.LeaseKey{PlatformID: platformID, Account: account}) == nil {
 			return nil, notFound("lease not found")

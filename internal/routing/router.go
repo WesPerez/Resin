@@ -395,24 +395,28 @@ func (r *Router) createLease(
 	if err != nil {
 		return Lease{}, RouteResult{}, err
 	}
-	ttl := plat.StickyTTLNs
-	if ttl <= 0 {
-		ttl = int64(24 * time.Hour) // Default safeguard
-	}
-
-	lease := Lease{
-		NodeHash:       h,
-		EgressIP:       entry.GetEgressIP(),
-		CreatedAtNs:    nowNs,
-		ExpiryNs:       now.Add(time.Duration(ttl)).UnixNano(),
-		LastAccessedNs: nowNs,
-	}
+	lease := leaseForNode(plat, h, entry.GetEgressIP(), now, nowNs)
 	return lease, RouteResult{
 		NodeHash:         lease.NodeHash,
 		EgressIP:         lease.EgressIP,
 		LeaseCreated:     true,
 		LeaseCreatedAtNs: lease.CreatedAtNs,
 	}, nil
+}
+
+func leaseForNode(plat *platform.Platform, h node.Hash, ip netip.Addr, now time.Time, nowNs int64) Lease {
+	ttl := plat.StickyTTLNs
+	if ttl <= 0 {
+		ttl = int64(24 * time.Hour) // Default safeguard
+	}
+
+	return Lease{
+		NodeHash:       h,
+		EgressIP:       ip,
+		CreatedAtNs:    nowNs,
+		ExpiryNs:       now.Add(time.Duration(ttl)).UnixNano(),
+		LastAccessedNs: nowNs,
+	}
 }
 
 func (r *Router) cleanupPreviousLease(

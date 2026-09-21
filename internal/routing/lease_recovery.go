@@ -2,6 +2,7 @@ package routing
 
 import (
 	"errors"
+	"net/netip"
 	"time"
 
 	"github.com/Resinat/Resin/internal/model"
@@ -57,6 +58,10 @@ func (r *Router) RegisterLeaseConnection(route RouteResult, account string, clos
 type RotateLeaseOptions struct {
 	ExcludeEgressIP     bool
 	PreserveConnections bool
+	// A supplied candidate is strict: stale or unavailable candidates leave the
+	// original lease intact instead of silently choosing an unaudited node.
+	PreferredNode    node.Hash
+	ExpectedTargetIP netip.Addr
 }
 
 // RotateLease replaces exactly the observed lease. No candidate leaves it intact.
@@ -88,10 +93,27 @@ func (r *Router) RotateLease(platformID, account string, expectedNode node.Hash,
 			})
 		}
 		nowNs := max(now.UnixNano(), current.CreatedAtNs+1)
-		replacement, _, err := r.createLease(plat, state, netutil.ExtractDomain(target), now, nowNs, excluded)
-		if err != nil {
-			rotateErr = err
-			return current, xsync.CancelOp
+		var replacement Lease
+		if !options.PreferredNode.IsZero() || options.ExpectedTargetIP.IsValid() {
+			entry, exists := r.pool.GetEntry(options.PreferredNode)
+			if options.PreferredNode.IsZero() || !options.ExpectedTargetIP.IsValid() || !exists || !entry.IsHealthy() ||
+				!plat.View().Contains(options.PreferredNode) || excluded.contains(options.PreferredNode) ||
+				entry.GetEgressIP() != options.ExpectedTargetIP {
+				rotateErr = ErrNoAvailableNodes
+				return current, xsync.CancelOp
+			}
+			replacement = leaseForNode(plat, options.PreferredNode, entry.GetEgressIP(), now, nowNs)
+			if replacement.EgressIP != options.ExpectedTargetIP || !entry.IsHealthy() || !plat.View().Contains(options.PreferredNode) {
+				rotateErr = ErrNoAvailableNodes
+				return current, xsync.CancelOp
+			}
+		} else {
+			var err error
+			replacement, _, err = r.createLease(plat, state, netutil.ExtractDomain(target), now, nowNs, excluded)
+			if err != nil {
+				rotateErr = err
+				return current, xsync.CancelOp
+			}
 		}
 		// Recheck the selected IP because an egress probe can update it concurrently.
 		if replacement.NodeHash == current.NodeHash || (options.ExcludeEgressIP && replacement.EgressIP == current.EgressIP) {
