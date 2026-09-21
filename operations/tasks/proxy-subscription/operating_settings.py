@@ -1,8 +1,10 @@
 """Non-secret operational limits shared by the scheduled subscription tasks."""
 import json
+import os
 from pathlib import Path
 
-PATH = Path('/etc/server-scheduled-tasks/proxy-subscription-settings.json')
+PATH = Path(os.environ.get('PROXY_OPERATING_SETTINGS_FILE',
+                          '/etc/server-scheduled-tasks/proxy-subscription-settings.json'))
 DEFAULTS = {'site_ttl_minutes': 90, 'rotation_ttl_minutes': 60, 'max_page_load_ms': 18000,
             'network_cooldown_minutes': 30, 'challenge_quarantine_hours': 24,
             'rotation_batch_size': 8, 'client_probe_timeout_seconds': 10,
