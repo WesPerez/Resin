@@ -1,0 +1,50 @@
+{
+  "xray-proxy-health.timer": {
+    "file": "xray-proxy-health/last-status.json",
+    "summary": "公网代理入口最近采样",
+    "metrics": [
+      {
+        "path": "ok",
+        "label": "入口状态",
+        "labels": {
+          "true": "正常",
+          "false": "需要关注"
+        }
+      },
+      {
+        "path": "tls_ms",
+        "label": "TLS 握手",
+        "unit": "毫秒"
+      },
+      {
+        "path": "ws_503_ratio",
+        "label": "WebSocket 503 占比",
+        "format": "ratio"
+      },
+      {
+        "path": "conn_443_est",
+        "label": "当前连接",
+        "unit": "条"
+      },
+      {
+        "path": "mem_available_mb",
+        "label": "可用内存",
+        "unit": "MiB"
+      },
+      {
+        "path": "alerts",
+        "label": "触发告警",
+        "op": "count",
+        "unit": "项"
+      }
+    ],
+    "at": "ts",
+    "warnings": [
+      {
+        "path": "ok",
+        "equals": false,
+        "message": "入口监测存在异常，需结合告警数量与执行日志排查。"
+      }
+    ]
+  }
+}

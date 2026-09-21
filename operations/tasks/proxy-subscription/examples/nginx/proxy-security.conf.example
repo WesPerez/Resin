@@ -1,0 +1,8 @@
+log_format proxy_ws '$remote_addr [$time_local] status=$status bytes=$body_bytes_sent duration=$request_time upstream="$upstream_addr" upstream_status="$upstream_status" upstream_connect="$upstream_connect_time" upstream_response="$upstream_response_time" connection="$connection" connection_requests="$connection_requests" ua="$http_user_agent"';
+log_format proxy_xhttp '$remote_addr [$time_local] status=$status bytes=$body_bytes_sent duration=$request_time upstream="$upstream_addr" upstream_status="$upstream_status" upstream_connect="$upstream_connect_time" upstream_response="$upstream_response_time" http2="$http2" ua="$http_user_agent"';
+log_format proxy_subscription '$remote_addr [$time_local] status=$status bytes=$body_bytes_sent ua="$http_user_agent"';
+
+limit_conn_zone $binary_remote_addr zone=proxy_ws_conn:10m;
+limit_conn_zone $server_name zone=proxy_ws_global:10m;
+limit_req_zone $binary_remote_addr zone=proxy_ws_handshake:10m rate=100r/s;
+limit_req_zone $binary_remote_addr zone=proxy_subscription_rate:10m rate=60r/m;

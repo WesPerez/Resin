@@ -1,0 +1,44 @@
+[Unit]
+Description=Central Resin sticky egress failure guard
+After=network-online.target resin-apps.service
+Wants=network-online.target
+Requires=resin-apps.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/resin-operations/operations/tasks/resin-egress-guard
+LoadCredential=apps_admin:/etc/resin-apps/admin.token
+LoadCredential=feedback_token:/etc/resin-egress-guard/feedback.token
+LoadCredential=sub2_admin_key:/etc/server-scheduled-tasks/sub2api-admin-key
+ExecStart=/opt/resin-operations/operations/tasks/resin-egress-guard/resin-egress-guard.sh serve --confirm-production-write
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+UMask=0077
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=read-only
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/opt/resin-operations /root/sub2api-prod-deploy/data/sub2api/logs /etc/server-scheduled-tasks
+ReadWritePaths=/var/lib/server-scheduled-tasks/resin-egress-guard /run/lock
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "refresh_hours": 6,
+  "candidate_limit": 300,
+  "sources": [],
+  "gist": {
+    "protocols": ["vless", "ss"],
+    "ids": ["d148a848435f429748490bd193ef08ad"],
+    "max_gists": 4,
+    "max_files": 4
+  }
+}

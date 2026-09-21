@@ -1,0 +1,12 @@
+location ~ "^/sub/([0-9a-f]{64})\.yaml$" {
+    alias /var/lib/proxy-subscription/$1.yaml;
+    default_type "text/yaml; charset=utf-8";
+    limit_except GET HEAD { deny all; }
+    limit_req zone=proxy_subscription_rate burst=20 nodelay;
+    limit_req_status 429;
+    access_log /var/log/nginx/proxy-subscription-access.log proxy_subscription;
+    add_header Cache-Control "no-store" always;
+    add_header profile-update-interval "1" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    etag off;
+}

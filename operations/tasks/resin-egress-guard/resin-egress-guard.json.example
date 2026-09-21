@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "state_file": "/var/lib/server-scheduled-tasks/resin-egress-guard/state.json",
+  "lock_file": "/run/lock/resin-egress-guard.lock",
+  "api_timeout_seconds": 10,
+  "poll_interval_seconds": 3,
+  "evidence_window_seconds": 300,
+  "request_log_initial_lookback_seconds": 120,
+  "request_log_overlap_seconds": 10,
+  "request_log_page_limit": 500,
+  "request_log_max_pages": 10,
+  "limits": {
+    "min_interval_seconds": 30,
+    "burst_window_seconds": 900,
+    "burst_max": 3,
+    "account_cooldown_seconds": 3600,
+    "ambiguous_window_seconds": 60,
+    "ambiguous_threshold": 2,
+    "platform_guard_window_seconds": 60,
+    "platform_guard_account_limit": 20,
+    "platform_guard_cooldown_seconds": 300
+  },
+  "feedback": {
+    "listen_addresses": [
+      "172.17.0.1",
+      "172.20.0.1"
+    ],
+    "port": 19085,
+    "token_credential": "feedback_token",
+    "allowed_sources": [
+      "metapi",
+      "sub2api"
+    ]
+  },
+  "instances": [
+    {
+      "key": "unified",
+      "base_url": "http://proxy.internal:10834",
+      "admin_token_credential": "apps_admin",
+      "platforms": [
+        {
+          "id": "aedc2fe9-c7eb-464e-b3f9-908dc9429dd7",
+          "name": "AppsGlobal"
+        },
+        {
+          "id": "68d136ca-d0da-4985-92a1-95db67ed01c2",
+          "name": "AppsCN"
+        }
+      ]
+    }
+  ],
+  "sub2api_log": {
+    "enabled": true,
+    "poll_interval_seconds": 30,
+    "path": "/root/sub2api-prod-deploy/data/sub2api/logs/sub2api.log",
+    "tail_bytes": 16777216,
+    "evidence_window_seconds": 900,
+    "forward_failed": {
+      "enabled": true,
+      "poll_interval_seconds": 0.25,
+      "window_seconds": 300,
+      "retry_max_attempts": 8,
+      "retry_ttl_seconds": 300,
+      "retry_initial_seconds": 1,
+      "retry_max_seconds": 30
+    },
+    "admin": {
+      "base_url": "http://127.0.0.1:13080",
+      "credential": "sub2_admin_key",
+      "probe_account_id": 2300,
+      "timeout_seconds": 3
+    },
+    "profiles": [
+      {
+        "key": "global",
+        "proxy_id": 387,
+        "proxy_name": "Global",
+        "instance": "unified",
+        "platform_id": "aedc2fe9-c7eb-464e-b3f9-908dc9429dd7",
+        "platform_name": "AppsGlobal",
+        "proxy_host": "proxy.internal",
+        "proxy_port": 10834,
+        "username_template": "AppsGlobal.sub2-{account_id}",
+        "target_host": "api.openai.com"
+      },
+      {
+        "key": "cn",
+        "proxy_id": 390,
+        "proxy_name": "CN",
+        "instance": "unified",
+        "platform_id": "68d136ca-d0da-4985-92a1-95db67ed01c2",
+        "platform_name": "AppsCN",
+        "proxy_host": "proxy.internal",
+        "proxy_port": 10834,
+        "username_template": "AppsCN.sub2-{account_id}",
+        "target_host": "api.openai.com"
+      }
+    ]
+  }
+}
