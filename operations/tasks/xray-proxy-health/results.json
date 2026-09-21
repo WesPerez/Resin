@@ -76,6 +76,21 @@
           "not_due": "未到刷新时间",
           "unknown": "状态无法识别"
         }
+      },
+      {
+        "path": "tcp_retrans_delta",
+        "label": "本次采样间隔 TCP 重传",
+        "unit": "次"
+      },
+      {
+        "path": "tcp_synretrans_delta",
+        "label": "本次采样间隔握手重传",
+        "unit": "次"
+      },
+      {
+        "path": "tcp_timeouts_delta",
+        "label": "本次采样间隔 TCP 超时",
+        "unit": "次"
       }
     ],
     "at": "ts",
@@ -84,6 +99,71 @@
         "path": "ok",
         "equals": false,
         "message": "入口监测存在异常，需结合告警数量与执行日志排查。"
+      },
+      {
+        "path": "alerts[]",
+        "equals": "ws_short_ratio_high",
+        "message": "短连接比例偏高，请结合客户端重连情况查看。"
+      },
+      {
+        "path": "alerts[]",
+        "equals": "tcp_retrans_high",
+        "message": "TCP 重传偏高，当前网络质量需要关注。"
+      },
+      {
+        "path": "alerts[]",
+        "equals": "tcp_synretrans_high",
+        "message": "TCP 握手重传偏高，部分连接建立较慢。"
+      },
+      {
+        "path": "alerts[]",
+        "equals": "tcp_timeouts_high",
+        "message": "TCP 超时偏高，部分请求可能等待或重试。"
+      },
+      {
+        "path": "alerts[]",
+        "equals": "subscription_general_probe_failed",
+        "message": "通用代理出口验证失败。"
+      },
+      {
+        "path": "alerts[]",
+        "equals": "subscription_download_probe_failed",
+        "message": "订阅下载或发布内容核对失败。"
+      },
+      {
+        "path": "alerts[]",
+        "equals": "subscription_strict_probe_failed",
+        "message": "站点专用出口验证失败。"
+      },
+      {
+        "path": "alerts[]",
+        "equals": "subscription_strict_count_empty",
+        "message": "暂无合格的站点专用出口，专用通道保持关闭。"
+      },
+      {
+        "path": "alerts[]",
+        "equals": "subscription_general_count_empty",
+        "message": "通用代理出口为空。"
+      },
+      {
+        "path": "alerts[]",
+        "equals": "subscription_global_maintenance_primary_failed",
+        "message": "国际池更新失败，已保留原代理池。"
+      },
+      {
+        "path": "alerts[]",
+        "equals": "subscription_global_maintenance_failed",
+        "message": "国际池维护失败。"
+      },
+      {
+        "path": "alerts[]",
+        "equals": "subscription_cn_maintenance_failed",
+        "message": "国内池维护失败。"
+      },
+      {
+        "path": "alerts[]",
+        "equals": "subscription_bridge_unavailable",
+        "message": "代理连接保护进程或当前代次不可用。"
       }
     ]
   }
