@@ -50,6 +50,16 @@ class SubscriptionMetricsTests(unittest.TestCase):
         self.write("client", finished_at=9990, general={"passed": False}, strict={"passed": True})
         self.assertEqual(self.codes(), {"subscription_general_probe_failed": "crit"})
 
+    def test_empty_strict_pool_reports_availability_without_duplicate_failed_probe(self):
+        self.write("client", finished_at=9990, general={"passed": True},
+                   strict={"passed": False, "reason": "strict_pool_empty"}, inconclusive=False)
+        self.write("pools", updated_at=9990, routable={"Global-Auto": 12, "Sites-Verified": 0})
+        self.assertEqual(self.codes(), {"subscription_strict_count_empty": "warn"})
+        self.assertEqual(self.collect()["client"]["strict_status"], "waiting_for_qualified_exit")
+        self.write("client", finished_at=9990, general={"passed": False},
+                   strict={"passed": False, "reason": "strict_pool_empty"}, inconclusive=False)
+        self.assertIn("subscription_general_probe_failed", self.codes())
+
     def test_transition_and_unknown_capacity_are_explicit(self):
         self.write("client", finished_at=9990, inconclusive=True)
         self.assertIn("subscription_client_inconclusive", self.codes())
@@ -66,8 +76,19 @@ class SubscriptionMetricsTests(unittest.TestCase):
         self.write("maintenance", last_run_finished_at=9990, global_status="success", cn_status="failed")
         self.write("bridge", updated_at=9990, active_generation="a", frontend_pid=1,
                    instances={name: {} for name in "abcd"}, capacity=4)
-        self.assertEqual(self.codes(), {"subscription_cn_maintenance_failed": "warn",
-                                        "subscription_bridge_generation_capacity": "warn"})
+        self.assertEqual(self.codes(), {"subscription_cn_maintenance_failed": "warn"})
+        self.assertTrue(self.collect()["bridge"]["waiting_for_connections"])
+
+    def test_deferred_refresh_is_observable_without_hiding_an_unavailable_bridge(self):
+        self.write("maintenance", last_run_finished_at=9990, global_status="deferred", cn_status="success")
+        self.write("bridge", updated_at=9990, active_generation="a", frontend_pid=1,
+                   instances={name: {} for name in "abcd"}, capacity=4)
+        self.assertEqual(self.codes(), {})
+        self.assertEqual(self.collect()["maintenance"]["global"], "deferred")
+        self.assertTrue(self.collect()["bridge"]["waiting_for_connections"])
+        self.write("bridge", updated_at=9990, active_generation="missing", frontend_pid=1,
+                   instances={name: {} for name in "abcd"}, capacity=4)
+        self.assertEqual(self.codes(), {"subscription_bridge_unavailable": "crit"})
 
     def test_legacy_install_does_not_require_split_files(self):
         for path in self.paths.values():

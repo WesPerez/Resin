@@ -36,6 +36,46 @@
         "label": "触发告警",
         "op": "count",
         "unit": "项"
+      },
+      {
+        "path": "subscription.client.strict_status",
+        "label": "专用出口验证",
+        "labels": {
+          "passed": "通过",
+          "waiting_for_qualified_exit": "等待合格出口",
+          "unverified": "未通过或尚未验证"
+        }
+      },
+      {
+        "path": "subscription.pools.general_count",
+        "label": "通用出口数",
+        "unit": "个"
+      },
+      {
+        "path": "subscription.pools.strict_count",
+        "label": "专用出口数",
+        "unit": "个"
+      },
+      {
+        "path": "subscription.bridge.waiting_for_connections",
+        "label": "连接保护",
+        "labels": {
+          "true": "保留现有连接，等待空闲后更新代理池",
+          "false": "可以正常更新代理池"
+        }
+      },
+      {
+        "path": "subscription.maintenance.global",
+        "label": "国际池维护",
+        "labels": {
+          "success": "完成",
+          "failed": "更新失败",
+          "primary_failed": "更新失败，已保留旧池",
+          "skipped": "本轮跳过",
+          "deferred": "等待旧连接结束",
+          "not_due": "未到刷新时间",
+          "unknown": "状态无法识别"
+        }
       }
     ],
     "at": "ts",

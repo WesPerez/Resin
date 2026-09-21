@@ -84,6 +84,14 @@ def collect(paths=PATHS, now=None):
         result["client"]["inconclusive"] = boolean(client.get("inconclusive"))
         download = client.get("subscription")
         result["client"]["subscription_passed"] = boolean(download.get("passed")) if isinstance(download, dict) else None
+        strict = client.get("strict")
+        waiting = (isinstance(strict, dict) and strict.get("reason") == "strict_pool_empty"
+                   and strict.get("passed") is False
+                   and result["client"]["general_passed"] is True
+                   and result["client"]["subscription_passed"] is True
+                   and client.get("inconclusive") is False)
+        result["client"]["strict_status"] = ("waiting_for_qualified_exit" if waiting
+            else "passed" if result["client"]["strict_passed"] is True else "unverified")
         if result["client"]["status"] == "ok":
             if result["client"]["subscription_passed"] is not True:
                 alert("subscription_download_probe_failed", "crit")
@@ -91,7 +99,7 @@ def collect(paths=PATHS, now=None):
                 alert("subscription_client_inconclusive")
             elif result["client"]["general_passed"] is not True:
                 alert("subscription_general_probe_failed", "crit")
-            elif result["client"]["strict_passed"] is not True:
+            elif result["client"]["strict_passed"] is not True and not waiting:
                 alert("subscription_strict_probe_failed")
         pools = section("pools", "updated_at", 1800)
         routable = pools.get("routable") if isinstance(pools.get("routable"), dict) else {}
@@ -115,15 +123,17 @@ def collect(paths=PATHS, now=None):
         if bridge.get("active_generation") not in instances or not bridge.get("frontend_pid"):
             alert("subscription_bridge_unavailable", "crit")
         capacity = bridge.get("capacity")
-        if type(capacity) is int and capacity > 0 and len(instances) >= capacity:
-            alert("subscription_bridge_generation_capacity")
+        # Occupied generations preserve existing TCP sessions; capacity alone
+        # does not mean the active proxy has failed. Availability is checked above.
+        result["bridge"]["waiting_for_connections"] = (type(capacity) is int and capacity > 0
+                                                        and len(instances) >= capacity)
 
     maintenance = section("maintenance", "last_run_finished_at", 3 * 3600, required=result["enabled"])
     if result["maintenance"]["status"] in ("ok", "stale_or_invalid_time"):
         for name in ("global", "cn"):
             status = maintenance.get(name + "_status")
             # Do not copy arbitrary upstream strings into logs.
-            status = status if status in ("success", "failed", "primary_failed", "skipped") else "unknown"
+            status = status if status in ("success", "failed", "primary_failed", "skipped", "deferred", "not_due") else "unknown"
             result["maintenance"][name] = status
             if status in ("failed", "primary_failed", "unknown"):
                 alert("subscription_" + name + "_maintenance_" + status)
