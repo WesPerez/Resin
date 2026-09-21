@@ -1,0 +1,11 @@
+[Unit]
+Description=Keep subscription regional exits fresh every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+RandomizedDelaySec=15s
+Unit=proxy-region-latency.service
+
+[Install]
+WantedBy=timers.target

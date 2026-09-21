@@ -1,0 +1,12 @@
+[Unit]
+Description=Run unified Resin Global and CN pool maintenance hourly
+
+[Timer]
+OnCalendar=*-*-* 00..05,07..23:23:00 Asia/Shanghai
+RandomizedDelaySec=30s
+AccuracySec=1min
+Persistent=true
+Unit=resin-pool-maintenance.service
+
+[Install]
+WantedBy=timers.target

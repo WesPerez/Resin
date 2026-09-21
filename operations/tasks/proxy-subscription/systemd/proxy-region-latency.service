@@ -1,0 +1,23 @@
+[Unit]
+Description=Refresh low-latency Resin exits for the public proxy subscription
+After=network-online.target resin-apps.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+LoadCredential=admin_token:/etc/resin-apps/admin.token
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /opt/resin-operations/operations/tasks/proxy-subscription/region-latency.py --apply
+TimeoutStartSec=12min
+UMask=0077
+StateDirectory=proxy-region-latency
+StateDirectoryMode=0700
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run/lock
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=

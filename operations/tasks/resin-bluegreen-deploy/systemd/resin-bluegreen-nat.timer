@@ -1,0 +1,11 @@
+[Unit]
+Description=Reconcile Resin NAT and draining slots
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=15s
+AccuracySec=1s
+Unit=resin-bluegreen-nat.service
+
+[Install]
+WantedBy=timers.target

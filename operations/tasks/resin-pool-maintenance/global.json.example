@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "state_dir": "/var/lib/resin-pool-maintainer",
+  "lock_file": "/run/lock/resin-pool-maintainer.lock",
+  "retain_runs": 1,
+  "sources": [
+    {
+      "id": "fixed-port-singbox-bridge",
+      "type": "file",
+      "path": "/var/lib/resin-singbox-bridge/current/proxies.txt",
+      "allowed_non_public_proxy_ips": [
+        "172.17.0.1"
+      ],
+      "enabled": true
+    }
+  ],
+  "validation": {
+    "workers": 300,
+    "batch_size": 500,
+    "timeout_seconds": 5,
+    "target_hosts": [
+      "www.cloudflare.com",
+      "www.microsoft.com",
+      "www.wikipedia.org"
+    ],
+    "min_target_hosts_passed": 2,
+    "trace_egress": true,
+    "max_source_bytes": 4194304
+  },
+  "selection": {
+    "max_nodes": 1000,
+    "max_per_egress": 0,
+    "max_per_source": 0,
+    "max_per_credential_group": 0,
+    "min_per_region": 1,
+    "require_egress": true,
+    "allowed_regions": [],
+    "excluded_regions": [
+      "cn"
+    ]
+  },
+  "safety": {
+    "mode": "non_empty"
+  },
+  "resin": {
+    "base_url": "http://172.17.0.1:10834",
+    "api_timeout_seconds": 20,
+    "max_api_body_bytes": 900000,
+    "subscription_name": "managed-apps-public-pool",
+    "platform_id": "replace-with-apps-global-platform-uuid",
+    "platform_name": "AppsGlobal",
+    "managed_regex": "^managed-apps-public-pool/",
+    "include_current_subscription": false,
+    "preserve_existing_trusted_filters": false,
+    "platform_regex_filters": [
+      "^managed-apps-public-pool/"
+    ],
+    "region_filters": [],
+    "update_interval": "24h",
+    "ephemeral": true,
+    "incremental_alive_nodes": false,
+    "ephemeral_node_evict_delay": "72h",
+    "cache_db_paths": [
+      "/var/lib/resin-apps/state.db",
+      "/var/cache/resin-apps/cache.db"
+    ]
+  }
+}

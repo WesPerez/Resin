@@ -1,0 +1,64 @@
+{
+  "resin-pool-maintenance.timer": {
+    "file": "last-unified-run.json",
+    "summary": "国内与国际代理池维护结果",
+    "metrics": [
+      {
+        "path": "overall_status",
+        "label": "整体结果",
+        "labels": {
+          "success": "完成",
+          "ok": "完成",
+          "failed": "失败",
+          "partial": "部分完成",
+          "skipped": "本轮跳过",
+          "deferred": "等待旧连接结束，继续使用现有代理池"
+        }
+      },
+      {
+        "path": "global_status",
+        "label": "国际出口",
+        "labels": {
+          "success": "完成",
+          "ok": "完成",
+          "skipped": "未到刷新时间",
+          "failed": "失败",
+          "primary_failed": "更新失败，已保留旧代理池",
+          "not_due": "未到刷新时间",
+          "deferred": "等待旧连接结束，继续使用现有代理池"
+        }
+      },
+      {
+        "path": "cn_status",
+        "label": "国内出口",
+        "labels": {
+          "success": "完成",
+          "ok": "完成",
+          "skipped": "本轮跳过",
+          "failed": "失败"
+        }
+      },
+      {
+        "path": "last_global_success_epoch",
+        "label": "国际池最近更新",
+        "format": "timestamp",
+        "labels": {
+          "0": "暂无成功记录"
+        }
+      }
+    ],
+    "root": "resin",
+    "at": "last_run_finished_at",
+    "warnings": [
+      {
+        "path": "overall_status",
+        "equals": "failed",
+        "message": "代理池维护未完成，请查看本轮执行日志。"
+      }
+    ],
+    "status_path": "overall_status",
+    "status_map": {
+      "deferred": "deferred"
+    }
+  }
+}

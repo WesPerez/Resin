@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "title": "代理入口健康监测",
+  "description": "采样连接、错误比例和内存，记录异常告警",
+  "category": "network",
+  "manual": true,
+  "effect": "只读采集健康指标并记录告警。"
+}

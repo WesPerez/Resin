@@ -1,0 +1,7 @@
+{
+  "clients": ["sub2api-prod", "antigravity-manager", "metapi-check-in"],
+  "proxy_token_file": "/etc/resin-apps/proxy.token",
+  "probe_identity": "AppsGlobal.bluegreen-check",
+  "probe_target": "https://www.cloudflare.com/cdn-cgi/trace",
+  "probe_status": 200
+}
