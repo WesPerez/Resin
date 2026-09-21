@@ -96,7 +96,7 @@ func TestRotateLease_InvalidPreferredRetainsLeaseAndConnections(t *testing.T) {
 				entry.SetEgressIP(netip.MustParseAddr("198.51.100.4"))
 			case "outside_platform":
 				plat, _ := pool.GetPlatform(platID)
-				plat.NotifyDirty(candidate, func(node.Hash) (*node.NodeEntry, bool) { return nil, false }, subMgr.Lookup, nil)
+				plat.NotifyDirty(candidate, func(node.Hash) (*node.NodeEntry, bool) { return nil, false }, nil, nil)
 			case "disabled":
 				sub, _ := subMgr.Get("sub-1")
 				sub.SetEnabled(false)
