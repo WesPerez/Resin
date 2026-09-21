@@ -22,7 +22,7 @@ jobs:
       - run: python -m pip install pytest PyYAML
       - name: Verify connection preservation, guard policy and deployment recovery
         run: >-
-          sudo env "PATH=$PATH" python -B -m pytest -q --import-mode=importlib
+          sudo env "PATH=$PATH" python -B -m pytest -q
           operations/tasks/resin-pool-maintenance/tests
           operations/tasks/resin-egress-guard/tests
           operations/tasks/resin-bluegreen-deploy/test_bluegreen.py
