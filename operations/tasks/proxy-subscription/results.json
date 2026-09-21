@@ -4,6 +4,16 @@
     "summary": "服务端经公网入口的真实客户端验证",
     "metrics": [
       {
+        "path": "status",
+        "label": "本轮检查",
+        "labels": {
+          "ok": "全部通过",
+          "failed": "链路检查失败",
+          "deferred": "等待合格的站点专用出口",
+          "skipped": "出口变化，等待下次复验"
+        }
+      },
+      {
         "path": "ok",
         "label": "整体验证",
         "labels": {
@@ -39,22 +49,38 @@
         "path": "strict_approved_count",
         "label": "已验证专用出口",
         "unit": "个"
+      },
+      {
+        "path": "strict.reason",
+        "label": "专用出口说明",
+        "labels": {
+          "strict_pool_empty": "暂无通过站点验证的出口，专用通道保持关闭"
+        }
       }
     ],
     "root": "proxy",
     "at": "finished_at",
     "warnings": [
       {
-        "path": "ok",
-        "equals": false,
+        "path": "status",
+        "equals": "failed",
         "message": "客户端链路验收未通过，请检查订阅与出口状态。"
+      },
+      {
+        "path": "strict.reason",
+        "equals": "strict_pool_empty",
+        "message": "站点专用出口暂不可用，等待节点通过站点验证。"
       },
       {
         "path": "inconclusive",
         "equals": true,
         "message": "采样期间出口发生变化，本次结果需要复验。"
       }
-    ]
+    ],
+    "status_map": {
+      "deferred": "deferred",
+      "skipped": "skipped"
+    }
   },
   "proxy-rotation-quality.timer": {
     "source": "journal",
@@ -114,7 +140,14 @@
     ],
     "status_map": {
       "skipped": "skipped"
-    }
+    },
+    "warnings": [
+      {
+        "path": "site_qualified",
+        "equals": 0,
+        "message": "暂无通过站点验证的出口；通用出口仍可独立使用。"
+      }
+    ]
   },
   "proxy-region-latency.timer": {
     "source": "journal",

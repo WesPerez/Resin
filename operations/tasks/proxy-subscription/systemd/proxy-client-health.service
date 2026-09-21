@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+SuccessExitStatus=75
 User=root
 Environment=PYTHONDONTWRITEBYTECODE=1
 ExecStart=/usr/bin/python3 /opt/resin-operations/operations/tasks/proxy-subscription/client-health.py

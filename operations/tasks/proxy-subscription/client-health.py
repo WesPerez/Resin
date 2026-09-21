@@ -111,7 +111,7 @@ def run(staged=False, general_only=False):
         for name in wanted:
             strict = name == client_pools.STRICT_NAME
             if strict and not strict_ips:
-                report["strict"] = {"passed": False, "reason": "strict_pool_empty"}
+                report["strict"] = {"passed": False, "skipped": True, "reason": "strict_pool_empty"}
                 continue
             call("/proxies/PROXY", {"name": name})
             report["strict" if strict else "general"] = probe(rotation, proxy, strict_ips if strict else general_ips, strict)
@@ -122,6 +122,13 @@ def run(staged=False, general_only=False):
     report["ok"] = (not report["inconclusive"] and report["general"]["passed"]
                     and (staged or download["passed"])
                     and (general_only or report["strict"]["passed"]))
+    # No qualified strict exit is a missing prerequisite, not a failed probe.
+    # Keep ok=False so callers cannot mistake this for full channel acceptance.
+    report["deferred"] = (not report["inconclusive"] and not general_only
+                          and report["general"]["passed"] and (staged or download["passed"])
+                          and report["strict"].get("reason") == "strict_pool_empty")
+    report["status"] = ("ok" if report["ok"] else "skipped" if report["inconclusive"]
+                        else "deferred" if report["deferred"] else "failed")
     return report
 
 
@@ -135,10 +142,10 @@ def main():
         report = run(args.staged, args.general_only)
     except Exception as exc:
         report = {"version": 1, "finished_at": time.time(), "ok": False, "inconclusive": False,
-                  "scope": "server_public_ingress", "error": type(exc).__name__}
+                  "status": "failed", "scope": "server_public_ingress", "error": type(exc).__name__}
     site_policy.atomic_json(args.output, report)
     print(json.dumps(report, sort_keys=True))
-    return 0 if report["ok"] or report["inconclusive"] else 1
+    return 0 if report["ok"] or report["inconclusive"] else 75 if report.get("deferred") else 1
 
 
 if __name__ == "__main__":
