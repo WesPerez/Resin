@@ -82,7 +82,7 @@ bridge 路由，按实际 IP 去重。每平台禁用自身流量引起的被动
 
 主要入口：`rotation-control.py provision` 备份并创建身份；`unify` 验证并切换；`refresh`
 续期和补充；`enforce` 清理检测路由、约束资格并重新发布。生产 timer 为
-`proxy-rotation-quality.timer`；旧 `proxy-site-quality.timer` 在统一模式不再执行页面复测。
+`proxy-rotation-quality.timer`；旧 `proxy-site-quality.timer` 已退役，资格约束由共享维护流程继续执行。
 浏览器复测每轮结束后间隔 3 分钟（另有 0–15 秒抖动）；30 分钟提前续期、90 分钟证据期限和
 页面性能判定保持原值。采用 `CPUWeight=20`，保留单核 CPU 配额，避免硬限过低把正常节点误判为慢节点。
 该周期仅用于代理页面质量复测，与 Sender 的每秒容量重试无关。
@@ -134,7 +134,7 @@ LINUX DO 必须显示真实话题链接；AgentRouter 必须显示真实登录�
 - `site-control.py`：`discover`、`audit`、`seed`、`activate`、`enforce`、`refresh`、`revoke`、`quarantine`。激活前备份平台过滤器和原订阅。
 - `verify-site-subscription.py`：逐地区启动隔离 Mihomo，使用真实订阅协议检查双站；`--auto-fast` 额外检查自动组实际选择。
 - `site-subscription.py`：只发布有效且已有精确平台路由的地区；零有效出口时发布 `REJECT`，不会直连或重新开放全池。
-- `proxy-site-quality.timer`：每轮结束后 15 分钟复测已有候选；发布和续期都必须再次通过两轮客户端检查。
+- `proxy-rotation-quality.timer`：统一复测和续期入口，每轮结束后 3 分钟复测（另有 0–15 秒抖动）；发布和续期都必须再次通过两轮客户端检查。旧 `proxy-site-quality.timer` 已移除，不另启重复调度。
 - 原 `proxy-region-latency.timer`：严格模式中只执行审批约束，禁用宽池回退。任务与节点池更新共享锁，忙时跳过，下一轮继续核对。
 
 节点池每次重启新 bridge 前和回滚旧 bridge 前都会检查配置身份。被替换的固定端口先从
