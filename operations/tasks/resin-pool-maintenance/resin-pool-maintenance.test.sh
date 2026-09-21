@@ -68,7 +68,7 @@ PYTHONDONTWRITEBYTECODE=1 \
 systemd-analyze verify \
   "$TASK_DIR/systemd/resin-pool-maintenance.service" \
   "$TASK_DIR/systemd/resin-pool-maintenance.timer" \
-  "$TASK_DIR/systemd/resin-apps.service" \
+  "$TASK_DIR/../resin-bluegreen-deploy/systemd/resin-apps.service" \
   "$TASK_DIR/systemd/resin-singbox-bridge.service"
 
 printf '%s\n' 'PASS: unified Resin Global/CN maintenance test suite'
