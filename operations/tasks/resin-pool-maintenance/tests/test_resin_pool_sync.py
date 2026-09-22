@@ -5,7 +5,6 @@ import datetime as dt
 import hashlib
 import importlib.util
 import json
-import sqlite3
 import sys
 import tempfile
 import urllib.request
@@ -167,81 +166,27 @@ class ResinPoolSyncTests(unittest.TestCase):
                 {"selected_count": 2},
             )
 
-    def test_read_subscription_node_state_uses_cache_schema(self):
-        with tempfile.TemporaryDirectory() as temp:
-            cache = Path(temp) / "cache.db"
-            with sqlite3.connect(cache) as db:
-                db.executescript(
-                    """
-                    CREATE TABLE subscription_nodes (
-                        subscription_id TEXT NOT NULL,
-                        node_hash TEXT NOT NULL,
-                        evicted INTEGER NOT NULL DEFAULT 0
-                    );
-                    INSERT INTO subscription_nodes VALUES ('sub', 'a', 0);
-                    INSERT INTO subscription_nodes VALUES ('sub', 'b', 1);
-                    INSERT INTO subscription_nodes VALUES ('other', 'c', 1);
-                    """
-                )
-            self.assertEqual(
-                MODULE.read_subscription_node_state([str(cache)], "sub"),
-                (2, 1),
-            )
+    def test_subscription_node_state_uses_live_api_counts(self):
+        for active, evicted in [(0, 0), (2, 1), (0, 3)]:
+            with self.subTest(active=active, evicted=evicted):
+                self.assertEqual(MODULE.subscription_node_state({
+                    "managed_node_count": active + evicted,
+                    "node_count": active, "evicted_node_count": evicted,
+                }), (active + evicted, evicted))
 
-    def test_slot_reconciliation_uses_only_active_cache_with_overlapping_slots(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            record = root / "deployment.json"
-            config = {"cache_db_paths": [str(root / "legacy" / "cache.db")],
-                      "deployment_record": str(record)}
-            for slot, count in (("legacy", 9), ("blue", 2), ("green", 3)):
-                cache = root / slot / "cache.db"
-                cache.parent.mkdir()
-                with sqlite3.connect(cache) as db:
-                    db.execute("CREATE TABLE subscription_nodes (subscription_id TEXT, node_hash TEXT, evicted INTEGER)")
-                    db.executemany("INSERT INTO subscription_nodes VALUES ('sub', ?, 0)",
-                                   [(str(i),) for i in range(count)])
-            for slot, count in (("blue", 2), ("green", 3)):
-                record.write_text(json.dumps({"version": 1, "active": {
-                    "slot": slot, "cache_db": str(root / slot / "cache.db")}}))
-                paths = MODULE.subscription_cache_paths(config)
-                self.assertEqual(MODULE.read_subscription_node_state(paths, "sub"), (count, 0))
-
-    def test_slot_reconciliation_falls_back_before_first_migration(self):
-        with tempfile.TemporaryDirectory() as temp:
-            record = Path(temp) / "deployment.json"
-            config = {"cache_db_paths": ["legacy.db"], "deployment_record": str(record)}
-            self.assertEqual(MODULE.subscription_cache_paths(config), ["legacy.db"])
-            record.write_text(json.dumps({"version": 1, "active": {"slot": "legacy"}}))
-            self.assertEqual(MODULE.subscription_cache_paths(config), ["legacy.db"])
-
-    def test_slot_reconciliation_rejects_unsettled_or_invalid_records(self):
-        with tempfile.TemporaryDirectory() as temp:
-            record = Path(temp) / "deployment.json"
-            config = {"cache_db_paths": ["legacy.db"], "deployment_record": str(record)}
-            invalid_records = [
-                "{", "[]", json.dumps({"version": 2}),
-                json.dumps({"version": 1, "active": {"slot": "blue"}}),
-                json.dumps({"version": 1, "active": {"slot": "other", "cache_db": "/cache.db"}}),
-                json.dumps({"version": 1, "active": {"slot": "blue", "cache_db": "relative/cache.db"}}),
-                json.dumps({"version": 1, "active": {"slot": "legacy"}, "pending": {"slot": "blue"}}),
-                json.dumps({"version": 1, "active": {"slot": "legacy"}, "preparing": {"slot": "blue"}}),
-            ]
-            for content in invalid_records:
-                with self.subTest(content=content):
-                    record.write_text(content)
-                    with self.assertRaises(MODULE.SyncError):
-                        MODULE.subscription_cache_paths(config)
-
-    def test_slot_reconciliation_never_falls_back_from_missing_active_cache(self):
-        with tempfile.TemporaryDirectory() as temp:
-            record = Path(temp) / "deployment.json"
-            record.write_text(json.dumps({"version": 1, "active": {
-                "slot": "green", "cache_db": str(Path(temp) / "missing" / "cache.db")}}))
-            paths = MODULE.subscription_cache_paths({"cache_db_paths": ["legacy.db"],
-                                                     "deployment_record": str(record)})
-            with self.assertRaisesRegex(MODULE.SyncError, "not uniquely identified"):
-                MODULE.read_subscription_node_state(paths, "sub")
+    def test_subscription_node_state_rejects_legacy_and_invalid_counts(self):
+        valid = {"managed_node_count": 3, "evicted_node_count": 1, "node_count": 2}
+        for field in valid:
+            for value in [None, True, "1", 1.5, -1]:
+                with self.subTest(field=field, value=value):
+                    with self.assertRaisesRegex(MODULE.SyncError, "valid live node counts"):
+                        MODULE.subscription_node_state({**valid, field: value})
+        for invalid in [{}, {"node_count": 2},
+                        {**valid, "evicted_node_count": 4},
+                        {**valid, "managed_node_count": 4}]:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(MODULE.SyncError):
+                    MODULE.subscription_node_state(invalid)
 
     def test_verify_subscription_allows_only_historical_evicted_deficit(self):
         content = "socks5h://127.0.0.1:12000\n"

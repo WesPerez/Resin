@@ -11,6 +11,7 @@ import (
 
 	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/routing"
 	"github.com/Resinat/Resin/internal/subscription"
 )
 
@@ -57,18 +58,24 @@ func TestRecoveryLease_NoAlternativeThenNewCandidate(t *testing.T) {
 		t.Fatalf("recovery: %+v %v", result, err)
 	}
 	result, err = cp.ReportLeaseFailure(plat.Name, "account", recoveryFailure(result.Lease))
-	if err != nil || result.Status != "no_alternative" || result.Lease.NodeHash != b.Hex() {
+	if err != nil || result.Status != "recovery_limited" || result.Lease.NodeHash != b.Hex() {
 		t.Fatalf("must not bounce to A: %+v %v", result, err)
 	}
 	recoveryTestNode(t, cp, "same-a-ip", "198.51.100.1")
 	result, err = cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{"example.com:443"})
-	if err != nil || result.Status != "no_alternative" {
+	if err != nil || result.Status != "recovery_limited" {
 		t.Fatalf("cooled IP reused: %+v %v", result, err)
 	}
 	c := recoveryTestNode(t, cp, "c", "198.51.100.3")
 	result, err = cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{"example.com:443"})
-	if err != nil || result.Status != "available" || result.Lease.NodeHash != c.Hex() {
-		t.Fatalf("next candidate: %+v %v", result, err)
+	if err != nil || result.Status != "recovery_limited" || result.Lease.NodeHash != b.Hex() {
+		t.Fatalf("acquire bypassed recovery limits: %+v %v", result, err)
+	}
+	// An administrator can still rotate; target cooling survives a limited report.
+	created, _ := strconv.ParseInt(result.Lease.CreatedAtNs, 10, 64)
+	manual, _, err := cp.Router.RotateLease(plat.ID, "account", b, created, "example.com:443", routing.RotateLeaseOptions{PreserveConnections: true, ApplyTargetCooldown: true})
+	if err != nil || manual.NodeHash != c.Hex() {
+		t.Fatalf("manual recovery failed to exclude cooled exits: %+v %v", manual, err)
 	}
 	entry, _ := cp.Pool.GetEntry(a)
 	if !entry.IsHealthy() {

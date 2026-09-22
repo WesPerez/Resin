@@ -80,10 +80,12 @@ func (s *ControlPlaneService) acquireRecoveryLease(platformName, account string,
 	}
 	status := "available"
 	if s.Router.TargetCooling(route.PlatformID, account, req.TargetHost, route.NodeHash, route.EgressIP) {
-		_, _, err = s.Router.RotateLease(route.PlatformID, account, route.NodeHash, route.LeaseCreatedAtNs, req.TargetHost,
+		_, _, err = s.Router.RecoverLease(route.PlatformID, account, route.NodeHash, route.LeaseCreatedAtNs, req.TargetHost,
 			routing.RotateLeaseOptions{PreserveConnections: true, ApplyTargetCooldown: true})
 		if errors.Is(err, routing.ErrNoAvailableNodes) {
 			status = "no_alternative"
+		} else if errors.Is(err, routing.ErrRecoveryLimited) || errors.Is(err, routing.ErrRecoveryDisabled) {
+			status = "recovery_limited"
 		} else if errors.Is(err, routing.ErrLeaseChanged) && retries > 0 {
 			return s.acquireRecoveryLease(platformName, account, req, retries-1)
 		} else if errors.Is(err, routing.ErrLeaseChanged) {
@@ -130,11 +132,13 @@ func (s *ControlPlaneService) ReportLeaseFailure(platformName, account string, r
 	if !ok || plat == nil {
 		return nil, notFound("platform not found")
 	}
-	lease, _, err := s.Router.RotateLease(plat.ID, account, hash, created, req.TargetHost,
+	lease, _, err := s.Router.RecoverLease(plat.ID, account, hash, created, req.TargetHost,
 		routing.RotateLeaseOptions{ExcludeEgressIP: true, PreserveConnections: true, ApplyTargetCooldown: true, FailureCooldown: 10 * time.Minute})
 	status := "rotated"
 	if errors.Is(err, routing.ErrLeaseChanged) {
 		status = "stale_lease"
+	} else if errors.Is(err, routing.ErrRecoveryLimited) || errors.Is(err, routing.ErrRecoveryDisabled) {
+		status = "recovery_limited"
 	} else if errors.Is(err, routing.ErrNoAvailableNodes) {
 		status = "no_alternative"
 	} else if err != nil {

@@ -67,10 +67,6 @@
     "update_interval": "6h",
     "ephemeral": false,
     "incremental_alive_nodes": false,
-    "ephemeral_node_evict_delay": "72h",
-    "cache_db_paths": [
-      "/var/lib/resin-apps/state.db",
-      "/var/cache/resin-apps/cache.db"
-    ]
+    "ephemeral_node_evict_delay": "72h"
   }
 }

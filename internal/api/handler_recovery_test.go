@@ -82,3 +82,24 @@ func TestRecoveryActions_RejectMalformedInput(t *testing.T) {
 		})
 	}
 }
+
+func TestRecoveryStatus_RequiresAdminAndExposesNoIdentities(t *testing.T) {
+	srv, _, _ := newControlPlaneTestServer(t)
+	unauth := doJSONRequest(t, srv, http.MethodGet, "/api/v1/system/recovery", nil, false)
+	if unauth.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status=%d", unauth.Code)
+	}
+	authed := doJSONRequest(t, srv, http.MethodGet, "/api/v1/system/recovery", nil, true)
+	if authed.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", authed.Code, authed.Body.String())
+	}
+	value := decodeJSONMap(t, authed)
+	if value["rotated"] != float64(0) || value["limited"] != float64(0) || value["since"] == nil {
+		t.Fatalf("invalid counters: %v", value)
+	}
+	for _, field := range []string{"account", "token", "node", "platform_id"} {
+		if _, found := value[field]; found {
+			t.Fatalf("unexpected identity field: %s", field)
+		}
+	}
+}

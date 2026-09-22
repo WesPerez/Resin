@@ -2,7 +2,7 @@ name: Project operations
 
 on:
   push:
-    branches: [mine, 'feat/project-operations-*']
+    branches: [mine, 'candidate-*', 'feat/project-operations-*']
     paths: ['operations/**', '.github/workflows/operations.yml']
   pull_request:
     paths: ['operations/**', '.github/workflows/operations.yml']

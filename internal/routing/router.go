@@ -29,15 +29,19 @@ type PoolAccessor interface {
 
 // Router handles route selection and lease management.
 type Router struct {
-	pool             PoolAccessor
-	states           *xsync.Map[string, *PlatformRoutingState]
-	authorities      func() []string
-	p2cWindow        func() time.Duration
-	onLeaseEvent     LeaseEventFunc
-	nodeTagResolver  func(node.Hash) string
-	recoveryMu       sync.RWMutex
-	leaseConnections map[leaseConnectionKey]map[*leaseConnection]struct{}
-	targetCooldowns  map[targetCooldownKey]targetCooldown
+	pool              PoolAccessor
+	states            *xsync.Map[string, *PlatformRoutingState]
+	authorities       func() []string
+	p2cWindow         func() time.Duration
+	onLeaseEvent      LeaseEventFunc
+	nodeTagResolver   func(node.Hash) string
+	recoveryMu        sync.RWMutex
+	leaseConnections  map[leaseConnectionKey]map[*leaseConnection]struct{}
+	targetCooldowns   map[targetCooldownKey]targetCooldown
+	recoveryPolicy    func() RecoveryPolicy
+	recoveryAccounts  map[model.LeaseKey]recoveryAccountHistory
+	recoveryPlatforms map[string]*recoveryPlatformHistory
+	recoveryStatus    RecoveryStatus
 }
 
 type RouterConfig struct {
@@ -49,6 +53,8 @@ type RouterConfig struct {
 	// NodeTagResolver resolves a node hash to its display tag ("<Sub>/<Tag>").
 	// If nil, NodeTag will be empty.
 	NodeTagResolver func(node.Hash) string
+	// RecoveryPolicy is read for automatic recovery only, never manual rotation.
+	RecoveryPolicy func() RecoveryPolicy
 }
 
 func NewRouter(cfg RouterConfig) *Router {
@@ -59,6 +65,8 @@ func NewRouter(cfg RouterConfig) *Router {
 		p2cWindow:       cfg.P2CWindow,
 		onLeaseEvent:    cfg.OnLeaseEvent,
 		nodeTagResolver: cfg.NodeTagResolver,
+		recoveryPolicy:  cfg.RecoveryPolicy,
+		recoveryStatus:  RecoveryStatus{Since: time.Now()},
 	}
 }
 
@@ -107,6 +115,35 @@ func (r *Router) RouteRequestExcluding(platName, account, target string, exclude
 // that already failed during the same bounded connection attempt.
 func (r *Router) RouteRequestExcludingNodes(platName, account, target string, excluded []node.Hash) (RouteResult, error) {
 	return r.routeRequest(platName, account, target, newNodeExclusionSet(excluded), false)
+}
+
+// PeekRouteExcludingNodes selects a retry candidate without changing a sticky
+// lease, load counters or lease events. A zero lease generation intentionally
+// leaves one-off connections outside lease registration and recovery.
+func (r *Router) PeekRouteExcludingNodes(platName, account, target string, excluded []node.Hash) (RouteResult, error) {
+	if HasLeaseGuard(account) {
+		return RouteResult{}, ErrLeaseGuard
+	}
+	plat, err := r.resolvePlatform(platName)
+	if err != nil {
+		return RouteResult{}, err
+	}
+	exclusions := newNodeExclusionSet(excluded)
+	if exclusions == nil {
+		exclusions = make(nodeExclusionSet)
+	}
+	r.recoveryMu.RLock()
+	r.addTargetCooldownExclusionsLocked(plat.ID, account, target, time.Now(), exclusions)
+	result, err := r.routeRandom(plat, r.ensurePlatformState(plat.ID), netutil.ExtractDomain(target), exclusions)
+	r.recoveryMu.RUnlock()
+	if err != nil {
+		return RouteResult{}, err
+	}
+	result = withPlatformContext(plat, result)
+	if r.nodeTagResolver != nil {
+		result.NodeTag = r.nodeTagResolver(result.NodeHash)
+	}
+	return result, nil
 }
 
 type nodeExclusionSet map[node.Hash]struct{}

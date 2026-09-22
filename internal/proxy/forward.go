@@ -289,6 +289,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		lifecycle.setHTTPStatus(proxyErr.HTTPCode)
 		if hasRoute {
 			recordPassiveResultAsync(p.health, route, false)
+			recoverTunnelLease(p.router, route, account, r.Host)
 		}
 		writeProxyError(w, proxyErr)
 		return
@@ -411,16 +412,17 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lifecycle.setHTTPStatus(http.StatusOK)
+	recoverFailure := sync.OnceFunc(func() {
+		recoverTunnelLease(p.router, prepare.route, account, target)
+	})
 	relay := pumpPreparedTunnel(clientConn, clientBuf.Reader, prepare.session, tunnelPumpOptions{
 		requireBidirectionalTraffic: true,
 		onFirstIngressByte:          lifecycle.markFirstByteReceived,
 		firstByteTimeout:            p.firstByteTimeout,
-		onFirstByteTimeout: func() {
-			invalidateTunnelLease(p.router, prepare.route, account)
-		},
+		onFirstByteTimeout:          recoverFailure,
 	})
 	if !prepare.session.recoveryClosed.Load() && shouldInvalidateTunnelLease(relay) {
-		invalidateTunnelLease(p.router, prepare.route, account)
+		recoverFailure()
 	}
 	lifecycle.addIngressBytes(relay.ingressBytes)
 	lifecycle.addEgressBytes(relay.egressBytes)

@@ -176,8 +176,21 @@ func prepareConnectTunnel(
 	excluded := make([]node.Hash, 0, retries)
 	attempts := retries + 1
 	var lastFailure tunnelPrepareResult
+	var grant *routing.RecoveryGrant
+	finishFailedRecovery := func() {
+		if grant != nil && ctx.Err() == nil {
+			_, _, _ = deps.router.CommitRecoveryGrant(grant, target, routing.RotateLeaseOptions{
+				ExcludeEgressIP: true, PreserveConnections: true, ApplyTargetCooldown: true, FailureCooldown: 10 * time.Minute,
+				ExcludedNodes: excluded,
+			})
+		}
+	}
 	for attempt := 0; attempt < attempts; attempt++ {
-		routed, routeErr := resolveRoutedOutboundExcluding(
+		resolve := resolveRoutedOutboundExcluding
+		if attempt > 0 {
+			resolve = resolveRoutedOutboundPeek
+		}
+		routed, routeErr := resolve(
 			deps.router,
 			deps.pool,
 			platformName,
@@ -187,6 +200,7 @@ func prepareConnectTunnel(
 		)
 		if routeErr != nil {
 			if lastFailure.proxyErr != nil {
+				finishFailedRecovery()
 				return lastFailure
 			}
 			return tunnelPrepareResult{proxyErr: routeErr}
@@ -211,7 +225,6 @@ func prepareConnectTunnel(
 			if deps.health != nil {
 				recordPassiveResultAsync(deps.health, routed.Route, false)
 			}
-			invalidateTunnelLease(deps.router, routed.Route, account)
 			lastFailure = tunnelPrepareResult{
 				route:         routed.Route,
 				proxyErr:      proxyErr,
@@ -220,6 +233,13 @@ func prepareConnectTunnel(
 			}
 			if routed.Route.LeaseGuarded {
 				return lastFailure
+			}
+			if attempt == 0 && account != "" && routed.Route.LeaseCreatedAtNs != 0 {
+				var beginErr error
+				grant, beginErr = deps.router.BeginRecovery(routed.Route.PlatformID, account, routed.Route.NodeHash, routed.Route.LeaseCreatedAtNs)
+				if beginErr != nil && !errors.Is(beginErr, routing.ErrRecoveryLimited) && !errors.Is(beginErr, routing.ErrRecoveryDisabled) {
+					return lastFailure
+				}
 			}
 			excluded = append(excluded, routed.Route.NodeHash)
 			if attempt+1 < attempts {
@@ -232,6 +252,19 @@ func prepareConnectTunnel(
 				)
 			}
 			continue
+		}
+
+		if grant != nil {
+			next, _, commitErr := deps.router.CommitRecoveryGrant(grant, target, routing.RotateLeaseOptions{
+				PreferredNode: routed.Route.NodeHash, ExpectedTargetIP: routed.Route.EgressIP,
+				PreserveConnections: true, ApplyTargetCooldown: true, FailureCooldown: 10 * time.Minute,
+			})
+			if commitErr != nil {
+				_ = rawConn.Close()
+				return tunnelPrepareResult{route: routed.Route, proxyErr: mapRouteError(commitErr), upstreamStage: "connect_recovery", upstreamErr: commitErr}
+			}
+			routed.Route.LeaseCreatedAtNs = next.CreatedAtNs
+			routed.Route.LeaseCreated = true
 		}
 
 		if routed.Route.LeaseGuarded {
@@ -266,6 +299,7 @@ func prepareConnectTunnel(
 			},
 		}
 	}
+	finishFailedRecovery()
 	return lastFailure
 }
 
@@ -342,6 +376,20 @@ func invalidateTunnelLease(router *routing.Router, route routing.RouteResult, ac
 		)
 	}
 	return deleted
+}
+
+// Recover directly from the completed tunnel's structured failure. Log retention
+// and log enablement cannot affect this path; client cancellation is filtered by
+// shouldInvalidateTunnelLease before it reaches here.
+func recoverTunnelLease(router *routing.Router, route routing.RouteResult, account, target string) {
+	if router == nil || route.LeaseGuarded || account == "" || route.PlatformID == "" || route.NodeHash.IsZero() || route.LeaseCreatedAtNs == 0 {
+		return
+	}
+	_, _, err := router.RecoverLease(route.PlatformID, account, route.NodeHash, route.LeaseCreatedAtNs, target,
+		routing.RotateLeaseOptions{ExcludeEgressIP: true, PreserveConnections: true, ApplyTargetCooldown: true, FailureCooldown: 10 * time.Minute})
+	if err == nil {
+		log.Printf("proxy sticky lease recovered: platform_id=%s observed_node_hash=%s", route.PlatformID, route.NodeHash.Hex())
+	}
 }
 
 func registerPreparedTunnel(router *routing.Router, route routing.RouteResult, account string, client net.Conn, session *preparedTunnel) (func(), bool) {

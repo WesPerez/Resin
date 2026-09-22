@@ -13,7 +13,6 @@ import ipaddress
 import json
 import os
 import shutil
-import sqlite3
 import sys
 import time
 import urllib.error
@@ -400,90 +399,20 @@ def config_with_current_subscription(
     return effective
 
 
-def subscription_cache_paths(resin: Mapping[str, Any]) -> list[str]:
-    paths = resin.get("cache_db_paths") or []
-    if not isinstance(paths, list):
-        raise SyncError("resin.cache_db_paths must be an array")
-    legacy_paths = [str(path) for path in paths]
-    record_path = resin.get("deployment_record")
-    if not record_path:
-        return legacy_paths
-    try:
-        record = json.loads(Path(str(record_path)).read_text())
-    except FileNotFoundError:
-        return legacy_paths
-    except (OSError, ValueError) as exc:
-        raise SyncError("Resin deployment record cannot be read") from exc
-    if not isinstance(record, dict) or record.get("version") != 1:
-        raise SyncError("invalid Resin deployment record")
-    if record.get("preparing") or record.get("pending"):
-        raise SyncError("Resin deployment recovery is pending")
-    active = record.get("active")
-    if not isinstance(active, dict):
-        raise SyncError("invalid Resin active slot")
-    if active.get("slot") == "legacy":
-        return legacy_paths
-    cache = active.get("cache_db")
-    if (active.get("slot") not in ("blue", "green") or not isinstance(cache, str)
-            or not Path(cache).is_absolute() or Path(cache).name != "cache.db"):
-        raise SyncError("Resin active slot cache path is missing or invalid")
-    return [cache]
+def subscription_node_state(subscription: Mapping[str, Any]) -> tuple[int, int]:
+    """Read the serving Resin process's authenticated, live subscription counts.
 
-
-def read_subscription_node_state(
-    db_paths: Sequence[str], subscription_id: str
-) -> tuple[int, int]:
-    """Read managed/evicted counts from Resin's read-only cache database.
-
-    Resin's Admin API exposes ``node_count`` after excluding Evicted nodes.
-    The cache table is the authoritative local record for the distinction, so
-    use it only as a short, indexed, read-only reconciliation query.  The
-    caller treats this as a pre-refresh upper bound; a stale/missing database
-    fails closed rather than silently widening the acceptance window.
+    Missing fields indicate an incompatible provider. Fail before any write;
+    never infer a count from a delayed cache or silently widen the gate.
     """
-    if not subscription_id:
-        raise SyncError("cannot read Resin node state without a subscription id")
-    candidates: list[tuple[Path, int, int]] = []
-    for raw_path in db_paths:
-        path = Path(str(raw_path)).resolve()
-        if not path.is_file():
-            continue
-        try:
-            uri_path = urllib.parse.quote(str(path), safe="/")
-            with sqlite3.connect(
-                f"file:{uri_path}?mode=ro", uri=True, timeout=5
-            ) as db:
-                db.execute("PRAGMA query_only=ON")
-                db.execute("PRAGMA busy_timeout=5000")
-                columns = {
-                    str(row[1])
-                    for row in db.execute("PRAGMA table_info(subscription_nodes)")
-                }
-                if not {"subscription_id", "node_hash", "evicted"}.issubset(columns):
-                    continue
-                row = db.execute(
-                    """
-                    SELECT COUNT(*),
-                           COALESCE(SUM(CASE WHEN evicted <> 0 THEN 1 ELSE 0 END), 0)
-                      FROM subscription_nodes
-                     WHERE subscription_id = ?
-                    """,
-                    (subscription_id,),
-                ).fetchone()
-        except sqlite3.Error as exc:
-            raise SyncError("Resin cache database read failed") from exc
-        if not row:
-            raise SyncError("Resin cache database returned no node-state row")
-        managed_count = int(row[0] or 0)
-        evicted_count = int(row[1] or 0)
-        if managed_count < 0 or evicted_count < 0 or evicted_count > managed_count:
-            raise SyncError("Resin cache database returned an invalid node state")
-        candidates.append((path, managed_count, evicted_count))
-
-    if len(candidates) != 1:
-        raise SyncError("Resin cache database with subscription_nodes was not uniquely identified")
-    _, managed_count, evicted_count = candidates[0]
-    return managed_count, evicted_count
+    fields = ("managed_node_count", "evicted_node_count", "node_count")
+    counts = [subscription.get(field) for field in fields]
+    if any(type(count) is not int or count < 0 for count in counts):
+        raise SyncError("Resin subscription API lacks valid live node counts; upgrade Resin first")
+    managed, evicted, active = counts
+    if active + evicted != managed:
+        raise SyncError("Resin subscription API returned inconsistent node counts")
+    return managed, evicted
 
 
 def new_run_dir(state_dir: Path) -> Path:
@@ -1042,13 +971,8 @@ def run(args: argparse.Namespace) -> int:
             ):
                 raise SyncError("Resin state changed during validation; refusing stale overwrite")
             before_evicted_count = 0
-            # The orchestrator and slot deployer hold the same data-plane lock.
-            cache_db_paths = subscription_cache_paths(resin)
-            if before_sub is not None and cache_db_paths:
-                _, before_evicted_count = read_subscription_node_state(
-                    [str(path) for path in cache_db_paths],
-                    str(before_sub.get("id") or ""),
-                )
+            if before_sub is not None:
+                _, before_evicted_count = subscription_node_state(before_sub)
             active_node_floor = minimum_active_node_count(config, previous)
             verify_timeout = float(resin.get("verify_timeout_seconds") or 120.0)
             verify_settle_reads = int(resin.get("verify_settle_reads") or 2)

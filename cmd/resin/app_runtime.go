@@ -185,6 +185,12 @@ func (a *resinApp) initTopologyRuntime(engine *state.StateEngine) (*netutil.Retr
 			return time.Duration(runtimeConfigSnapshot(a.runtimeCfg).P2CLatencyWindow)
 		},
 		NodeTagResolver: a.topoRuntime.pool.ResolveNodeDisplayTag,
+		RecoveryPolicy: func() routing.RecoveryPolicy {
+			cfg := runtimeConfigSnapshot(a.runtimeCfg)
+			return routing.RecoveryPolicy{Enabled: cfg.LeaseRecoveryEnabled,
+				PlatformAccountLimit: cfg.LeaseRecoveryAccountsPerMinute,
+				PlatformCooldown:     time.Duration(cfg.LeaseRecoveryCooldownSeconds) * time.Second}
+		},
 		// Lease events are emitted synchronously on routing paths.
 		// Keep this callback lightweight and non-blocking.
 		OnLeaseEvent: func(e routing.LeaseEvent) {

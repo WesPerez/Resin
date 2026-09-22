@@ -27,8 +27,12 @@ selects an alternative outside all matching cooldowns. The lease is still
 account-global: a replacement is used by subsequent requests from the account.
 Other accounts, target cooldowns, and global node health are unaffected.
 
-Statuses are `available` (acquire), `rotated` (report), `stale_lease`, and
-`no_alternative`. No alternative preserves the old lease and active tunnels,
+Statuses are `available` (acquire), `rotated` (report), `stale_lease`,
+`no_alternative`, and `recovery_limited`. A recovery limit or disabled automatic
+recovery preserves the current lease and active tunnels; clients must continue
+observing the returned lease, use bounded per-lease backoff, and must not treat
+this status as a control-plane outage or a successful rotation.
+No alternative preserves the old lease and active tunnels,
 but retains the cooldown so a later acquire can use a newly available node.
 Cooldown memory is bounded to 4096 entries and is not persisted across restart.
 Existing tunnels are preserved on recovery; clients must retire their idle

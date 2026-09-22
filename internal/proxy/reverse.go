@@ -354,6 +354,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			lifecycle.setHTTPStatus(proxyErr.HTTPCode)
 			if hasRoute {
 				recordPassiveResultAsync(p.health, route, false)
+				recoverTunnelLease(p.router, route, account, parsed.Host)
 			}
 			writeProxyError(rw, proxyErr)
 		},

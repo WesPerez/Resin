@@ -160,15 +160,16 @@ func (s *Socks5Inbound) ServeConnContext(baseCtx context.Context, conn net.Conn)
 		return
 	}
 
+	recoverFailure := sync.OnceFunc(func() {
+		recoverTunnelLease(s.tunnel.router, prepare.route, handshake.account, handshake.target)
+	})
 	relay := pumpPreparedTunnel(conn, reader, prepare.session, tunnelPumpOptions{
 		onFirstIngressByte: lifecycle.markFirstByteReceived,
 		firstByteTimeout:   s.tunnel.firstByteTimeout,
-		onFirstByteTimeout: func() {
-			invalidateTunnelLease(s.tunnel.router, prepare.route, handshake.account)
-		},
+		onFirstByteTimeout: recoverFailure,
 	})
 	if !prepare.session.recoveryClosed.Load() && shouldInvalidateTunnelLease(relay) {
-		invalidateTunnelLease(s.tunnel.router, prepare.route, handshake.account)
+		recoverFailure()
 	}
 	lifecycle.addIngressBytes(relay.ingressBytes)
 	lifecycle.addEgressBytes(relay.egressBytes)

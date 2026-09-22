@@ -2,6 +2,7 @@ package routing_test
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -14,6 +15,52 @@ import (
 	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/routing"
 )
+
+func TestRecoverLease_ConcurrentPlatformLimitAndManualOverride(t *testing.T) {
+	pool, subMgr := setupPool(t)
+	makeRoutableNode(t, pool, subMgr, `{"storm":"a"}`, "198.51.100.1", "cloudflare.com", 10*time.Millisecond)
+	makeRoutableNode(t, pool, subMgr, `{"storm":"b"}`, "198.51.100.2", "cloudflare.com", 20*time.Millisecond)
+	router := makeRouter(pool, nil)
+	routes := make([]routing.RouteResult, 24)
+	for i := range routes {
+		var err error
+		routes[i], err = router.RouteRequest(platName, fmt.Sprint(i), "cloudflare.com")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var rotated, limited atomic.Int32
+	var wg sync.WaitGroup
+	for i, route := range routes {
+		wg.Add(1)
+		go func(i int, route routing.RouteResult) {
+			defer wg.Done()
+			_, _, err := router.RecoverLease(platID, fmt.Sprint(i), route.NodeHash, route.LeaseCreatedAtNs, "cloudflare.com", routing.RotateLeaseOptions{PreserveConnections: true})
+			switch {
+			case err == nil:
+				rotated.Add(1)
+			case errors.Is(err, routing.ErrRecoveryLimited):
+				limited.Add(1)
+			default:
+				t.Errorf("unexpected recovery error: %v", err)
+			}
+		}(i, route)
+	}
+	wg.Wait()
+	if rotated.Load() != 20 || limited.Load() != 4 {
+		t.Fatalf("rotated=%d limited=%d", rotated.Load(), limited.Load())
+	}
+	if status := router.RecoveryStatus(); status.Rotated != 20 || status.Limited != 4 || status.CoolingPlatforms != 1 {
+		t.Fatalf("status: %+v", status)
+	}
+	current, err := router.RouteRequest(platName, "0", "cloudflare.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := router.RotateLease(platID, "0", current.NodeHash, current.LeaseCreatedAtNs, "cloudflare.com", routing.RotateLeaseOptions{PreserveConnections: true}); err != nil {
+		t.Fatalf("manual rotation was limited: %v", err)
+	}
+}
 
 func TestRotateLease_CASSuccessAndStale(t *testing.T) {
 	pool, subMgr := setupPool(t)
@@ -53,6 +100,72 @@ func TestRotateLease_CASSuccessAndStale(t *testing.T) {
 	}
 	if newLease.CreatedAtNs <= res1.LeaseCreatedAtNs {
 		t.Fatalf("expected new lease createdAtNs (%d) > original (%d)", newLease.CreatedAtNs, res1.LeaseCreatedAtNs)
+	}
+}
+
+func TestRecoveryGrant_ReservesOnceAndPeekDoesNotMutateLease(t *testing.T) {
+	pool, subMgr := setupPool(t)
+	makeRoutableNode(t, pool, subMgr, `{"grant":"a"}`, "198.51.100.1", "cloudflare.com", 10*time.Millisecond)
+	makeRoutableNode(t, pool, subMgr, `{"grant":"b"}`, "198.51.100.2", "cloudflare.com", 20*time.Millisecond)
+	var events []routing.LeaseEvent
+	router := makeRouter(pool, &events)
+	initial, err := router.RouteRequest(platName, "grant", "cloudflare.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := model.LeaseKey{PlatformID: platID, Account: "grant"}
+	before := *router.ReadLease(key)
+	eventCount := len(events)
+	grant, err := router.BeginRecovery(platID, "grant", initial.NodeHash, initial.LeaseCreatedAtNs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := router.BeginRecovery(platID, "grant", initial.NodeHash, initial.LeaseCreatedAtNs); !errors.Is(err, routing.ErrRecoveryLimited) {
+		t.Fatalf("second concurrent reservation was allowed: %v", err)
+	}
+	candidate, err := router.PeekRouteExcludingNodes(platName, "grant", "cloudflare.com", []node.Hash{initial.NodeHash})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *router.ReadLease(key) != before || len(events) != eventCount || candidate.LeaseCreatedAtNs != 0 {
+		t.Fatal("peek changed a lease, its access time or emitted an event")
+	}
+	options := routing.RotateLeaseOptions{PreferredNode: candidate.NodeHash, ExpectedTargetIP: candidate.EgressIP, PreserveConnections: true}
+	next, _, err := router.CommitRecoveryGrant(grant, "cloudflare.com", options)
+	if err != nil || next.NodeHash != candidate.NodeHash.Hex() {
+		t.Fatalf("reserved commit failed: %+v %v", next, err)
+	}
+	if _, _, err := router.CommitRecoveryGrant(grant, "cloudflare.com", options); !errors.Is(err, routing.ErrLeaseChanged) {
+		t.Fatalf("grant was reusable: %v", err)
+	}
+	if router.RecoveryStatus().Rotated != 1 {
+		t.Fatal("reservation was counted as a completed rotation")
+	}
+}
+
+func TestRecoveryGrant_ConcurrentManualChangeWinsCAS(t *testing.T) {
+	pool, subMgr := setupPool(t)
+	makeRoutableNode(t, pool, subMgr, `{"grant-cas":"a"}`, "198.51.100.1", "cloudflare.com", 10*time.Millisecond)
+	makeRoutableNode(t, pool, subMgr, `{"grant-cas":"b"}`, "198.51.100.2", "cloudflare.com", 20*time.Millisecond)
+	router := makeRouter(pool, nil)
+	initial, err := router.RouteRequest(platName, "grant", "cloudflare.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := router.BeginRecovery(platID, "grant", initial.NodeHash, initial.LeaseCreatedAtNs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, _, err := router.RotateLease(platID, "grant", initial.NodeHash, initial.LeaseCreatedAtNs, "cloudflare.com", routing.RotateLeaseOptions{PreserveConnections: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := router.CommitRecoveryGrant(grant, "cloudflare.com", routing.RotateLeaseOptions{}); !errors.Is(err, routing.ErrLeaseChanged) {
+		t.Fatalf("stale grant overwrote manual rotation: %v", err)
+	}
+	current := router.ReadLease(model.LeaseKey{PlatformID: platID, Account: "grant"})
+	if current.CreatedAtNs != next.CreatedAtNs {
+		t.Fatal("manual lease was changed")
 	}
 }
 

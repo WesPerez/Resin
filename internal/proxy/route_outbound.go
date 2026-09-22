@@ -34,7 +34,18 @@ func resolveRoutedOutboundExcluding(
 	if err != nil {
 		return routedOutbound{}, mapRouteError(err)
 	}
+	return outboundForRoute(pool, result)
+}
 
+func resolveRoutedOutboundPeek(router *routing.Router, pool outbound.PoolAccessor, platformName, account, target string, excluded []node.Hash) (routedOutbound, *ProxyError) {
+	result, err := router.PeekRouteExcludingNodes(platformName, account, target, excluded)
+	if err != nil {
+		return routedOutbound{}, mapRouteError(err)
+	}
+	return outboundForRoute(pool, result)
+}
+
+func outboundForRoute(pool outbound.PoolAccessor, result routing.RouteResult) (routedOutbound, *ProxyError) {
 	entry, ok := pool.GetEntry(result.NodeHash)
 	if !ok {
 		return routedOutbound{}, ErrNoAvailableNodes

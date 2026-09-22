@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/routing"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -19,6 +21,37 @@ type tunnelFaultConn struct {
 	readErr  error
 	writeErr error
 	closed   atomic.Bool
+}
+
+func TestRecoverTunnelLease_PreservesSiblingConnectionAndGuardedJob(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	route, err := env.router.RouteRequest("plat", "recovery", "example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var closed atomic.Bool
+	unregister, ok := env.router.RegisterLeaseConnection(route, "recovery", func() { closed.Store(true) })
+	if !ok {
+		t.Fatal("register sibling connection")
+	}
+	defer unregister()
+	addProxyE2ENode(t, env, json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":2}`), "203.0.113.11",
+		func(context.Context, string, M.Socksaddr) (net.Conn, error) { return nil, errors.New("unused") })
+	guarded := route
+	guarded.LeaseGuarded = true
+	recoverTunnelLease(env.router, guarded, "recovery", "example.com:443")
+	if env.router.RecoveryStatus().Rotated != 0 {
+		t.Fatal("guarded browser job recovered automatically")
+	}
+	recoverTunnelLease(env.router, route, "recovery", "example.com:443")
+	current := env.router.ReadLease(model.LeaseKey{PlatformID: route.PlatformID, Account: "recovery"})
+	if current == nil || current.CreatedAtNs == route.LeaseCreatedAtNs || current.EgressIP == route.EgressIP.String() || closed.Load() {
+		t.Fatalf("recovery lost connection or kept failed exit: %+v closed=%v", current, closed.Load())
+	}
+	recoverTunnelLease(env.router, route, "recovery", "example.com:443")
+	if env.router.RecoveryStatus().Rotated != 1 {
+		t.Fatal("old failure rotated twice")
+	}
 }
 
 func (c *tunnelFaultConn) Read(p []byte) (int, error) {
@@ -188,6 +221,62 @@ func TestPrepareConnectTunnel_ThreeAttemptsExcludeEveryFailedNode(t *testing.T) 
 	}
 	if len(seen) != 3 {
 		t.Fatalf("attempts reused a failed node: distinct=%d, want 3", len(seen))
+	}
+	lease := env.router.ReadLease(model.LeaseKey{PlatformID: result.route.PlatformID, Account: "acct-three-attempts"})
+	if lease == nil || lease.NodeHash != result.route.NodeHash.Hex() || lease.CreatedAtNs != result.route.LeaseCreatedAtNs || env.router.RecoveryStatus().Rotated != 1 {
+		t.Fatalf("bounded retries must commit exactly one lease: %+v %+v", lease, env.router.RecoveryStatus())
+	}
+}
+
+func TestPrepareConnectTunnel_LimitedRecoveryCanServeWithoutChangingLease(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	initial, err := env.router.RouteRequest("plat", "limited", "example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.router.BeginRecovery(initial.PlatformID, "limited", initial.NodeHash, initial.LeaseCreatedAtNs); err != nil {
+		t.Fatal(err)
+	}
+	setProxyE2EOutboundDialFunc(t, env, func(context.Context, string, M.Socksaddr) (net.Conn, error) {
+		return nil, errors.New("dial failed")
+	})
+	conn, peer := net.Pipe()
+	defer peer.Close()
+	addProxyE2ENode(t, env, json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":2}`), "203.0.113.11",
+		func(context.Context, string, M.Socksaddr) (net.Conn, error) { return conn, nil })
+	result := prepareConnectTunnel(context.Background(), tunnelDeps{router: env.router, pool: env.pool, connectRetries: 2}, "plat", "limited", "example.com:443")
+	if result.session == nil || result.route.LeaseCreatedAtNs != 0 {
+		t.Fatalf("limited recovery should serve an uncommitted retry: %+v", result)
+	}
+	defer result.session.upstreamConn.Close()
+	lease := env.router.ReadLease(model.LeaseKey{PlatformID: initial.PlatformID, Account: "limited"})
+	if lease == nil || lease.CreatedAtNs != initial.LeaseCreatedAtNs || lease.NodeHash != initial.NodeHash.Hex() {
+		t.Fatalf("limited retry changed the lease: %+v", lease)
+	}
+	if status := env.router.RecoveryStatus(); status.Limited != 1 || status.Rotated != 0 {
+		t.Fatalf("unexpected recovery counters: %+v", status)
+	}
+}
+
+func TestPrepareConnectTunnel_AllFailedCandidatesKeepOriginalLease(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	initial, err := env.router.RouteRequest("plat", "no-alternative", "example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dial := func(context.Context, string, M.Socksaddr) (net.Conn, error) { return nil, errors.New("dial failed") }
+	setProxyE2EOutboundDialFunc(t, env, dial)
+	addProxyE2ENode(t, env, json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":2}`), "203.0.113.11", dial)
+	result := prepareConnectTunnel(context.Background(), tunnelDeps{router: env.router, pool: env.pool, connectRetries: 2}, "plat", "no-alternative", "example.com:443")
+	if result.session != nil || result.proxyErr == nil {
+		t.Fatal("expected failed request")
+	}
+	lease := env.router.ReadLease(model.LeaseKey{PlatformID: initial.PlatformID, Account: "no-alternative"})
+	if lease == nil || lease.CreatedAtNs != initial.LeaseCreatedAtNs || lease.NodeHash != initial.NodeHash.Hex() {
+		t.Fatalf("no verified alternative must preserve the lease: %+v", lease)
+	}
+	if _, err := env.router.BeginRecovery(initial.PlatformID, "no-alternative", initial.NodeHash, initial.LeaseCreatedAtNs); !errors.Is(err, routing.ErrRecoveryLimited) {
+		t.Fatalf("one failed connection must consume only one reservation: %v", err)
 	}
 }
 

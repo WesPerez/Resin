@@ -88,7 +88,18 @@ func HandleSystemEnvConfig(envCfg *config.EnvConfig) http.HandlerFunc {
 	}
 }
 
-// HandlePatchSystemConfig returns a handler for PATCH /api/v1/system/config.
+// HandleRecoveryStatus returns process-local, credential-free recovery counters.
+func HandleRecoveryStatus(cp *service.ControlPlaneService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if cp.Router == nil {
+			WriteJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "router unavailable"})
+			return
+		}
+		WriteJSON(w, http.StatusOK, cp.Router.RecoveryStatus())
+	}
+}
+
+// HandlePatchSystemConfig applies a constrained, authenticated partial update.
 func HandlePatchSystemConfig(cp *service.ControlPlaneService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, ok := readRawBodyOrWriteInvalid(w, r)
