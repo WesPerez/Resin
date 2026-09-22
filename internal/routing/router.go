@@ -97,7 +97,9 @@ func (r *Router) RouteRequest(platName, account, target string) (RouteResult, er
 	return r.routeRequest(platName, account, target, nil, false)
 }
 
-// AcquireRecoveryRoute never deletes an existing binding when selection fails.
+// AcquireRecoveryRoute preserves an unexpired cooling binding for guarded
+// recovery. Ordinary selection must not commit an uncounted replacement.
+// It also never deletes an existing binding when selection fails.
 func (r *Router) AcquireRecoveryRoute(platName, account, target string) (RouteResult, error) {
 	return r.routeRequest(platName, account, target, nil, true)
 }
@@ -267,6 +269,16 @@ func (r *Router) routeSticky(
 	var events []LeaseEvent
 
 	_, _ = state.Leases.leases.Compute(account, func(current Lease, loaded bool) (Lease, xsync.ComputeOp) {
+		// The recovery read lock and lease transaction cover both this check and
+		// selection. A service-layer precheck alone would race a failure report.
+		// Return the observed generation so RecoverLease can apply its CAS and
+		// shared budget before changing an account's exit.
+		if preserveOnFailure && loaded && !current.IsExpired(now) &&
+			r.targetCoolingLocked(plat.ID, account, targetDomain, current.NodeHash, current.EgressIP, now) {
+			result = RouteResult{NodeHash: current.NodeHash, EgressIP: current.EgressIP,
+				LeaseCreatedAtNs: current.CreatedAtNs}
+			return current, xsync.CancelOp
+		}
 		newLease, op, routeResult, err := r.decideStickyLease(
 			plat,
 			state,

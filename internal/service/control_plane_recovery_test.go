@@ -45,6 +45,9 @@ func TestRecoveryLease_NoAlternativeThenNewCandidate(t *testing.T) {
 	if result.Lease.CreatedAtNs != first.Lease.CreatedAtNs {
 		t.Fatal("failed rotation replaced the lease")
 	}
+	if status := cp.Router.RecoveryStatus(); status.Rotated != 0 {
+		t.Fatalf("no-alternative report consumed rotation budget: %+v", status)
+	}
 	if !cp.Router.TargetCooling(plat.ID, "account", "EXAMPLE.COM.:443", a, netip.MustParseAddr("198.51.100.1")) {
 		t.Fatal("no-alternative failure lost its cooldown")
 	}
@@ -56,6 +59,14 @@ func TestRecoveryLease_NoAlternativeThenNewCandidate(t *testing.T) {
 	result, err = cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{"example.com:443"})
 	if err != nil || result.Status != "available" || result.Lease.NodeHash != b.Hex() {
 		t.Fatalf("recovery: %+v %v", result, err)
+	}
+	if status := cp.Router.RecoveryStatus(); status.Rotated != 1 {
+		t.Fatalf("acquire bypassed guarded rotation accounting: %+v", status)
+	}
+	stable, err := cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{"example.com:443"})
+	if err != nil || stable.Status != "available" || stable.Lease.CreatedAtNs != result.Lease.CreatedAtNs ||
+		cp.Router.RecoveryStatus().Rotated != 1 {
+		t.Fatalf("ordinary acquire changed the lease or rotation budget: %+v %v", stable, err)
 	}
 	result, err = cp.ReportLeaseFailure(plat.Name, "account", recoveryFailure(result.Lease))
 	if err != nil || result.Status != "recovery_limited" || result.Lease.NodeHash != b.Hex() {

@@ -35,7 +35,11 @@ func recoveryDomain(target string) string {
 func (r *Router) TargetCooling(platformID, account, target string, hash node.Hash, ip netip.Addr) bool {
 	r.recoveryMu.RLock()
 	defer r.recoveryMu.RUnlock()
-	now := time.Now()
+	return r.targetCoolingLocked(platformID, account, target, hash, ip, time.Now())
+}
+
+// The caller must hold recoveryMu for reading or writing.
+func (r *Router) targetCoolingLocked(platformID, account, target string, hash node.Hash, ip netip.Addr, now time.Time) bool {
 	domain := recoveryDomain(target)
 	for key, entry := range r.targetCooldowns {
 		if key.platformID == platformID && key.account == account && key.domain == domain && now.Before(entry.until) &&
