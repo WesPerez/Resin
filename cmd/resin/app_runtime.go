@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -66,9 +67,32 @@ func run() error {
 	}
 
 	serverErrCh := app.startServers()
-	runtimeErr := waitForShutdown(serverErrCh)
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	// Keep signals registered until drain completes; repeated retirement must
+	// not restore SIGTERM's default action while tunnels are still active.
+	defer signal.Stop(quit)
+	runtimeErr := waitForShutdown(serverErrCh, quit)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if os.Getenv("RESIN_SHUTDOWN_PRESERVE_CONNECTIONS") == "1" {
+		drainTimeout := 10 * time.Minute
+		if raw := strings.TrimSpace(os.Getenv("RESIN_DRAIN_TIMEOUT")); raw != "" {
+			if parsed, err := time.ParseDuration(raw); err == nil && parsed >= 0 {
+				drainTimeout = parsed
+			} else {
+				log.Printf("Invalid RESIN_DRAIN_TIMEOUT %q; using %s", raw, drainTimeout)
+			}
+		}
+		if drainTimeout == 0 {
+			ctx, cancel = context.WithCancel(context.Background())
+		} else {
+			ctx, cancel = context.WithTimeout(context.Background(), drainTimeout)
+		}
+	} else {
+		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	}
 	defer cancel()
 	app.shutdown(ctx)
 
@@ -422,6 +446,9 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		OutboundTransport: outboundTransportCfg,
 		TransportPool:     a.transportPool,
 		ProxyBypassRules:  a.envCfg.ProxyBypassRules,
+		ConnectTimeout:    a.envCfg.ProxyConnectTimeout,
+		ConnectRetries:    a.envCfg.ProxyConnectRetries,
+		FirstByteTimeout:  a.envCfg.ProxyTunnelFirstByteTimeout,
 	})
 
 	reverseProxy := proxy.NewReverseProxy(proxy.ReverseProxyConfig{
@@ -445,6 +472,9 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		Events:           proxyEvents,
 		MetricsSink:      a.metricsManager,
 		ProxyBypassRules: a.envCfg.ProxyBypassRules,
+		ConnectTimeout:   a.envCfg.ProxyConnectTimeout,
+		ConnectRetries:   a.envCfg.ProxyConnectRetries,
+		FirstByteTimeout: a.envCfg.ProxyTunnelFirstByteTimeout,
 	})
 
 	endpointManager := newEndpointRuntimeManager(
@@ -523,11 +553,7 @@ func (a *resinApp) startServers() <-chan error {
 	return a.endpointManager.Start()
 }
 
-func waitForShutdown(serverErrCh <-chan error) error {
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(quit)
-
+func waitForShutdown(serverErrCh <-chan error, quit <-chan os.Signal) error {
 	select {
 	case sig := <-quit:
 		log.Printf("Received signal %s, shutting down...", sig)
@@ -547,7 +573,12 @@ func formatListenURL(listenAddress string, port int) string {
 }
 
 func (a *resinApp) shutdown(ctx context.Context) {
-	if err := a.endpointManager.Shutdown(ctx); err != nil {
+	drainOnly := os.Getenv("RESIN_SHUTDOWN_PRESERVE_CONNECTIONS") == "1"
+	if drainOnly {
+		log.Println("Resin drain-only shutdown enabled; preserving tunnels and suppressing final state flush")
+		a.flushWorker.Discard()
+	}
+	if err := a.endpointManager.Shutdown(ctx, drainOnly); err != nil {
 		log.Printf("Server shutdown error: %v", err)
 	}
 	log.Println("Resin server stopped")
@@ -596,6 +627,6 @@ func (a *resinApp) shutdown(ctx context.Context) {
 		log.Println("SingboxBuilder stopped")
 	}
 
-	a.flushWorker.Stop() // final cache flush before DB close
+	a.flushWorker.Stop()
 	log.Println("Server stopped")
 }

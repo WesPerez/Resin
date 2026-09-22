@@ -43,6 +43,9 @@ type Socks5InboundConfig struct {
 	Events           EventEmitter
 	MetricsSink      MetricsEventSink
 	ProxyBypassRules []string
+	ConnectTimeout   time.Duration
+	ConnectRetries   int
+	FirstByteTimeout time.Duration
 }
 
 // Socks5Inbound implements SOCKS5 CONNECT over a raw TCP connection.
@@ -68,11 +71,14 @@ func NewSocks5Inbound(cfg Socks5InboundConfig) *Socks5Inbound {
 	return &Socks5Inbound{
 		token: cfg.ProxyToken,
 		tunnel: tunnelDeps{
-			router:      cfg.Router,
-			pool:        cfg.Pool,
-			health:      cfg.Health,
-			metricsSink: cfg.MetricsSink,
-			bypass:      NewTargetBypassMatcher(cfg.ProxyBypassRules),
+			router:           cfg.Router,
+			pool:             cfg.Pool,
+			health:           cfg.Health,
+			metricsSink:      cfg.MetricsSink,
+			bypass:           NewTargetBypassMatcher(cfg.ProxyBypassRules),
+			connectTimeout:   cfg.ConnectTimeout,
+			connectRetries:   cfg.ConnectRetries,
+			firstByteTimeout: cfg.FirstByteTimeout,
 		},
 		events: ev,
 	}
@@ -141,6 +147,11 @@ func (s *Socks5Inbound) ServeConnContext(baseCtx context.Context, conn net.Conn)
 		return
 	}
 
+	unregister, registered := registerPreparedTunnel(s.tunnel.router, prepare.route, handshake.account, conn, prepare.session)
+	defer unregister()
+	if !registered {
+		return
+	}
 	if err := writeSocks5Reply(conn, socks5ReplySucceeded, prepare.session.upstreamConn.LocalAddr()); err != nil {
 		prepare.session.upstreamConn.Close()
 		lifecycle.setProxyError(ErrUpstreamRequestFailed)
@@ -151,7 +162,14 @@ func (s *Socks5Inbound) ServeConnContext(baseCtx context.Context, conn net.Conn)
 
 	relay := pumpPreparedTunnel(conn, reader, prepare.session, tunnelPumpOptions{
 		onFirstIngressByte: lifecycle.markFirstByteReceived,
+		firstByteTimeout:   s.tunnel.firstByteTimeout,
+		onFirstByteTimeout: func() {
+			invalidateTunnelLease(s.tunnel.router, prepare.route, handshake.account)
+		},
 	})
+	if !prepare.session.recoveryClosed.Load() && shouldInvalidateTunnelLease(relay) {
+		invalidateTunnelLease(s.tunnel.router, prepare.route, handshake.account)
+	}
 	lifecycle.addIngressBytes(relay.ingressBytes)
 	lifecycle.addEgressBytes(relay.egressBytes)
 	if relay.proxyErr != nil {
@@ -159,7 +177,9 @@ func (s *Socks5Inbound) ServeConnContext(baseCtx context.Context, conn net.Conn)
 		lifecycle.setUpstreamError(relay.upstreamStage, relay.upstreamErr)
 	}
 	lifecycle.setNetOK(relay.netOK)
-	prepare.session.recordResult(relay.netOK)
+	if !prepare.session.recoveryClosed.Load() {
+		prepare.session.recordResult(relay.netOK)
+	}
 }
 
 func (s *Socks5Inbound) performHandshake(conn net.Conn, reader *bufio.Reader, requireAuthInfo bool) socks5HandshakeResult {
