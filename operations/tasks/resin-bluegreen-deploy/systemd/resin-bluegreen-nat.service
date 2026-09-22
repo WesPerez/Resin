@@ -1,0 +1,40 @@
+[Unit]
+Description=Restore Resin blue/green virtual entry NAT
+After=network-online.target docker.service ufw.service
+Wants=network-online.target
+Requires=docker.service
+After=resin-apps.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/resin-operations/operations/tasks/resin-bluegreen-deploy/resin-bluegreen-deploy.sh start
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=120
+UMask=0077
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=read-only
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/opt/resin-operations
+ReadWritePaths=/var/lib/resin-slots /run/lock
+RestrictAddressFamilies=AF_INET AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# ss -p verifies the legacy listener during first-migration recovery.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_OVERRIDE
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

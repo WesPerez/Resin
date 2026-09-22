@@ -1,0 +1,44 @@
+[Unit]
+Description=Stable HAProxy ingress and draining sing-box generations for Resin and Direct
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=root
+Group=root
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /opt/resin-operations/operations/tasks/resin-pool-maintenance/lib/bridge_runtime.py serve
+RuntimeDirectory=resin-singbox-bridge
+RuntimeDirectoryMode=0700
+TimeoutStartSec=120
+LimitNOFILE=65536
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=read-only
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/resin-singbox-bridge
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

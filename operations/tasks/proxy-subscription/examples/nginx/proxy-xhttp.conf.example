@@ -1,0 +1,15 @@
+location ^~ /xhttp/REPLACE_WITH_64_HEX_PATH/ {
+    grpc_pass grpc://127.0.0.1:12763;
+    grpc_set_header Host $host;
+    grpc_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    grpc_set_header X-Forwarded-Proto https;
+    grpc_connect_timeout 10s;
+    grpc_read_timeout 3600s;
+    grpc_send_timeout 3600s;
+    grpc_socket_keepalive on;
+    client_max_body_size 0;
+    limit_conn proxy_ws_conn 384;
+    limit_conn proxy_ws_global 768;
+    limit_conn_status 429;
+    access_log /var/log/nginx/proxy-xhttp-access.log proxy_xhttp buffer=32k flush=1s;
+}

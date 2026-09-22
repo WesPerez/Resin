@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "title": "Resin 出口故障观察",
+  "description": "观察代理出口异常，记录可恢复的故障事件",
+  "category": "helpers",
+  "operating_note": "持续观察出口状态；账号选择与恢复归属由该服务的既定策略维护，避免多处设置相互覆盖。"
+}

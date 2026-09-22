@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "id": "resin",
+  "task_directory": "operations/tasks",
+  "title": "Resin",
+  "description": "代理池、共享订阅、出口恢复与连接保护",
+  "link": "/resinofficial/dashboard",
+  "applications": [
+    {
+      "id": "app:resin:subscriptions",
+      "title": "订阅自动更新",
+      "description": "订阅地址、刷新间隔、最近更新和导入结果在 Resin 订阅页面维护。",
+      "schedule_text": "按每个订阅的更新间隔",
+      "link": "/resinofficial/subscriptions"
+    },
+    {
+      "id": "app:resin:geoip",
+      "title": "GeoIP 资源更新",
+      "description": "按资源更新计划刷新地区数据库，查看更新时间和下载结果。",
+      "schedule_text": "按资源页的更新计划",
+      "link": "/resinofficial/resources"
+    },
+    {
+      "id": "app:resin:eviction",
+      "title": "临时节点维护",
+      "description": "应用按淘汰延迟回收临时节点；节点状态、存活情况和池容量在 Resin 内查看。",
+      "schedule_text": "应用内持续维护",
+      "link": "/resinofficial/nodes"
+    },
+    {
+      "id": "app:resin:metrics",
+      "title": "流量与节点指标汇总",
+      "description": "持续采样连接和代理池指标，为仪表盘提供运行趋势。",
+      "schedule_text": "应用内周期采样",
+      "link": "/resinofficial/dashboard"
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+[Unit]
+Description=Single Xray VLESS XHTTP and WebSocket proxy backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+LoadCredential=proxy.json:/etc/xray/proxy.json
+ExecStart=/usr/local/lib/xray/v26.3.27/xray run -config ${CREDENTIALS_DIRECTORY}/proxy.json
+Restart=always
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+UMask=0077
+LimitNOFILE=1048576
+MemorySwapMax=0
+OOMScoreAdjust=-200
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Continuously renew and replenish the shared subscription pool
+
+[Timer]
+OnBootSec=8min
+OnUnitInactiveSec=3min
+RandomizedDelaySec=15s
+Unit=proxy-rotation-quality.service
+
+[Install]
+WantedBy=timers.target

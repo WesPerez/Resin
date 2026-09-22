@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "state_dir": "/var/lib/resin-cn-pool-maintainer",
+  "lock_file": "/var/lib/resin-cn-pool-maintainer/resin-pool-sync.lock",
+  "retain_runs": 1,
+  "sources": [
+    {
+      "id": "validated-cn-http",
+      "type": "file",
+      "path": "/var/lib/resin-cn-pool-maintainer/sources/cn-validated-http.txt",
+      "enabled": true
+    }
+  ],
+  "validation": {
+    "workers": 16,
+    "batch_size": 16,
+    "timeout_seconds": 12,
+    "target_hosts": [
+      "connectivitycheck.platform.hicloud.com",
+      "www.baidu.com",
+      "www.bilibili.com"
+    ],
+    "min_target_hosts_passed": 2,
+    "generic_probe_urls": [
+      "https://connectivitycheck.platform.hicloud.com/generate_204",
+      "https://www.baidu.com/",
+      "https://www.bilibili.com/robots.txt"
+    ],
+    "generic_probe_min_successes": 2,
+    "trace_egress": true,
+    "max_source_bytes": 65536
+  },
+  "selection": {
+    "max_nodes": 4,
+    "max_per_egress": 1,
+    "max_per_source": 4,
+    "max_per_credential_group": 1,
+    "min_per_region": 1,
+    "require_egress": true,
+    "allowed_regions": [
+      "cn"
+    ]
+  },
+  "safety": {
+    "mode": "cn_gate",
+    "min_selected": 2,
+    "min_passed": 2,
+    "min_ratio_to_previous": 0.5,
+    "max_validation_age_seconds": 21600
+  },
+  "resin": {
+    "base_url": "http://172.17.0.1:10834",
+    "api_timeout_seconds": 20,
+    "max_api_body_bytes": 200000,
+    "subscription_name": "managed-apps-cn-public-pool",
+    "platform_id": "replace-with-apps-cn-platform-uuid",
+    "platform_name": "AppsCN",
+    "managed_regex": "^managed-apps-cn-public-pool/",
+    "include_current_subscription": true,
+    "preserve_existing_trusted_filters": false,
+    "platform_regex_filters": [
+      "^managed-apps-cn-public-pool/"
+    ],
+    "region_filters": [
+      "cn"
+    ],
+    "update_interval": "6h",
+    "ephemeral": false,
+    "incremental_alive_nodes": false,
+    "ephemeral_node_evict_delay": "72h",
+    "cache_db_paths": [
+      "/var/lib/resin-apps/state.db",
+      "/var/cache/resin-apps/cache.db"
+    ]
+  }
+}
