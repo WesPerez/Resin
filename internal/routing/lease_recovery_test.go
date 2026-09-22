@@ -103,7 +103,7 @@ func TestRotateLease_CASSuccessAndStale(t *testing.T) {
 	}
 }
 
-func TestRecoveryGrant_ReservesOnceAndPeekDoesNotMutateLease(t *testing.T) {
+func TestRecoveryAttempt_CountsOnlySuccessfulCommitAndPeekDoesNotMutateLease(t *testing.T) {
 	pool, subMgr := setupPool(t)
 	makeRoutableNode(t, pool, subMgr, `{"grant":"a"}`, "198.51.100.1", "cloudflare.com", 10*time.Millisecond)
 	makeRoutableNode(t, pool, subMgr, `{"grant":"b"}`, "198.51.100.2", "cloudflare.com", 20*time.Millisecond)
@@ -120,8 +120,9 @@ func TestRecoveryGrant_ReservesOnceAndPeekDoesNotMutateLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := router.BeginRecovery(platID, "grant", initial.NodeHash, initial.LeaseCreatedAtNs); !errors.Is(err, routing.ErrRecoveryLimited) {
-		t.Fatalf("second concurrent reservation was allowed: %v", err)
+	other, err := router.BeginRecovery(platID, "grant", initial.NodeHash, initial.LeaseCreatedAtNs)
+	if err != nil {
+		t.Fatalf("uncommitted attempt consumed budget: %v", err)
 	}
 	candidate, err := router.PeekRouteExcludingNodes(platName, "grant", "cloudflare.com", []node.Hash{initial.NodeHash})
 	if err != nil {
@@ -131,19 +132,22 @@ func TestRecoveryGrant_ReservesOnceAndPeekDoesNotMutateLease(t *testing.T) {
 		t.Fatal("peek changed a lease, its access time or emitted an event")
 	}
 	options := routing.RotateLeaseOptions{PreferredNode: candidate.NodeHash, ExpectedTargetIP: candidate.EgressIP, PreserveConnections: true}
-	next, _, err := router.CommitRecoveryGrant(grant, "cloudflare.com", options)
+	next, _, err := router.CommitRecovery(grant, "cloudflare.com", options)
 	if err != nil || next.NodeHash != candidate.NodeHash.Hex() {
 		t.Fatalf("reserved commit failed: %+v %v", next, err)
 	}
-	if _, _, err := router.CommitRecoveryGrant(grant, "cloudflare.com", options); !errors.Is(err, routing.ErrLeaseChanged) {
+	if _, _, err := router.CommitRecovery(grant, "cloudflare.com", options); !errors.Is(err, routing.ErrLeaseChanged) {
 		t.Fatalf("grant was reusable: %v", err)
 	}
+	if _, _, err := router.CommitRecovery(other, "cloudflare.com", options); !errors.Is(err, routing.ErrLeaseChanged) {
+		t.Fatalf("concurrent attempt overwrote committed lease: %v", err)
+	}
 	if router.RecoveryStatus().Rotated != 1 {
-		t.Fatal("reservation was counted as a completed rotation")
+		t.Fatal("attempt was counted as a completed rotation")
 	}
 }
 
-func TestRecoveryGrant_ConcurrentManualChangeWinsCAS(t *testing.T) {
+func TestRecoveryAttempt_ConcurrentManualChangeWinsCAS(t *testing.T) {
 	pool, subMgr := setupPool(t)
 	makeRoutableNode(t, pool, subMgr, `{"grant-cas":"a"}`, "198.51.100.1", "cloudflare.com", 10*time.Millisecond)
 	makeRoutableNode(t, pool, subMgr, `{"grant-cas":"b"}`, "198.51.100.2", "cloudflare.com", 20*time.Millisecond)
@@ -160,7 +164,7 @@ func TestRecoveryGrant_ConcurrentManualChangeWinsCAS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := router.CommitRecoveryGrant(grant, "cloudflare.com", routing.RotateLeaseOptions{}); !errors.Is(err, routing.ErrLeaseChanged) {
+	if _, _, err := router.CommitRecovery(grant, "cloudflare.com", routing.RotateLeaseOptions{}); !errors.Is(err, routing.ErrLeaseChanged) {
 		t.Fatalf("stale grant overwrote manual rotation: %v", err)
 	}
 	current := router.ReadLease(model.LeaseKey{PlatformID: platID, Account: "grant"})

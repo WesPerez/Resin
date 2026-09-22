@@ -73,7 +73,9 @@ type RotateLeaseOptions struct {
 	PreserveConnections bool
 	ApplyTargetCooldown bool
 	FailureCooldown     time.Duration
-	ExcludedNodes       []node.Hash
+	// Set only by the in-process dialer after a candidate has connected.
+	VerifiedPreferred bool
+	ExcludedNodes     []node.Hash
 	// A supplied candidate is strict: stale or unavailable candidates leave the
 	// original lease intact instead of silently choosing an unaudited node.
 	PreferredNode    node.Hash
@@ -83,25 +85,25 @@ type RotateLeaseOptions struct {
 // RotateLease replaces exactly the observed lease. No candidate leaves it intact.
 // HTTP-level failures can preserve established tunnels; new dials use the new lease.
 func (r *Router) RotateLease(platformID, account string, expectedNode node.Hash, expectedCreatedAtNs int64, target string, options RotateLeaseOptions) (*model.Lease, int, error) {
-	return r.rotateLease(platformID, account, expectedNode, expectedCreatedAtNs, target, options, false, false)
+	return r.rotateLease(platformID, account, expectedNode, expectedCreatedAtNs, target, options, false)
 }
 
 // RecoverLease applies shared automatic-recovery limits to an observed generation.
 // Both proxy events and authenticated failure reports use this entry point.
 func (r *Router) RecoverLease(platformID, account string, expectedNode node.Hash, expectedCreatedAtNs int64, target string, options RotateLeaseOptions) (*model.Lease, int, error) {
-	return r.rotateLease(platformID, account, expectedNode, expectedCreatedAtNs, target, options, true, false)
+	return r.rotateLease(platformID, account, expectedNode, expectedCreatedAtNs, target, options, true)
 }
 
-// RecoveryGrant reserves one automatic recovery for one bounded dial sequence.
-// It stays with the connection, has no router-side registry, and cannot be
-// constructed by callers. CAS still protects the original lease at commit.
-type RecoveryGrant struct {
+// RecoveryAttempt captures the observed lease for one bounded dial sequence.
+// It stays with the connection and has no router-side registry. The final
+// commit rechecks CAS and shared limits; only successful rotations use budget.
+type RecoveryAttempt struct {
 	owner *Router
 	key   leaseConnectionKey
 	used  atomic.Bool
 }
 
-func (r *Router) BeginRecovery(platformID, account string, expectedNode node.Hash, expectedCreatedAtNs int64) (*RecoveryGrant, error) {
+func (r *Router) BeginRecovery(platformID, account string, expectedNode node.Hash, expectedCreatedAtNs int64) (*RecoveryAttempt, error) {
 	r.recoveryMu.Lock()
 	defer r.recoveryMu.Unlock()
 	now := time.Now()
@@ -117,21 +119,20 @@ func (r *Router) BeginRecovery(platformID, account string, expectedNode node.Has
 		r.recordRecoveryResultLocked(err, now)
 		return nil, err
 	}
-	r.recordRecoveryLocked(platformID, account, now)
-	return &RecoveryGrant{owner: r, key: leaseConnectionKey{platformID, account, expectedNode, expectedCreatedAtNs}}, nil
+	return &RecoveryAttempt{owner: r, key: leaseConnectionKey{platformID, account, expectedNode, expectedCreatedAtNs}}, nil
 }
 
-// CommitRecoveryGrant consumes the reservation even when selection/CAS fails.
-// Disabling recovery also revokes already reserved work before it can commit.
-func (r *Router) CommitRecoveryGrant(grant *RecoveryGrant, target string, options RotateLeaseOptions) (*model.Lease, int, error) {
+// CommitRecovery consumes the attempt once, including on selection/CAS failure.
+// It rechecks live policy so cancellation/failed dials never consume a rotation.
+func (r *Router) CommitRecovery(grant *RecoveryAttempt, target string, options RotateLeaseOptions) (*model.Lease, int, error) {
 	if grant == nil || grant.owner != r || !grant.used.CompareAndSwap(false, true) {
 		return nil, 0, ErrLeaseChanged
 	}
 	key := grant.key
-	return r.rotateLease(key.platformID, key.account, key.node, key.createdAtNs, target, options, true, true)
+	return r.rotateLease(key.platformID, key.account, key.node, key.createdAtNs, target, options, true)
 }
 
-func (r *Router) rotateLease(platformID, account string, expectedNode node.Hash, expectedCreatedAtNs int64, target string, options RotateLeaseOptions, automatic, reserved bool) (*model.Lease, int, error) {
+func (r *Router) rotateLease(platformID, account string, expectedNode node.Hash, expectedCreatedAtNs int64, target string, options RotateLeaseOptions, automatic bool) (*model.Lease, int, error) {
 	plat, ok := r.pool.GetPlatform(platformID)
 	if !ok {
 		return nil, 0, ErrPlatformNotFound
@@ -149,10 +150,8 @@ func (r *Router) rotateLease(platformID, account string, expectedNode node.Hash,
 			return current, xsync.CancelOp
 		}
 		var guardErr error
-		if automatic && !reserved {
+		if automatic {
 			guardErr = r.checkRecoveryLocked(platformID, account, now)
-		} else if reserved && !r.currentRecoveryPolicy().Enabled {
-			guardErr = ErrRecoveryDisabled
 		}
 		if options.FailureCooldown > 0 && !errors.Is(guardErr, ErrRecoveryDisabled) {
 			r.recordTargetCooldownLocked(platformID, account, target, current, now, options.FailureCooldown)
@@ -165,7 +164,7 @@ func (r *Router) rotateLease(platformID, account string, expectedNode node.Hash,
 		for _, hash := range options.ExcludedNodes {
 			excluded[hash] = struct{}{}
 		}
-		if options.ApplyTargetCooldown {
+		if options.ApplyTargetCooldown && !options.VerifiedPreferred {
 			r.addTargetCooldownExclusionsLocked(platformID, account, target, now, excluded)
 		}
 		if options.ExcludeEgressIP {
@@ -180,7 +179,7 @@ func (r *Router) rotateLease(platformID, account string, expectedNode node.Hash,
 		var replacement Lease
 		if !options.PreferredNode.IsZero() || options.ExpectedTargetIP.IsValid() {
 			entry, exists := r.pool.GetEntry(options.PreferredNode)
-			if options.PreferredNode.IsZero() || !options.ExpectedTargetIP.IsValid() || !exists || !entry.IsHealthy() ||
+			if options.PreferredNode.IsZero() || !options.ExpectedTargetIP.IsValid() || !exists || (!options.VerifiedPreferred && !entry.IsHealthy()) ||
 				!plat.View().Contains(options.PreferredNode) || excluded.contains(options.PreferredNode) ||
 				entry.GetEgressIP() != options.ExpectedTargetIP {
 				rotateErr = ErrNoAvailableNodes
@@ -188,7 +187,7 @@ func (r *Router) rotateLease(platformID, account string, expectedNode node.Hash,
 			}
 			replacement = leaseForNode(plat, options.PreferredNode, entry.GetEgressIP(), now, nowNs)
 			if replacement.EgressIP != options.ExpectedTargetIP || entry.GetEgressIP() != options.ExpectedTargetIP ||
-				!entry.IsHealthy() || !plat.View().Contains(options.PreferredNode) {
+				(!options.VerifiedPreferred && !entry.IsHealthy()) || !plat.View().Contains(options.PreferredNode) {
 				rotateErr = ErrNoAvailableNodes
 				return current, xsync.CancelOp
 			}
@@ -207,7 +206,7 @@ func (r *Router) rotateLease(platformID, account string, expectedNode node.Hash,
 		}
 		state.IPLoadStats.Dec(current.EgressIP)
 		state.IPLoadStats.Inc(replacement.EgressIP)
-		if automatic && !reserved {
+		if automatic {
 			r.recordRecoveryLocked(platformID, account, now)
 		}
 		next = &model.Lease{

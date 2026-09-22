@@ -234,16 +234,24 @@ func TestPrepareConnectTunnel_LimitedRecoveryCanServeWithoutChangingLease(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := env.router.BeginRecovery(initial.PlatformID, "limited", initial.NodeHash, initial.LeaseCreatedAtNs); err != nil {
-		t.Fatal(err)
-	}
-	setProxyE2EOutboundDialFunc(t, env, func(context.Context, string, M.Socksaddr) (net.Conn, error) {
-		return nil, errors.New("dial failed")
-	})
 	conn, peer := net.Pipe()
 	defer peer.Close()
-	addProxyE2ENode(t, env, json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":2}`), "203.0.113.11",
-		func(context.Context, string, M.Socksaddr) (net.Conn, error) { return conn, nil })
+	var calls atomic.Int32
+	dial := func(context.Context, string, M.Socksaddr) (net.Conn, error) {
+		if calls.Add(1) == 1 {
+			return nil, errors.New("dial failed")
+		}
+		return conn, nil
+	}
+	setProxyE2EOutboundDialFunc(t, env, dial)
+	addProxyE2ENode(t, env, json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":2}`), "203.0.113.11", dial)
+	if _, _, err := env.router.RecoverLease(initial.PlatformID, "limited", initial.NodeHash, initial.LeaseCreatedAtNs, "example.com:443", routing.RotateLeaseOptions{PreserveConnections: true}); err != nil {
+		t.Fatal(err)
+	}
+	initial, err = env.router.RouteRequest("plat", "limited", "example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
 	result := prepareConnectTunnel(context.Background(), tunnelDeps{router: env.router, pool: env.pool, connectRetries: 2}, "plat", "limited", "example.com:443")
 	if result.session == nil || result.route.LeaseCreatedAtNs != 0 {
 		t.Fatalf("limited recovery should serve an uncommitted retry: %+v", result)
@@ -253,7 +261,7 @@ func TestPrepareConnectTunnel_LimitedRecoveryCanServeWithoutChangingLease(t *tes
 	if lease == nil || lease.CreatedAtNs != initial.LeaseCreatedAtNs || lease.NodeHash != initial.NodeHash.Hex() {
 		t.Fatalf("limited retry changed the lease: %+v", lease)
 	}
-	if status := env.router.RecoveryStatus(); status.Limited != 1 || status.Rotated != 0 {
+	if status := env.router.RecoveryStatus(); status.Limited != 1 || status.Rotated != 1 {
 		t.Fatalf("unexpected recovery counters: %+v", status)
 	}
 }
@@ -275,8 +283,29 @@ func TestPrepareConnectTunnel_AllFailedCandidatesKeepOriginalLease(t *testing.T)
 	if lease == nil || lease.CreatedAtNs != initial.LeaseCreatedAtNs || lease.NodeHash != initial.NodeHash.Hex() {
 		t.Fatalf("no verified alternative must preserve the lease: %+v", lease)
 	}
-	if _, err := env.router.BeginRecovery(initial.PlatformID, "no-alternative", initial.NodeHash, initial.LeaseCreatedAtNs); !errors.Is(err, routing.ErrRecoveryLimited) {
-		t.Fatalf("one failed connection must consume only one reservation: %v", err)
+	if _, err := env.router.BeginRecovery(initial.PlatformID, "no-alternative", initial.NodeHash, initial.LeaseCreatedAtNs); err != nil {
+		t.Fatalf("failed selection must not consume a rotation: %v", err)
+	}
+}
+
+func TestPrepareConnectTunnel_VerifiedSameIPCandidateSurvivesFailureCooldown(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	initial, err := env.router.RouteRequest("plat", "same-ip", "example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setProxyE2EOutboundDialFunc(t, env, func(context.Context, string, M.Socksaddr) (net.Conn, error) { return nil, errors.New("dial failed") })
+	conn, peer := net.Pipe()
+	defer peer.Close()
+	candidate := addProxyE2ENode(t, env, json.RawMessage(`{"type":"stub","server":"127.0.0.1","server_port":2}`), initial.EgressIP.String(),
+		func(context.Context, string, M.Socksaddr) (net.Conn, error) { return conn, nil })
+	result := prepareConnectTunnel(context.Background(), tunnelDeps{router: env.router, pool: env.pool, connectRetries: 2}, "plat", "same-ip", "example.com:443")
+	if result.session == nil || result.route.NodeHash != candidate || result.route.LeaseCreatedAtNs == 0 {
+		t.Fatalf("successful same-IP candidate was discarded: %+v", result)
+	}
+	defer result.session.upstreamConn.Close()
+	if env.router.RecoveryStatus().Rotated != 1 {
+		t.Fatal("expected one successful rotation")
 	}
 }
 

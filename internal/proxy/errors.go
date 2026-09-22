@@ -143,7 +143,8 @@ func mapRouteError(err error) *ProxyError {
 	if errors.Is(err, routing.ErrPlatformNotFound) {
 		return ErrPlatformNotFound
 	}
-	if errors.Is(err, routing.ErrNoAvailableNodes) {
+	if errors.Is(err, routing.ErrNoAvailableNodes) || errors.Is(err, routing.ErrLeaseChanged) ||
+		errors.Is(err, routing.ErrRecoveryLimited) || errors.Is(err, routing.ErrRecoveryDisabled) {
 		return ErrNoAvailableNodes
 	}
 	return ErrInternalError

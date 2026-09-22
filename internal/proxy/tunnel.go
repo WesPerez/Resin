@@ -176,10 +176,10 @@ func prepareConnectTunnel(
 	excluded := make([]node.Hash, 0, retries)
 	attempts := retries + 1
 	var lastFailure tunnelPrepareResult
-	var grant *routing.RecoveryGrant
+	var grant *routing.RecoveryAttempt
 	finishFailedRecovery := func() {
 		if grant != nil && ctx.Err() == nil {
-			_, _, _ = deps.router.CommitRecoveryGrant(grant, target, routing.RotateLeaseOptions{
+			_, _, _ = deps.router.CommitRecovery(grant, target, routing.RotateLeaseOptions{
 				ExcludeEgressIP: true, PreserveConnections: true, ApplyTargetCooldown: true, FailureCooldown: 10 * time.Minute,
 				ExcludedNodes: excluded,
 			})
@@ -237,8 +237,9 @@ func prepareConnectTunnel(
 			if attempt == 0 && account != "" && routed.Route.LeaseCreatedAtNs != 0 {
 				var beginErr error
 				grant, beginErr = deps.router.BeginRecovery(routed.Route.PlatformID, account, routed.Route.NodeHash, routed.Route.LeaseCreatedAtNs)
-				if beginErr != nil && !errors.Is(beginErr, routing.ErrRecoveryLimited) && !errors.Is(beginErr, routing.ErrRecoveryDisabled) {
-					return lastFailure
+				if beginErr != nil {
+					// A concurrent rotation or policy limit leaves retries read-only.
+					grant = nil
 				}
 			}
 			excluded = append(excluded, routed.Route.NodeHash)
@@ -255,16 +256,18 @@ func prepareConnectTunnel(
 		}
 
 		if grant != nil {
-			next, _, commitErr := deps.router.CommitRecoveryGrant(grant, target, routing.RotateLeaseOptions{
-				PreferredNode: routed.Route.NodeHash, ExpectedTargetIP: routed.Route.EgressIP,
+			next, _, commitErr := deps.router.CommitRecovery(grant, target, routing.RotateLeaseOptions{
+				PreferredNode: routed.Route.NodeHash, ExpectedTargetIP: routed.Route.EgressIP, VerifiedPreferred: true,
 				PreserveConnections: true, ApplyTargetCooldown: true, FailureCooldown: 10 * time.Minute,
 			})
-			if commitErr != nil {
+			if commitErr != nil && !errors.Is(commitErr, routing.ErrRecoveryLimited) && !errors.Is(commitErr, routing.ErrRecoveryDisabled) {
 				_ = rawConn.Close()
 				return tunnelPrepareResult{route: routed.Route, proxyErr: mapRouteError(commitErr), upstreamStage: "connect_recovery", upstreamErr: commitErr}
 			}
-			routed.Route.LeaseCreatedAtNs = next.CreatedAtNs
-			routed.Route.LeaseCreated = true
+			if next != nil {
+				routed.Route.LeaseCreatedAtNs = next.CreatedAtNs
+				routed.Route.LeaseCreated = true
+			}
 		}
 
 		if routed.Route.LeaseGuarded {
