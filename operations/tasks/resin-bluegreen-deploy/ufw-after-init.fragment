@@ -1,3 +1,0 @@
-# Insert inside the existing /etc/ufw/after.init start) branch.
-# Preserve all existing Docker ingress policy calls.
-/bin/systemctl --no-block start resin-bluegreen-nat.service

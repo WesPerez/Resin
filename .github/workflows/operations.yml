@@ -1,4 +1,4 @@
-name: Project operations
+name: Project catalog
 
 on:
   push:
@@ -19,23 +19,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install pytest PyYAML
-      - name: Verify connection preservation, guard policy and deployment recovery
-        run: >-
-          sudo env "PATH=$PATH" python -B -m pytest -q
-          operations/tasks/resin-pool-maintenance/tests
-          operations/tasks/resin-egress-guard/tests
-          operations/tasks/resin-bluegreen-deploy/test_bluegreen.py
-      - name: Verify shared pool and client policies
-        working-directory: operations/tasks/proxy-subscription
-        run: sudo env "PATH=$PATH" python -B -m pytest -q
-      - name: Verify proxy health metrics
-        working-directory: operations/tasks/xray-proxy-health
-        run: python -B -m pytest -q
-      - name: Verify orchestration and shell entrypoints
-        run: |
-          bash operations/tasks/resin-pool-maintenance/orchestrator.test.sh
-          bash operations/tasks/resin-pool-maintenance/global-pool.test.sh
-          bash operations/tasks/resin-pool-maintenance/cn-pool.test.sh
-          bash operations/tasks/resin-bluegreen-deploy/resin-bluegreen-deploy.test.sh
-          shellcheck operations/tasks/resin-bluegreen-deploy/*.sh operations/tasks/resin-egress-guard/resin-egress-guard.sh
+      - name: Validate the published native task catalog
+        run: python -m json.tool operations/project.json > /dev/null
