@@ -3,6 +3,7 @@ package proxy
 import (
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -141,6 +142,11 @@ func (l *requestLifecycle) setNetOK(ok bool) {
 }
 
 func (l *requestLifecycle) setAccount(account string) {
+	// Keep failed guard checks attached to the canonical identity too. The
+	// transient generation/deadline suffix is not an extra application account.
+	if canonical, _, guarded := strings.Cut(account, routing.LeaseGuardMarker); guarded {
+		account = canonical
+	}
 	l.log.Account = account
 }
 

@@ -107,7 +107,8 @@ Platform.Account~r1~node_hash~created_at_ns~deadline_unix_ms~base64url(egress_ip
 ```
 
 `node_hash` 为 32 位十六进制，`created_at_ns` 保留十进制字符串的全部精度，IP 用
-无填充 base64url 编码。账号与平台各不超过 64 个 ASCII 字符，完整用户名不超过
+无填充 base64url 编码。此可选格式的账号使用 `[a-zA-Z0-9_-]`，账号与平台各不超过
+64 个 ASCII 字符；普通账号的字符规则保持不变。完整用户名不超过
 SOCKS5 的 255 字节。截止时间最多为当前时间后 15 分钟，在浏览器队列真正启动时生成。
 
 每个 CONNECT 都只允许命中原账号的同一节点、租约代次和确切 IP。缺失、过期、

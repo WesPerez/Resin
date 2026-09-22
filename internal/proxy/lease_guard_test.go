@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -67,5 +69,32 @@ func TestPrepareConnectTunnel_GuardCannotUseDirectBypass(t *testing.T) {
 			result.session.upstreamConn.Close()
 		}
 		t.Fatalf("guard fell through to direct bypass: %+v", result)
+	}
+}
+
+func TestForwardProxy_GuardRejectionLogsTheOriginalAccount(t *testing.T) {
+	env := newProxyE2EEnv(t)
+	emitter := newMockEventEmitter()
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	fp := NewForwardProxy(ForwardProxyConfig{ProxyToken: "tok", Router: env.router, Pool: env.pool, Events: emitter, ProxyBypassRules: []string{"127.*"}})
+	req := httptest.NewRequest(http.MethodGet, upstream.URL, nil)
+	req.Header.Set("Proxy-Authorization", basicAuth("plat.browser~r1~invalid", "tok"))
+	response := httptest.NewRecorder()
+	fp.ServeHTTP(response, req)
+	if response.Code != http.StatusConflict || response.Header().Get("X-Resin-Error") != "LEASE_GUARD_FAILED" || requests.Load() != 0 {
+		t.Fatalf("guard rejection bypassed routing: status=%d requests=%d", response.Code, requests.Load())
+	}
+	select {
+	case event := <-emitter.logCh:
+		if event.Account != "browser" {
+			t.Fatalf("failed guard logged a transient identity: %q", event.Account)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing rejected request log")
 	}
 }
