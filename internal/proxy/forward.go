@@ -239,7 +239,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	var route routing.RouteResult
 	var hasRoute bool
 	var transport *http.Transport
-	if p.bypass != nil && p.bypass.ShouldBypass(r.Host) {
+	if p.bypass != nil && !routing.HasLeaseGuard(account) && p.bypass.ShouldBypass(r.Host) {
 		transport = p.directHTTPTransport()
 	} else {
 		routed, routeErr := resolveRoutedOutbound(p.router, p.pool, platName, account, r.Host)

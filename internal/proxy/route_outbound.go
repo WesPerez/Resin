@@ -39,6 +39,9 @@ func resolveRoutedOutboundExcluding(
 	if !ok {
 		return routedOutbound{}, ErrNoAvailableNodes
 	}
+	if result.LeaseGuarded && (!entry.IsHealthy() || entry.GetEgressIP() != result.EgressIP) {
+		return routedOutbound{}, ErrLeaseGuard
+	}
 	obPtr := entry.Outbound.Load()
 	if obPtr == nil {
 		return routedOutbound{}, ErrNoAvailableNodes

@@ -62,13 +62,16 @@ func NewRouter(cfg RouterConfig) *Router {
 }
 
 type RouteResult struct {
-	PlatformID       string
-	PlatformName     string
-	NodeHash         node.Hash
-	EgressIP         netip.Addr
-	NodeTag          string // display tag: "<Subscription>/<Tag>" (DESIGN.md §601)
-	LeaseCreated     bool
-	LeaseCreatedAtNs int64
+	PlatformID        string
+	PlatformName      string
+	NodeHash          node.Hash
+	EgressIP          netip.Addr
+	NodeTag           string // display tag: "<Subscription>/<Tag>" (DESIGN.md §601)
+	LeaseCreated      bool
+	LeaseCreatedAtNs  int64
+	LeaseAccount      string
+	LeaseGuarded      bool
+	LeaseGuardUntilMs int64
 }
 
 const livePickAttempts = 2 // first pick + one retry
@@ -124,6 +127,11 @@ func (s nodeExclusionSet) contains(hash node.Hash) bool {
 }
 
 func (r *Router) routeRequest(platName, account, target string, excluded nodeExclusionSet) (RouteResult, error) {
+	now := time.Now()
+	guard, err := parseLeaseGuard(account, now)
+	if err != nil {
+		return RouteResult{}, err
+	}
 	plat, err := r.resolvePlatform(platName)
 	if err != nil {
 		return RouteResult{}, err
@@ -132,10 +140,12 @@ func (r *Router) routeRequest(platName, account, target string, excluded nodeExc
 	targetDomain := netutil.ExtractDomain(target)
 	state := r.ensurePlatformState(plat.ID)
 	var result RouteResult
-	if account == "" {
+	if guard != nil {
+		result, err = r.routeGuarded(plat, state, guard, now, excluded)
+	} else if account == "" {
 		result, err = r.routeRandom(plat, state, targetDomain, excluded)
 	} else {
-		result, err = r.routeSticky(plat, state, account, targetDomain, time.Now(), excluded)
+		result, err = r.routeSticky(plat, state, account, targetDomain, now, excluded)
 	}
 	if err != nil {
 		return RouteResult{}, err

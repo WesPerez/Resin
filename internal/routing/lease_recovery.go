@@ -27,6 +27,9 @@ type leaseConnection struct {
 // RegisterLeaseConnection rejects a dial that completed after its lease rotated.
 // The recovery lock covers both registration and replacement, including late dials.
 func (r *Router) RegisterLeaseConnection(route RouteResult, account string, closeConnection func()) (func(), bool) {
+	if route.LeaseGuarded {
+		account = route.LeaseAccount
+	}
 	if r == nil || account == "" || route.PlatformID == "" || route.LeaseCreatedAtNs == 0 || closeConnection == nil {
 		return func() {}, true
 	}
@@ -36,6 +39,15 @@ func (r *Router) RegisterLeaseConnection(route RouteResult, account string, clos
 	lease := r.ReadLease(model.LeaseKey{PlatformID: route.PlatformID, Account: account})
 	if lease == nil || lease.NodeHash != route.NodeHash.Hex() || lease.CreatedAtNs != route.LeaseCreatedAtNs {
 		return func() {}, false
+	}
+	if route.LeaseGuarded {
+		now := time.Now()
+		entry, exists := r.pool.GetEntry(route.NodeHash)
+		plat, hasPlatform := r.pool.GetPlatform(route.PlatformID)
+		if now.UnixMilli() >= route.LeaseGuardUntilMs || lease.ExpiryNs <= now.UnixNano() || lease.EgressIP != route.EgressIP.String() ||
+			!exists || !entry.IsHealthy() || entry.GetEgressIP() != route.EgressIP || !hasPlatform || !plat.View().Contains(route.NodeHash) {
+			return func() {}, false
+		}
 	}
 	if r.leaseConnections == nil {
 		r.leaseConnections = make(map[leaseConnectionKey]map[*leaseConnection]struct{})

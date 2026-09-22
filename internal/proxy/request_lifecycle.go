@@ -170,6 +170,9 @@ func (l *requestLifecycle) setRespBodyCapture(c *payloadCaptureReadCloser) {
 }
 
 func (l *requestLifecycle) setRouteResult(result routing.RouteResult) {
+	if result.LeaseAccount != "" {
+		l.log.Account = result.LeaseAccount
+	}
 	l.finished.PlatformID = result.PlatformID
 	l.log.PlatformID = result.PlatformID
 	l.log.PlatformName = result.PlatformName

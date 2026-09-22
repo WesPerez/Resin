@@ -473,6 +473,15 @@ func TestAPIContract_RequestBodyTooLarge(t *testing.T) {
 }
 
 func TestAPIContract_RotateLease(t *testing.T) {
+	t.Run("lease advertises strict routing support", func(t *testing.T) {
+		srv, cp, _ := newControlPlaneTestServer(t)
+		platformID, account, _ := seedRotateLease(t, srv, cp, "lease-guard-capability", 1)
+		rec := doJSONRequest(t, srv, http.MethodGet, "/api/v1/platforms/"+platformID+"/leases/"+account, nil, true)
+		if rec.Code != http.StatusOK || decodeJSONMap(t, rec)["lease_guard_version"] != float64(1) {
+			t.Fatalf("missing guarded lease capability: status=%d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+
 	t.Run("explicit candidate needs no parent lease", func(t *testing.T) {
 		srv, cp, _ := newControlPlaneTestServer(t)
 		platformID, account, before := seedRotateLease(t, srv, cp, "rotate-preferred", 3)

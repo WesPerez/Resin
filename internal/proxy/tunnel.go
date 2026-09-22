@@ -161,7 +161,7 @@ func prepareConnectTunnel(
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if deps.bypass != nil && deps.bypass.ShouldBypass(target) {
+	if deps.bypass != nil && !routing.HasLeaseGuard(account) && deps.bypass.ShouldBypass(target) {
 		return prepareDirectConnectTunnel(ctx, deps, target)
 	}
 
@@ -218,6 +218,9 @@ func prepareConnectTunnel(
 				upstreamStage: "connect_dial",
 				upstreamErr:   err,
 			}
+			if routed.Route.LeaseGuarded {
+				return lastFailure
+			}
 			excluded = append(excluded, routed.Route.NodeHash)
 			if attempt+1 < attempts {
 				log.Printf(
@@ -231,6 +234,12 @@ func prepareConnectTunnel(
 			continue
 		}
 
+		if routed.Route.LeaseGuarded {
+			if err := rawConn.SetDeadline(time.UnixMilli(routed.Route.LeaseGuardUntilMs)); err != nil {
+				_ = rawConn.Close()
+				return tunnelPrepareResult{route: routed.Route, proxyErr: ErrLeaseGuard}
+			}
+		}
 		recordResult := func(ok bool) {
 			if deps.health != nil {
 				recordPassiveResultAsync(deps.health, routed.Route, ok)
@@ -315,6 +324,12 @@ func dialTunnelWithTimeout(
 }
 
 func invalidateTunnelLease(router *routing.Router, route routing.RouteResult, account string) bool {
+	// A failed image/font/echo connection cannot invalidate a whole browser job.
+	// Explicit administrative recovery may still change the lease; every later
+	// guarded CONNECT will reject that generation instead of following it.
+	if route.LeaseGuarded {
+		return false
+	}
 	if router == nil || account == "" || route.PlatformID == "" || route.NodeHash.IsZero() || route.LeaseCreatedAtNs == 0 {
 		return false
 	}
