@@ -22,7 +22,7 @@ ARG VERSION=dev
 ARG GIT_COMMIT=unknown
 ARG BUILD_TIME=unknown
 
-RUN CGO_ENABLED=0 go build -trimpath -tags "with_quic with_wireguard with_grpc with_utls" \
+RUN CGO_ENABLED=0 go build -trimpath -tags "with_quic with_wireguard with_grpc with_utls with_embedded_tor with_naive_outbound" \
   -ldflags="-s -w \
   -X github.com/Resinat/Resin/internal/buildinfo.Version=${VERSION} \
   -X github.com/Resinat/Resin/internal/buildinfo.GitCommit=${GIT_COMMIT} \
@@ -30,6 +30,7 @@ RUN CGO_ENABLED=0 go build -trimpath -tags "with_quic with_wireguard with_grpc w
   -o /out/resin ./cmd/resin
 
 FROM alpine:3.21
+LABEL io.resin.unlimited-drain="1"
 # NOTE: Keep this runtime stage in sync with .github/Dockerfile.release.
 # GHCR release images are built from .github/Dockerfile.release, not this file.
 RUN apk add --no-cache ca-certificates tzdata su-exec \

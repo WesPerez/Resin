@@ -375,6 +375,8 @@ RESIN_PORT=2260 \
   - **A**: `LEGACY_V0` is no longer supported. Remove `RESIN_AUTH_VERSION` or set it to `V1`. If you are upgrading from a release that used legacy authentication, see the [v1.0.0 auth migration guide](doc/v1.0.0-migration-guide.md).
 - **Q: Why can't my SOCKS5 client connect?**
   - **A**: If `RESIN_PROXY_TOKEN` is non-empty, the client must send SOCKS5 username/password authentication. If it is explicitly set to an empty string, `NO AUTH` is also allowed.
+- **Q: How can a bad node be replaced during the current connection setup?**
+  - **A**: Set `RESIN_PROXY_CONNECT_TIMEOUT=10s`, `RESIN_PROXY_CONNECT_RETRIES=2`, and `RESIN_PROXY_TUNNEL_FIRST_BYTE_TIMEOUT=10s`. Dial failures exclude every failed node and reselect up to twice before CONNECT/SOCKS reports success, for at most three distinct nodes. If the client has sent tunnel data but the target returns no bytes for 10 seconds, Resin closes the tunnel and invalidates only the matching sticky lease. The first byte is usually a TLS `ServerHello`, not an LLM token; after any upstream byte arrives, model thinking time does not trigger this timeout. Resin does not buffer or replay encrypted application requests inside the tunnel.
 - **Q: How to write reverse-proxy paths for WebSocket (ws/wss)?**
   - **A**: In the URL path, the protocol field must still be `http` or `https` (not `ws`/`wss`). Resin auto-detects and handles WebSocket upgrade.
 
@@ -388,3 +390,8 @@ RESIN_PORT=2260 \
 - **Prohibited use**: You must not use this project for unauthorized access, control-evasion, fraud, attacks, abusive traffic generation, or other illegal or non-compliant activity.
 - **No warranty**: This project is provided on an "AS IS" basis, without express or implied warranties, including but not limited to merchantability, fitness for a particular purpose, and non-infringement.
 - **Limitation of liability**: To the maximum extent permitted by applicable law, authors and contributors are not liable for any direct, indirect, incidental, special, exemplary, or consequential damages arising from use of, or inability to use, this project.
+
+
+## 生产服务器发布约束
+
+本服务器禁止下载或安装项目依赖、编译、构建及构造镜像；源码审查后推送 GitHub，由 GitHub-hosted CI 完成验证与构建。服务器只拉取通过验证的镜像或发布包。具体发布入口、数据保护、日志保留和工作树收尾规则见 [AGENTS.md](AGENTS.md)。

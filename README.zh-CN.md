@@ -361,6 +361,8 @@ RESIN_PORT=2260 \
   - **A**: 当前版本已不再支持 `LEGACY_V0`，请删除 `RESIN_AUTH_VERSION` 或将其设为 `V1`。如果你正从使用旧认证格式的版本升级，请参阅 [v1.0.0 认证迁移指南](doc/v1.0.0-migration-guide.zh-CN.md)。
 - **Q: 为什么 SOCKS5 客户端连不上？**
   - **A**: 若 `RESIN_PROXY_TOKEN` 非空，客户端需要发送 SOCKS5 用户名密码认证；若它被显式设为空字符串，则也允许 `NO AUTH`。
+- **Q: 如何让坏节点在当前连接建立阶段自动切换？**
+  - **A**: 可设置 `RESIN_PROXY_CONNECT_TIMEOUT=10s`、`RESIN_PROXY_CONNECT_RETRIES=2` 和 `RESIN_PROXY_TUNNEL_FIRST_BYTE_TIMEOUT=10s`。拨号失败会在 CONNECT/SOCKS 成功响应前排除本次连接中全部已失败节点并最多重选两次，总计尝试三个不同节点；客户端已发送数据但目标 10 秒没有返回任何字节时，会关闭隧道并精确失效旧粘性租约。这里的“首字”通常是 TLS `ServerHello`，不是大模型首 token；收到任意上游字节后不会因模型继续思考而切换。Resin 不缓存或重放隧道内的加密业务请求。
 - **Q: 使用反向代理 WebSocket 协议（如 ws/wss）怎么写路径？**
   - **A**: 目标无论是不是 ws/wss，URL 路径里的协议字段**依然只能写 `http` 或 `https`**（不能写 ws/wss）。Resin 会自动探测并完成 WebSocket 协议升级（Upgrade）。
 
