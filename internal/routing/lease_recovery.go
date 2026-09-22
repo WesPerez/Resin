@@ -70,6 +70,8 @@ func (r *Router) RegisterLeaseConnection(route RouteResult, account string, clos
 type RotateLeaseOptions struct {
 	ExcludeEgressIP     bool
 	PreserveConnections bool
+	ApplyTargetCooldown bool
+	FailureCooldown     time.Duration
 	// A supplied candidate is strict: stale or unavailable candidates leave the
 	// original lease intact instead of silently choosing an unaudited node.
 	PreferredNode    node.Hash
@@ -95,7 +97,13 @@ func (r *Router) RotateLease(platformID, account string, expectedNode node.Hash,
 			rotateErr = ErrLeaseChanged
 			return current, xsync.CancelOp
 		}
+		if options.FailureCooldown > 0 {
+			r.recordTargetCooldownLocked(platformID, account, target, current, now, options.FailureCooldown)
+		}
 		excluded := nodeExclusionSet{expectedNode: struct{}{}}
+		if options.ApplyTargetCooldown {
+			r.addTargetCooldownExclusionsLocked(platformID, account, target, now, excluded)
+		}
 		if options.ExcludeEgressIP {
 			plat.View().Range(func(hash node.Hash) bool {
 				if entry, exists := r.pool.GetEntry(hash); exists && entry.GetEgressIP() == current.EgressIP {

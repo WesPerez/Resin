@@ -37,6 +37,7 @@ type Router struct {
 	nodeTagResolver  func(node.Hash) string
 	recoveryMu       sync.RWMutex
 	leaseConnections map[leaseConnectionKey]map[*leaseConnection]struct{}
+	targetCooldowns  map[targetCooldownKey]targetCooldown
 }
 
 type RouterConfig struct {
@@ -85,22 +86,27 @@ const (
 )
 
 func (r *Router) RouteRequest(platName, account, target string) (RouteResult, error) {
-	return r.routeRequest(platName, account, target, nil)
+	return r.routeRequest(platName, account, target, nil, false)
+}
+
+// AcquireRecoveryRoute never deletes an existing binding when selection fails.
+func (r *Router) AcquireRecoveryRoute(platName, account, target string) (RouteResult, error) {
+	return r.routeRequest(platName, account, target, nil, true)
 }
 
 // RouteRequestExcluding routes one request while excluding a node that failed
 // earlier in the same connection attempt.
 func (r *Router) RouteRequestExcluding(platName, account, target string, excluded node.Hash) (RouteResult, error) {
 	if excluded.IsZero() {
-		return r.routeRequest(platName, account, target, nil)
+		return r.routeRequest(platName, account, target, nil, false)
 	}
-	return r.routeRequest(platName, account, target, nodeExclusionSet{excluded: struct{}{}})
+	return r.routeRequest(platName, account, target, nodeExclusionSet{excluded: struct{}{}}, false)
 }
 
 // RouteRequestExcludingNodes routes one request while excluding every node
 // that already failed during the same bounded connection attempt.
 func (r *Router) RouteRequestExcludingNodes(platName, account, target string, excluded []node.Hash) (RouteResult, error) {
-	return r.routeRequest(platName, account, target, newNodeExclusionSet(excluded))
+	return r.routeRequest(platName, account, target, newNodeExclusionSet(excluded), false)
 }
 
 type nodeExclusionSet map[node.Hash]struct{}
@@ -126,7 +132,7 @@ func (s nodeExclusionSet) contains(hash node.Hash) bool {
 	return ok
 }
 
-func (r *Router) routeRequest(platName, account, target string, excluded nodeExclusionSet) (RouteResult, error) {
+func (r *Router) routeRequest(platName, account, target string, excluded nodeExclusionSet, preserveOnFailure bool) (RouteResult, error) {
 	now := time.Now()
 	guard, err := parseLeaseGuard(account, now)
 	if err != nil {
@@ -145,7 +151,7 @@ func (r *Router) routeRequest(platName, account, target string, excluded nodeExc
 	} else if account == "" {
 		result, err = r.routeRandom(plat, state, targetDomain, excluded)
 	} else {
-		result, err = r.routeSticky(plat, state, account, targetDomain, now, excluded)
+		result, err = r.routeSticky(plat, state, account, targetDomain, now, excluded, preserveOnFailure)
 	}
 	if err != nil {
 		return RouteResult{}, err
@@ -208,8 +214,16 @@ func (r *Router) routeSticky(
 	targetDomain string,
 	now time.Time,
 	excluded nodeExclusionSet,
+	preserveOnFailure bool,
 ) (RouteResult, error) {
 	r.recoveryMu.RLock()
+	if preserveOnFailure {
+		if excluded == nil {
+			excluded = make(nodeExclusionSet)
+		}
+		// Apply cooldowns before any sticky hit or same-IP replacement commits.
+		r.addTargetCooldownExclusionsLocked(plat.ID, account, targetDomain, now, excluded)
+	}
 	nowNs := now.UnixNano()
 	var result RouteResult
 	var routeErr error
@@ -227,6 +241,7 @@ func (r *Router) routeSticky(
 			loaded,
 			excluded,
 			&events,
+			preserveOnFailure,
 		)
 		if err != nil {
 			routeErr = err
@@ -254,6 +269,7 @@ func (r *Router) decideStickyLease(
 	loaded bool,
 	excluded nodeExclusionSet,
 	events *[]LeaseEvent,
+	preserveOnFailure bool,
 ) (Lease, xsync.ComputeOp, RouteResult, error) {
 	hadPreviousLease := loaded
 	invalidation := leaseInvalidationNone
@@ -285,6 +301,7 @@ func (r *Router) decideStickyLease(
 		invalidation,
 		excluded,
 		events,
+		preserveOnFailure,
 	)
 }
 
@@ -300,9 +317,16 @@ func (r *Router) createOrAbortStickyLease(
 	invalidation leaseInvalidationReason,
 	excluded nodeExclusionSet,
 	events *[]LeaseEvent,
+	preserveOnFailure bool,
 ) (Lease, xsync.ComputeOp, RouteResult, error) {
+	if hadPreviousLease {
+		nowNs = max(nowNs, previous.CreatedAtNs+1)
+	}
 	newLease, createdResult, err := r.createLease(plat, state, targetDomain, now, nowNs, excluded)
 	if err != nil {
+		if hadPreviousLease && preserveOnFailure {
+			return previous, xsync.CancelOp, RouteResult{}, err
+		}
 		r.cleanupPreviousLease(state, previous, hadPreviousLease, invalidation, plat.ID, account, events)
 		lease, op := abortLeaseCreate(previous, hadPreviousLease)
 		return lease, op, RouteResult{}, err
@@ -377,19 +401,21 @@ func (r *Router) tryLeaseSameIPRotation(
 
 	newLease := current
 	newLease.NodeHash = bestHash
+	newLease.CreatedAtNs = max(nowNs, current.CreatedAtNs+1)
 	newLease.LastAccessedNs = nowNs
 	*events = append(*events, LeaseEvent{
-		Type:       LeaseReplace,
-		PlatformID: plat.ID,
-		Account:    account,
-		NodeHash:   bestHash,
-		EgressIP:   current.EgressIP,
+		Type:        LeaseReplace,
+		PlatformID:  plat.ID,
+		Account:     account,
+		NodeHash:    bestHash,
+		EgressIP:    current.EgressIP,
+		CreatedAtNs: newLease.CreatedAtNs,
 	})
 	return newLease, RouteResult{
 		NodeHash:         bestHash,
 		EgressIP:         current.EgressIP,
 		LeaseCreated:     false,
-		LeaseCreatedAtNs: current.CreatedAtNs,
+		LeaseCreatedAtNs: newLease.CreatedAtNs,
 	}, true
 }
 
