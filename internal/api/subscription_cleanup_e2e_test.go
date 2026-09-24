@@ -68,6 +68,9 @@ func TestAPIContract_SubscriptionCleanupAction_E2E(t *testing.T) {
 		t.Fatalf("get subscription before cleanup status: got %d, want %d, body=%s", beforeCleanupSubRec.Code, http.StatusOK, beforeCleanupSubRec.Body.String())
 	}
 	beforeCleanupSubBody := decodeJSONMap(t, beforeCleanupSubRec)
+	if beforeCleanupSubBody["managed_node_count"] != float64(3) || beforeCleanupSubBody["evicted_node_count"] != float64(0) {
+		t.Fatalf("live counts before cleanup: %v", beforeCleanupSubBody)
+	}
 	if got := beforeCleanupSubBody["node_count"]; got != float64(3) {
 		t.Fatalf("subscription node_count before cleanup: got %v, want 3", got)
 	}
@@ -116,6 +119,9 @@ func TestAPIContract_SubscriptionCleanupAction_E2E(t *testing.T) {
 		t.Fatalf("get subscription after cleanup status: got %d, want %d, body=%s", afterCleanupSubRec.Code, http.StatusOK, afterCleanupSubRec.Body.String())
 	}
 	afterCleanupSubBody := decodeJSONMap(t, afterCleanupSubRec)
+	if afterCleanupSubBody["managed_node_count"] != float64(3) || afterCleanupSubBody["evicted_node_count"] != float64(2) {
+		t.Fatalf("live counts after cleanup: %v", afterCleanupSubBody)
+	}
 	if got := afterCleanupSubBody["node_count"]; got != float64(1) {
 		t.Fatalf("subscription node_count after cleanup: got %v, want 1", got)
 	}

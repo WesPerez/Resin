@@ -83,6 +83,9 @@ var runtimeConfigAllowedFields = map[string]bool{
 	"max_latency_test_interval":                true,
 	"max_authority_latency_test_interval":      true,
 	"max_egress_test_interval":                 true,
+	"lease_recovery_enabled":                   true,
+	"lease_recovery_accounts_per_minute":       true,
+	"lease_recovery_cooldown_seconds":          true,
 	"latency_test_url":                         true,
 	"latency_authorities":                      true,
 	"p2c_latency_window":                       true,
@@ -193,6 +196,12 @@ func (s *ControlPlaneService) PatchRuntimeConfig(patchJSON json.RawMessage) (*co
 }
 
 func validateRuntimeConfig(cfg *config.RuntimeConfig) *ServiceError {
+	if cfg.LeaseRecoveryAccountsPerMinute < 1 || cfg.LeaseRecoveryAccountsPerMinute > 100 {
+		return invalidArg("lease_recovery_accounts_per_minute: must be between 1 and 100")
+	}
+	if cfg.LeaseRecoveryCooldownSeconds < 60 || cfg.LeaseRecoveryCooldownSeconds > 3600 {
+		return invalidArg("lease_recovery_cooldown_seconds: must be between 60 and 3600")
+	}
 	latencyURL := strings.TrimSpace(cfg.LatencyTestURL)
 	u, verr := parseHTTPAbsoluteURL("latency_test_url", latencyURL)
 	if verr != nil {

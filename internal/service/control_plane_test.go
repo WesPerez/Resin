@@ -178,6 +178,30 @@ func TestValidateRuntimeConfig_ValidConfig(t *testing.T) {
 	}
 }
 
+func TestValidateRuntimeConfig_RecoveryBounds(t *testing.T) {
+	for _, value := range []int{-1, 0, 101} {
+		cfg := newDefaultCfg()
+		cfg.LeaseRecoveryAccountsPerMinute = value
+		if validateRuntimeConfig(cfg) == nil {
+			t.Fatalf("accepted account limit %d", value)
+		}
+	}
+	for _, value := range []int{-1, 0, 59, 3601} {
+		cfg := newDefaultCfg()
+		cfg.LeaseRecoveryCooldownSeconds = value
+		if validateRuntimeConfig(cfg) == nil {
+			t.Fatalf("accepted cooldown %d", value)
+		}
+	}
+	for _, value := range []int{60, 300, 3600} {
+		cfg := newDefaultCfg()
+		cfg.LeaseRecoveryCooldownSeconds = value
+		if err := validateRuntimeConfig(cfg); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestRuntimeConfigPatchAllowlist_StaysInSyncWithRuntimeConfigJSONFields(t *testing.T) {
 	rt := reflect.TypeOf(config.RuntimeConfig{})
 	jsonFields := make(map[string]struct{})

@@ -29,6 +29,8 @@ type SubscriptionResponse struct {
 	Content                 string `json:"content"`
 	UpdateInterval          string `json:"update_interval"`
 	NodeCount               int    `json:"node_count"`
+	ManagedNodeCount        int    `json:"managed_node_count"`
+	EvictedNodeCount        int    `json:"evicted_node_count"`
 	HealthyNodeCount        int    `json:"healthy_node_count"`
 	Ephemeral               bool   `json:"ephemeral"`
 	IncrementalAliveNodes   bool   `json:"incremental_alive_nodes"`
@@ -42,6 +44,7 @@ type SubscriptionResponse struct {
 
 func (s *ControlPlaneService) subToResponse(sub *subscription.Subscription) SubscriptionResponse {
 	nodeCount := 0
+	evictedNodeCount := 0
 	healthyNodeCount := 0
 	var isHealthyAndEnabled func(*node.NodeEntry) bool
 	if sub.Enabled() && s != nil && s.Pool != nil {
@@ -50,6 +53,7 @@ func (s *ControlPlaneService) subToResponse(sub *subscription.Subscription) Subs
 	if managed := sub.ManagedNodes(); managed != nil {
 		managed.RangeNodes(func(h node.Hash, n subscription.ManagedNode) bool {
 			if n.Evicted {
+				evictedNodeCount++
 				return true
 			}
 			nodeCount++
@@ -64,13 +68,16 @@ func (s *ControlPlaneService) subToResponse(sub *subscription.Subscription) Subs
 	}
 
 	resp := SubscriptionResponse{
-		ID:                      sub.ID,
-		Name:                    sub.Name(),
-		SourceType:              sub.SourceType(),
-		URL:                     sub.URL(),
-		Content:                 sub.Content(),
-		UpdateInterval:          time.Duration(sub.UpdateIntervalNs()).String(),
-		NodeCount:               nodeCount,
+		ID:             sub.ID,
+		Name:           sub.Name(),
+		SourceType:     sub.SourceType(),
+		URL:            sub.URL(),
+		Content:        sub.Content(),
+		UpdateInterval: time.Duration(sub.UpdateIntervalNs()).String(),
+		NodeCount:      nodeCount,
+		// Use the same traversal for all counts; cache.db is a delayed snapshot.
+		ManagedNodeCount:        nodeCount + evictedNodeCount,
+		EvictedNodeCount:        evictedNodeCount,
 		HealthyNodeCount:        healthyNodeCount,
 		Ephemeral:               sub.Ephemeral(),
 		IncrementalAliveNodes:   sub.IncrementalAliveNodes(),

@@ -11,7 +11,7 @@ import { ToastContainer } from "../../components/ui/Toast";
 import { useToast } from "../../hooks/useToast";
 import i18next, { useI18n } from "../../i18n";
 import { formatApiErrorMessage } from "../../lib/error-message";
-import { getEnvConfig, patchSystemConfig, getSystemConfig, getDefaultSystemConfig } from "./api";
+import { getEnvConfig, patchSystemConfig, getSystemConfig, getDefaultSystemConfig, getRecoveryStatus } from "./api";
 import type { RuntimeConfig, RuntimeConfigPatch } from "./types";
 
 type RuntimeConfigForm = {
@@ -25,6 +25,9 @@ type RuntimeConfigForm = {
   max_latency_test_interval: string;
   max_authority_latency_test_interval: string;
   max_egress_test_interval: string;
+  lease_recovery_enabled: boolean;
+  lease_recovery_accounts_per_minute: string;
+  lease_recovery_cooldown_seconds: string;
   latency_test_url: string;
   latency_authorities_raw: string;
   p2c_latency_window: string;
@@ -44,6 +47,9 @@ const EDITABLE_FIELDS: Array<keyof RuntimeConfig> = [
   "max_latency_test_interval",
   "max_authority_latency_test_interval",
   "max_egress_test_interval",
+  "lease_recovery_enabled",
+  "lease_recovery_accounts_per_minute",
+  "lease_recovery_cooldown_seconds",
   "latency_test_url",
   "latency_authorities",
   "p2c_latency_window",
@@ -63,6 +69,9 @@ const FIELD_LABELS: Record<keyof RuntimeConfig, string> = {
   max_latency_test_interval: "节点延迟最大测试间隔",
   max_authority_latency_test_interval: "权威域名最大测试间隔",
   max_egress_test_interval: "出口 IP 更新检查间隔",
+  lease_recovery_enabled: "自动恢复失败的出口",
+  lease_recovery_accounts_per_minute: "每分钟最多恢复账号数（每平台）",
+  lease_recovery_cooldown_seconds: "平台暂停恢复时长（秒）",
   latency_test_url: "延迟测试目标 URL",
   latency_authorities: "延迟测试权威域名列表",
   p2c_latency_window: "P2C 延迟衰减窗口",
@@ -88,6 +97,15 @@ const EMPTY_ACCOUNT_BEHAVIOR_LABELS: Record<string, string> = {
   ACCOUNT_HEADER_RULE: "按照全局请求头规则提取 Account",
 };
 
+const RECOVERY_STATUS_LABELS: Record<string, string> = {
+  rotated: "已恢复出口",
+  recovery_limited: "等待恢复冷却结束",
+  disabled: "自动恢复已关闭",
+  no_alternative: "暂无可用替代出口，保持原连接",
+  stale_lease: "旧请求已失效，保持当前出口",
+  failed: "恢复失败，请查看请求日志",
+};
+
 function configToForm(config: RuntimeConfig): RuntimeConfigForm {
   return {
     request_log_enabled: config.request_log_enabled,
@@ -100,6 +118,9 @@ function configToForm(config: RuntimeConfig): RuntimeConfigForm {
     max_latency_test_interval: config.max_latency_test_interval,
     max_authority_latency_test_interval: config.max_authority_latency_test_interval,
     max_egress_test_interval: config.max_egress_test_interval,
+    lease_recovery_enabled: config.lease_recovery_enabled,
+    lease_recovery_accounts_per_minute: String(config.lease_recovery_accounts_per_minute),
+    lease_recovery_cooldown_seconds: String(config.lease_recovery_cooldown_seconds),
     latency_test_url: config.latency_test_url,
     latency_authorities_raw: config.latency_authorities.join("\n"),
     p2c_latency_window: config.p2c_latency_window,
@@ -129,6 +150,14 @@ function parseDurationField(field: string, raw: string): string {
   const value = raw.trim();
   if (!value) {
     throw new Error(i18next.t("{{field}} 不能为空", { field: requiredFieldLabel(field) }));
+  }
+  return value;
+}
+
+function parseRecoveryInt(field: string, raw: string, min: number, max: number): number {
+  const value = parseNonNegativeInt(field, raw);
+  if (value < min || value > max) {
+    throw new Error(i18next.t("{{field}} 必须在 {{min}} 到 {{max}} 之间", { field: requiredFieldLabel(field), min, max }));
   }
   return value;
 }
@@ -174,6 +203,9 @@ function parseForm(form: RuntimeConfigForm): RuntimeConfig {
       form.max_authority_latency_test_interval,
     ),
     max_egress_test_interval: parseDurationField("出口 IP 更新检查间隔", form.max_egress_test_interval),
+    lease_recovery_enabled: form.lease_recovery_enabled,
+    lease_recovery_accounts_per_minute: parseRecoveryInt("每分钟最多恢复账号数（每平台）", form.lease_recovery_accounts_per_minute, 1, 100),
+    lease_recovery_cooldown_seconds: parseRecoveryInt("平台暂停恢复时长（秒）", form.lease_recovery_cooldown_seconds, 60, 3600),
     latency_test_url: latencyURL,
     latency_authorities: parseAuthorities(form.latency_authorities_raw),
     p2c_latency_window: parseDurationField("P2C 延迟衰减窗口", form.p2c_latency_window),
@@ -253,6 +285,12 @@ export function SystemConfigPage() {
     queryKey: ["system-config-env"],
     queryFn: getEnvConfig,
     staleTime: Infinity, // Env config does not change at runtime
+  });
+
+  const recoveryQuery = useQuery({
+    queryKey: ["system-recovery"],
+    queryFn: getRecoveryStatus,
+    refetchInterval: 15_000,
   });
 
   const baseline = configQuery.data ?? null;
@@ -475,6 +513,43 @@ export function SystemConfigPage() {
                       onChange={(event) => setFormField("max_consecutive_failures", event.target.value)}
                     />
                   </div>
+                </div>
+              </section>
+
+              <section className="syscfg-section">
+                <h4>{t("出口自动恢复")}</h4>
+                <p className="muted">{t("在请求失败时直接恢复出口，已有连接继续完成。各平台分别限流；无可用替代时保留当前出口。")}</p>
+                <div className="form-grid">
+                  <div className="field-group">
+                    <label className="field-label" htmlFor="sys-recovery-enabled">{t("自动恢复失败的出口")}</label>
+                    <Switch id="sys-recovery-enabled" checked={form.lease_recovery_enabled}
+                      onChange={(event) => setFormField("lease_recovery_enabled", event.target.checked)} />
+                  </div>
+                  <div className="field-group">
+                    <label className="field-label" htmlFor="sys-recovery-limit">{t("每分钟最多恢复账号数（每平台）")}</label>
+                    <Input id="sys-recovery-limit" type="number" min={1} max={100}
+                      value={form.lease_recovery_accounts_per_minute}
+                      onChange={(event) => setFormField("lease_recovery_accounts_per_minute", event.target.value)} />
+                  </div>
+                  <div className="field-group">
+                    <label className="field-label" htmlFor="sys-recovery-cooldown">{t("平台暂停恢复时长（秒）")}</label>
+                    <Input id="sys-recovery-cooldown" type="number" min={60} max={3600}
+                      value={form.lease_recovery_cooldown_seconds}
+                      onChange={(event) => setFormField("lease_recovery_cooldown_seconds", event.target.value)} />
+                  </div>
+                </div>
+                <p className="muted">{t("单账号至少间隔 30 秒；15 分钟内恢复 3 次后暂停 1 小时。客户端取消不会触发恢复。")}</p>
+                <div role="status" aria-live="polite">
+                  {recoveryQuery.isError ? <p>{t("恢复状态暂不可用")}</p> : recoveryQuery.data ? <>
+                    <p>{t("本次启动以来：恢复 {{rotated}} 次，限流 {{limited}} 次，无替代 {{unavailable}} 次，暂停 {{platforms}} 个平台。", {
+                      rotated: recoveryQuery.data.rotated, limited: recoveryQuery.data.limited,
+                      unavailable: recoveryQuery.data.no_alternative, platforms: recoveryQuery.data.cooling_platforms,
+                    })}</p>
+                    {recoveryQuery.data.last_status && <p>{t(RECOVERY_STATUS_LABELS[recoveryQuery.data.last_status] ?? "恢复状态暂不可用")}</p>}
+                    <p className="muted">{recoveryQuery.data.last_at
+                      ? t("最近处理时间：{{time}}", { time: new Date(recoveryQuery.data.last_at).toLocaleString() })
+                      : t("本次启动后尚无恢复事件")}</p>
+                  </> : <p>{t("正在读取恢复状态")}</p>}
                 </div>
               </section>
 
