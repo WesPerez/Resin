@@ -19,6 +19,11 @@ type RuntimeConfig struct {
 	MaxAuthorityLatencyTestInterval Duration `json:"max_authority_latency_test_interval"`
 	MaxEgressTestInterval           Duration `json:"max_egress_test_interval"`
 
+	// Automatic lease recovery (shared by in-process events and feedback API).
+	LeaseRecoveryEnabled           bool `json:"lease_recovery_enabled"`
+	LeaseRecoveryAccountsPerMinute int  `json:"lease_recovery_accounts_per_minute"`
+	LeaseRecoveryCooldownSeconds   int  `json:"lease_recovery_cooldown_seconds"`
+
 	// Probe
 	LatencyTestURL     string   `json:"latency_test_url"`
 	LatencyAuthorities []string `json:"latency_authorities"`
@@ -47,6 +52,9 @@ func NewDefaultRuntimeConfig() *RuntimeConfig {
 		MaxLatencyTestInterval:          Duration(1 * time.Hour),
 		MaxAuthorityLatencyTestInterval: Duration(3 * time.Hour),
 		MaxEgressTestInterval:           Duration(24 * time.Hour),
+		LeaseRecoveryEnabled:            true,
+		LeaseRecoveryAccountsPerMinute:  20,
+		LeaseRecoveryCooldownSeconds:    300,
 
 		LatencyTestURL:     "https://www.gstatic.com/generate_204",
 		LatencyAuthorities: []string{"gstatic.com", "google.com", "cloudflare.com", "github.com"},

@@ -19,6 +19,11 @@ type ProxyError struct {
 
 // Predefined proxy errors aligned with DESIGN.md error specification.
 var (
+	ErrLeaseGuard = &ProxyError{
+		HTTPCode:   http.StatusConflict,
+		ResinError: "LEASE_GUARD_FAILED",
+		Message:    "Guarded lease changed, expired, or unavailable",
+	}
 	ErrAuthRequired = &ProxyError{
 		HTTPCode:   http.StatusProxyAuthRequired,
 		ResinError: "AUTH_REQUIRED",
@@ -132,10 +137,14 @@ func classifyConnectError(err error) *ProxyError {
 
 // mapRouteError translates a routing-layer error into a ProxyError.
 func mapRouteError(err error) *ProxyError {
+	if errors.Is(err, routing.ErrLeaseGuard) {
+		return ErrLeaseGuard
+	}
 	if errors.Is(err, routing.ErrPlatformNotFound) {
 		return ErrPlatformNotFound
 	}
-	if errors.Is(err, routing.ErrNoAvailableNodes) {
+	if errors.Is(err, routing.ErrNoAvailableNodes) || errors.Is(err, routing.ErrLeaseChanged) ||
+		errors.Is(err, routing.ErrRecoveryLimited) || errors.Is(err, routing.ErrRecoveryDisabled) {
 		return ErrNoAvailableNodes
 	}
 	return ErrInternalError

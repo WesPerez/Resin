@@ -300,7 +300,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var transport *http.Transport
 	var nodeHashRaw = route.NodeHash
 	domain := netutil.ExtractDomain(parsed.Host)
-	if p.bypass != nil && p.bypass.ShouldBypass(parsed.Host) {
+	if p.bypass != nil && !routing.HasLeaseGuard(account) && p.bypass.ShouldBypass(parsed.Host) {
 		transport = p.directHTTPTransport()
 	} else {
 		routed, routeErr := resolveRoutedOutbound(p.router, p.pool, parsed.PlatformName, account, parsed.Host)
@@ -354,6 +354,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			lifecycle.setHTTPStatus(proxyErr.HTTPCode)
 			if hasRoute {
 				recordPassiveResultAsync(p.health, route, false)
+				recoverTunnelLease(p.router, route, account, parsed.Host)
 			}
 			writeProxyError(rw, proxyErr)
 		},

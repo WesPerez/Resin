@@ -9,6 +9,7 @@ import (
 	"net/http/httptrace"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Resinat/Resin/internal/netutil"
 	"github.com/Resinat/Resin/internal/outbound"
@@ -26,6 +27,9 @@ type ForwardProxyConfig struct {
 	OutboundTransport OutboundTransportConfig
 	TransportPool     *OutboundTransportPool
 	ProxyBypassRules  []string
+	ConnectTimeout    time.Duration
+	ConnectRetries    int
+	FirstByteTimeout  time.Duration
 }
 
 // ForwardProxy implements an HTTP forward proxy with Proxy-Authorization
@@ -43,6 +47,9 @@ type ForwardProxy struct {
 	directTransport   *http.Transport
 	directOnce        sync.Once
 	bypass            *TargetBypassMatcher
+	connectTimeout    time.Duration
+	connectRetries    int
+	firstByteTimeout  time.Duration
 }
 
 // NewForwardProxy creates a new forward proxy handler.
@@ -57,15 +64,18 @@ func NewForwardProxy(cfg ForwardProxyConfig) *ForwardProxy {
 		transportPool = NewOutboundTransportPool(transportCfg)
 	}
 	return &ForwardProxy{
-		token:           cfg.ProxyToken,
-		router:          cfg.Router,
-		pool:            cfg.Pool,
-		health:          cfg.Health,
-		events:          ev,
-		metricsSink:     cfg.MetricsSink,
-		transportConfig: transportCfg,
-		transportPool:   transportPool,
-		bypass:          NewTargetBypassMatcher(cfg.ProxyBypassRules),
+		token:            cfg.ProxyToken,
+		router:           cfg.Router,
+		pool:             cfg.Pool,
+		health:           cfg.Health,
+		events:           ev,
+		metricsSink:      cfg.MetricsSink,
+		transportConfig:  transportCfg,
+		transportPool:    transportPool,
+		bypass:           NewTargetBypassMatcher(cfg.ProxyBypassRules),
+		connectTimeout:   cfg.ConnectTimeout,
+		connectRetries:   cfg.ConnectRetries,
+		firstByteTimeout: cfg.FirstByteTimeout,
 	}
 }
 
@@ -229,7 +239,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	var route routing.RouteResult
 	var hasRoute bool
 	var transport *http.Transport
-	if p.bypass != nil && p.bypass.ShouldBypass(r.Host) {
+	if p.bypass != nil && !routing.HasLeaseGuard(account) && p.bypass.ShouldBypass(r.Host) {
 		transport = p.directHTTPTransport()
 	} else {
 		routed, routeErr := resolveRoutedOutbound(p.router, p.pool, platName, account, r.Host)
@@ -279,6 +289,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		lifecycle.setHTTPStatus(proxyErr.HTTPCode)
 		if hasRoute {
 			recordPassiveResultAsync(p.health, route, false)
+			recoverTunnelLease(p.router, route, account, r.Host)
 		}
 		writeProxyError(w, proxyErr)
 		return
@@ -327,11 +338,14 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 	prepare := prepareConnectTunnel(
 		r.Context(),
 		tunnelDeps{
-			router:      p.router,
-			pool:        p.pool,
-			health:      p.health,
-			metricsSink: p.metricsSink,
-			bypass:      p.bypass,
+			router:           p.router,
+			pool:             p.pool,
+			health:           p.health,
+			metricsSink:      p.metricsSink,
+			bypass:           p.bypass,
+			connectTimeout:   p.connectTimeout,
+			connectRetries:   p.connectRetries,
+			firstByteTimeout: p.firstByteTimeout,
 		},
 		platName,
 		account,
@@ -375,6 +389,11 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	unregister, registered := registerPreparedTunnel(p.router, prepare.route, account, clientConn, prepare.session)
+	defer unregister()
+	if !registered {
+		return
+	}
 	// Write the raw CONNECT success line with proper reason phrase.
 	if _, err := clientBuf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		prepare.session.upstreamConn.Close()
@@ -393,10 +412,18 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lifecycle.setHTTPStatus(http.StatusOK)
+	recoverFailure := sync.OnceFunc(func() {
+		recoverTunnelLease(p.router, prepare.route, account, target)
+	})
 	relay := pumpPreparedTunnel(clientConn, clientBuf.Reader, prepare.session, tunnelPumpOptions{
 		requireBidirectionalTraffic: true,
 		onFirstIngressByte:          lifecycle.markFirstByteReceived,
+		firstByteTimeout:            p.firstByteTimeout,
+		onFirstByteTimeout:          recoverFailure,
 	})
+	if !prepare.session.recoveryClosed.Load() && shouldInvalidateTunnelLease(relay) {
+		recoverFailure()
+	}
 	lifecycle.addIngressBytes(relay.ingressBytes)
 	lifecycle.addEgressBytes(relay.egressBytes)
 	if relay.proxyErr != nil {
@@ -404,7 +431,9 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 		lifecycle.setUpstreamError(relay.upstreamStage, relay.upstreamErr)
 	}
 	lifecycle.setNetOK(relay.netOK)
-	prepare.session.recordResult(relay.netOK)
+	if !prepare.session.recoveryClosed.Load() {
+		prepare.session.recordResult(relay.netOK)
+	}
 }
 
 // shouldRecordForwardCopyFailure decides whether an HTTP response body copy

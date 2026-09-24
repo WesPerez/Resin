@@ -96,6 +96,10 @@ func shouldRouteTokenAPI(r *http.Request, proxyToken string) bool {
 	if r == nil {
 		return false
 	}
+	// Recovery uses header authentication so proxy credentials never enter URLs.
+	if r.URL != nil && strings.HasPrefix(r.URL.Path, "/proxy-api/v1/") {
+		return true
+	}
 	segments := escapedPathSegments(r)
 	if len(segments) < 2 {
 		return false

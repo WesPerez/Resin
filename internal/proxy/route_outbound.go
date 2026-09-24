@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"github.com/Resinat/Resin/internal/node"
 	"github.com/Resinat/Resin/internal/outbound"
 	"github.com/Resinat/Resin/internal/routing"
 	"github.com/sagernet/sing-box/adapter"
@@ -18,14 +19,39 @@ func resolveRoutedOutbound(
 	account string,
 	target string,
 ) (routedOutbound, *ProxyError) {
-	result, err := router.RouteRequest(platformName, account, target)
+	return resolveRoutedOutboundExcluding(router, pool, platformName, account, target, nil)
+}
+
+func resolveRoutedOutboundExcluding(
+	router *routing.Router,
+	pool outbound.PoolAccessor,
+	platformName string,
+	account string,
+	target string,
+	excluded []node.Hash,
+) (routedOutbound, *ProxyError) {
+	result, err := router.RouteRequestExcludingNodes(platformName, account, target, excluded)
 	if err != nil {
 		return routedOutbound{}, mapRouteError(err)
 	}
+	return outboundForRoute(pool, result)
+}
 
+func resolveRoutedOutboundPeek(router *routing.Router, pool outbound.PoolAccessor, platformName, account, target string, excluded []node.Hash) (routedOutbound, *ProxyError) {
+	result, err := router.PeekRouteExcludingNodes(platformName, account, target, excluded)
+	if err != nil {
+		return routedOutbound{}, mapRouteError(err)
+	}
+	return outboundForRoute(pool, result)
+}
+
+func outboundForRoute(pool outbound.PoolAccessor, result routing.RouteResult) (routedOutbound, *ProxyError) {
 	entry, ok := pool.GetEntry(result.NodeHash)
 	if !ok {
 		return routedOutbound{}, ErrNoAvailableNodes
+	}
+	if result.LeaseGuarded && (!entry.IsHealthy() || entry.GetEgressIP() != result.EgressIP) {
+		return routedOutbound{}, ErrLeaseGuard
 	}
 	obPtr := entry.Outbound.Load()
 	if obPtr == nil {

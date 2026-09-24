@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net"
 	"path/filepath"
 	"testing"
@@ -33,7 +35,7 @@ func TestEndpointRuntimeManager_RemoveReleasesPortBeforeReturn(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := manager.Shutdown(ctx); err != nil {
+	if err := manager.Shutdown(ctx, false); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
 }
@@ -75,9 +77,37 @@ func TestRestorePersistedEndpoints_SkipsDisabledListeners(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := manager.Shutdown(ctx); err != nil {
+	if err := manager.Shutdown(ctx, false); err != nil {
 		t.Fatalf("Shutdown: %v", err)
 	}
+}
+
+func TestEndpointRuntimeManager_RemoveClosesConnections(t *testing.T) {
+	port := reserveTestPorts(t, 1)[0]
+	manager := newEndpointRuntimeManager("127.0.0.1", "", nil, nil, nil, nil, &stubSocksHandler{}, nil)
+	endpoint := model.Endpoint{ID: "remove-closes", Port: port, Enabled: true, AllowProxy: true, AllowSOCKS5: true}
+	if err := manager.ApplyEndpoint(endpoint); err != nil {
+		t.Fatalf("ApplyEndpoint: %v", err)
+	}
+	manager.Start()
+
+	conn, err := net.Dial("tcp", formatListenAddress("127.0.0.1", port))
+	if err != nil {
+		t.Fatalf("dial endpoint: %v", err)
+	}
+	defer conn.Close()
+	manager.mu.Lock()
+	runtime := manager.runtimes[endpoint.ID]
+	manager.mu.Unlock()
+	waitForDemuxConnState(t, runtime.server, 1, 1)
+
+	manager.RemoveEndpoint(endpoint.ID)
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("removed endpoint connection should close, got %v", err)
+	}
+	waitForDemuxConnState(t, runtime.server, 0, 0)
 }
 
 func reserveTestPorts(t *testing.T, count int) []int {
