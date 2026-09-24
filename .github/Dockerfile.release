@@ -1,4 +1,5 @@
 FROM alpine:3.21
+LABEL io.resin.unlimited-drain="1"
 
 # Docker platform args automatically provided by buildx
 ARG TARGETOS

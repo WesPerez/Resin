@@ -1,0 +1,63 @@
+name: ${RESIN_COMPOSE_PROJECT:-resin-prod}
+
+services:
+  resin:
+    image: ${RESIN_IMAGE:-ghcr.io/wesperez/resin:mine}
+    container_name: ${RESIN_CONTAINER_NAME:-resin-apps}
+    restart: unless-stopped
+    network_mode: host
+    pull_policy: always
+    labels:
+      - "com.centurylinklabs.watchtower.enable=${RESIN_WATCHTOWER_ENABLED:-false}"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      RESIN_AUTH_VERSION: V1
+      RESIN_ADMIN_TOKEN_FILE: /run/secrets/resin_admin_token
+      RESIN_PROXY_TOKEN_FILE: /run/secrets/resin_proxy_token
+      RESIN_RUNTIME_UID: ${RESIN_RUNTIME_UID:-993}
+      RESIN_RUNTIME_GID: ${RESIN_RUNTIME_GID:-984}
+      RESIN_SKIP_CHOWN: "1"
+      RESIN_LISTEN_ADDRESS: ${RESIN_LISTEN_ADDRESS:-172.17.0.1}
+      RESIN_PORT: ${RESIN_PORT:-10834}
+      RESIN_STATE_DIR: /var/lib/resin
+      RESIN_CACHE_DIR: /var/cache/resin
+      RESIN_LOG_DIR: /var/log/resin
+      RESIN_PROBE_CONCURRENCY: ${RESIN_PROBE_CONCURRENCY:-16}
+      RESIN_REQUEST_LOG_DB_MAX_MB: ${RESIN_REQUEST_LOG_DB_MAX_MB:-128}
+      RESIN_REQUEST_LOG_DB_RETAIN_COUNT: ${RESIN_REQUEST_LOG_DB_RETAIN_COUNT:-3}
+      RESIN_PROXY_BYPASS: ${RESIN_PROXY_BYPASS:-localhost;127.*;10.*;172.16.0.0/12;192.168.*;<local>}
+      RESIN_PROXY_CONNECT_TIMEOUT: ${RESIN_PROXY_CONNECT_TIMEOUT:-10s}
+      RESIN_PROXY_CONNECT_RETRIES: ${RESIN_PROXY_CONNECT_RETRIES:-2}
+      RESIN_PROXY_TUNNEL_FIRST_BYTE_TIMEOUT: ${RESIN_PROXY_TUNNEL_FIRST_BYTE_TIMEOUT:-10s}
+      RESIN_SHUTDOWN_PRESERVE_CONNECTIONS: ${RESIN_SHUTDOWN_PRESERVE_CONNECTIONS:-0}
+      RESIN_DRAIN_TIMEOUT: ${RESIN_DRAIN_TIMEOUT:-10m}
+    volumes:
+      - ${RESIN_STATE_HOST_DIR:-/var/lib/resin-apps}:/var/lib/resin
+      - ${RESIN_CACHE_HOST_DIR:-/var/cache/resin-apps}:/var/cache/resin
+      - ${RESIN_LOG_HOST_DIR:-/var/log/resin-apps}:/var/log/resin
+    secrets:
+      - resin_admin_token
+      - resin_proxy_token
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+    stop_grace_period: ${RESIN_STOP_GRACE_PERIOD:-11m}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://${RESIN_LISTEN_ADDRESS:-172.17.0.1}:${RESIN_PORT:-10834}/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+secrets:
+  resin_admin_token:
+    file: ${RESIN_ADMIN_TOKEN_HOST_FILE:-/etc/resin-apps/admin.token}
+  resin_proxy_token:
+    file: ${RESIN_PROXY_TOKEN_HOST_FILE:-/etc/resin-apps/proxy.token}
