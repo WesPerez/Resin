@@ -67,8 +67,8 @@ jobs:
       - name: Run Go tests
         run: go test ./...
 
-      - name: Run proxy and routing race tests
-        run: go test -race ./internal/proxy ./internal/routing
+      - name: Run proxy, routing and probe race tests
+        run: go test -race ./internal/proxy ./internal/routing ./internal/netutil ./internal/probe
 
       - name: Check entrypoint syntax
         run: sh -n docker/entrypoint.sh
