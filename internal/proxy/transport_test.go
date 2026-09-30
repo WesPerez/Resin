@@ -3,14 +3,86 @@ package proxy
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/Resinat/Resin/internal/node"
+	"github.com/Resinat/Resin/internal/testutil"
 	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
 )
+
+func TestHTTPTransports_CanceledRequestCannotLeaveTLSHandshakeForever(t *testing.T) {
+	for _, direct := range []bool{false, true} {
+		name := "outbound"
+		if direct {
+			name = "direct"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			ob, err := (&testutil.StubOutboundBuilder{}).Build(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			transport := newOutboundTransportPool().Get(node.Hash{1}, ob, nil)
+			if direct {
+				transport = newDirectHTTPTransport(OutboundTransportConfig{}, nil)
+			}
+			defer transport.CloseIdleConnections()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+listener.Addr().String(), nil)
+				if err == nil {
+					var resp *http.Response
+					resp, err = (&http.Client{Transport: transport}).Do(req)
+					if resp != nil {
+						resp.Body.Close()
+					}
+				}
+				done <- err
+			}()
+			if err := listener.(*net.TCPListener).SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			peer, err := listener.Accept()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer peer.Close()
+			if err := peer.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			var firstByte [1]byte
+			if _, err := io.ReadFull(peer, firstByte[:]); err != nil {
+				t.Fatalf("read ClientHello: %v", err)
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("request cancellation: %v", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("request did not return after cancellation")
+			}
+			// Keep the shared pool alive: only its setup deadline may release the
+			// abandoned handshake; idle eviction must not be needed to do so.
+			if _, err := io.Copy(io.Discard, peer); err != nil {
+				t.Fatalf("detached TLS handshake exceeded its setup budget: %v", err)
+			}
+		})
+	}
+}
 
 type noopOutbound struct {
 	adapter.Outbound

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"time"
@@ -19,7 +20,10 @@ import (
 // timeout is a closure that returns the current probe timeout.
 func DirectFetcher(timeout func() time.Duration) Fetcher {
 	transport := &http.Transport{
-		// Disable redirect following for trace endpoint handled below.
+		// Request cancellation does not cancel a shared transport's pending dial.
+		DialContext:         (&net.Dialer{Timeout: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+		IdleConnTimeout:     90 * time.Second,
 	}
 
 	return func(_ node.Hash, url string) ([]byte, time.Duration, error) {

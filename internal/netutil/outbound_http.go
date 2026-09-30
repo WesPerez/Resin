@@ -63,6 +63,11 @@ func HTTPGetViaOutbound(
 		DisableKeepAlives: true,
 		ForceAttemptHTTP2: true,
 	}
+	// This transport belongs to one fetch. net/http detaches connection setup
+	// from the request's cancellation so a shared transport can reuse the dial.
+	// Once this fetch returns, cancel its abandoned dial/TLS handshake as well
+	// as closing idle connections; DisableKeepAlives alone does not do that.
+	defer transport.CloseIdleConnections()
 
 	client := &http.Client{
 		Transport: transport,
