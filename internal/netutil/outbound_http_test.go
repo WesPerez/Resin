@@ -67,9 +67,8 @@ func TestHTTPGetViaOutbound_CancellationClosesStalledTLSHandshake(t *testing.T) 
 	}
 	// The caller returning is insufficient: the detached TLS goroutine and
 	// its actual connection must also finish without a peer response.
-	if err := peer.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
+	// Keep the deadline set before cancellation: net.Pipe can already be
+	// closed here, in which case changing its deadline correctly fails.
 	if _, err := io.Copy(io.Discard, peer); err != nil {
 		t.Fatalf("abandoned TLS connection was not closed: %v", err)
 	}
