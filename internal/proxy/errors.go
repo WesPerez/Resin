@@ -79,6 +79,11 @@ var (
 		ResinError: "UPSTREAM_REQUEST_FAILED",
 		Message:    "Upstream request failed",
 	}
+	ErrUpstreamCertificate = &ProxyError{
+		HTTPCode:   http.StatusBadGateway,
+		ResinError: "UPSTREAM_TLS_CERTIFICATE_ERROR",
+		Message:    "Upstream TLS certificate verification failed",
+	}
 	ErrInternalError = &ProxyError{
 		HTTPCode:   http.StatusInternalServerError,
 		ResinError: "INTERNAL_ERROR",
@@ -110,6 +115,11 @@ func classifyUpstreamError(err error) *ProxyError {
 	if errors.Is(err, context.Canceled) {
 		return nil
 	}
+	// A rejected certificate must remain a failure, but changing the account's
+	// IP or penalizing the shared node cannot renew a site's certificate.
+	if isUpstreamCertificateError(err) {
+		return ErrUpstreamCertificate
+	}
 	// Timeout (context deadline or OS-level).
 	if os.IsTimeout(err) || errors.Is(err, context.DeadlineExceeded) {
 		return ErrUpstreamTimeout
@@ -117,6 +127,15 @@ func classifyUpstreamError(err error) *ProxyError {
 	// Everything else (dial failure, read/write errors, connection reset, etc.).
 	// In non-CONNECT paths, all upstream failures are UPSTREAM_REQUEST_FAILED.
 	return ErrUpstreamRequestFailed
+}
+
+func isUpstreamCertificateError(err error) bool {
+	switch classifyUpstreamErrKind(err, "") {
+	case "tls_cert_invalid", "tls_unknown_authority", "tls_hostname_invalid":
+		return true
+	default:
+		return false
+	}
 }
 
 // classifyConnectError classifies errors in the CONNECT dial path.
