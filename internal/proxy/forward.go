@@ -287,7 +287,7 @@ func (p *ForwardProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		lifecycle.setProxyError(proxyErr)
 		lifecycle.setUpstreamError("forward_roundtrip", err)
 		lifecycle.setHTTPStatus(proxyErr.HTTPCode)
-		if hasRoute {
+		if hasRoute && !isUpstreamCertificateError(err) {
 			recordPassiveResultAsync(p.health, route, false)
 			recoverTunnelLease(p.router, route, account, r.Host)
 		}

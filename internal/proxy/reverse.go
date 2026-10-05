@@ -352,7 +352,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			lifecycle.setUpstreamError("reverse_roundtrip", err)
 			lifecycle.setNetOK(false)
 			lifecycle.setHTTPStatus(proxyErr.HTTPCode)
-			if hasRoute {
+			if hasRoute && !isUpstreamCertificateError(err) {
 				recordPassiveResultAsync(p.health, route, false)
 				recoverTunnelLease(p.router, route, account, parsed.Host)
 			}
