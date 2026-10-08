@@ -178,7 +178,7 @@ func (s *Socks5Inbound) ServeConnContext(baseCtx context.Context, conn net.Conn)
 		lifecycle.setUpstreamError(relay.upstreamStage, relay.upstreamErr)
 	}
 	lifecycle.setNetOK(relay.netOK)
-	if !prepare.session.recoveryClosed.Load() {
+	if !prepare.session.recoveryClosed.Load() && !relay.clientClosedFirst {
 		prepare.session.recordResult(relay.netOK)
 	}
 }

@@ -431,7 +431,7 @@ func (p *ForwardProxy) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 		lifecycle.setUpstreamError(relay.upstreamStage, relay.upstreamErr)
 	}
 	lifecycle.setNetOK(relay.netOK)
-	if !prepare.session.recoveryClosed.Load() {
+	if !prepare.session.recoveryClosed.Load() && !relay.clientClosedFirst {
 		prepare.session.recordResult(relay.netOK)
 	}
 }

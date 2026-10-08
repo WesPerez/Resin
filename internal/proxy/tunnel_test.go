@@ -248,6 +248,9 @@ func TestPumpPreparedTunnelReader_FirstByteTimeoutClosesTunnel(t *testing.T) {
 		if result.upstreamStage != "connect_first_byte_timeout" {
 			t.Fatalf("timeout stage: got %q", result.upstreamStage)
 		}
+		if result.clientClosedFirst || !shouldInvalidateTunnelLease(result) {
+			t.Fatal("a real first-byte timeout must still fail node health and lease recovery")
+		}
 		if result.egressBytes != int64(len("client-hello")) || result.ingressBytes != 0 {
 			t.Fatalf("timeout bytes: ingress=%d egress=%d", result.ingressBytes, result.egressBytes)
 		}
