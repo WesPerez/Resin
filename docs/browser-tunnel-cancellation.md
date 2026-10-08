@@ -11,7 +11,7 @@ The relay now observes which source ends first, before forwarding shutdown to
 the other side. When the client ends first, no upstream byte was delivered, no
 first-byte timeout fired, and no hard upstream read error occurred, the result
 does not update passive node health or invalidate the lease. It does not report
-success either: existing failure counts are preserved and request logs keep the
+success in place of failure: existing failure counts are preserved and request logs keep the
 actual failed exchange, error category, and byte counts.
 
 Upstream-first EOF, hard upstream errors, and first-byte timeouts still fail.
@@ -19,6 +19,7 @@ Client half-close still propagates `CloseWrite` and waits for the upstream reply
 a successful response remains a successful health sample. Forward CONNECT and
 SOCKS5 share the classification. Active probes, platform configuration, leases,
 and the circuit breaker threshold are unchanged.
+Existing successful SOCKS5 one-way/empty exchanges retain their success accounting.
 
 Close order is conservative evidence, not proof of intent. A client that gives
 up early on a truly silent upstream also supplies no conclusive health sample;

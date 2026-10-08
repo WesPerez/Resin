@@ -56,6 +56,12 @@ type tunnelRelayResult struct {
 	clientClosedFirst  bool
 }
 
+// A canceled failed exchange provides no node-health evidence. Preserve the
+// existing success accounting (including SOCKS5 one-way/empty exchanges).
+func (r tunnelRelayResult) passiveHealth() (success, known bool) {
+	return r.netOK, r.netOK || !r.clientClosedFirst
+}
+
 type tunnelCopyObserver struct {
 	reader  io.Reader
 	readErr error

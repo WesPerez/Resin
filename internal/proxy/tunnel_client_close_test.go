@@ -75,6 +75,9 @@ func TestTunnelClientCloseBeforeResponseDoesNotInvalidateLease(t *testing.T) {
 			if !result.clientClosedFirst || shouldInvalidateTunnelLease(result) {
 				t.Fatalf("client cancellation must be neutral to the route: %+v", result)
 			}
+			if _, known := result.passiveHealth(); known {
+				t.Fatal("client cancellation must not update node health")
+			}
 			if result.netOK || result.proxyErr == nil || result.ingressBytes != 0 || result.egressBytes != int64(len(request)) {
 				t.Fatalf("keep failed-request evidence and exact byte counts: %+v", result)
 			}
@@ -105,6 +108,9 @@ func TestTunnelUpstreamEOFBeforeClientRemainsNodeFailure(t *testing.T) {
 	result := receiveTunnelResult(t, results)
 	if result.netOK || result.clientClosedFirst || !shouldInvalidateTunnelLease(result) {
 		t.Fatalf("upstream EOF must remain a real failure: %+v", result)
+	}
+	if success, known := result.passiveHealth(); !known || success {
+		t.Fatal("upstream failure must report a negative health result")
 	}
 }
 
@@ -138,5 +144,38 @@ func TestTunnelClientHalfCloseStillReceivesDelayedResponse(t *testing.T) {
 	result := receiveTunnelResult(t, results)
 	if !result.netOK || result.clientClosedFirst || result.ingressBytes != int64(len(response)) {
 		t.Fatalf("half-close must preserve the successful exchange: %+v", result)
+	}
+}
+
+func TestTunnelClientHalfCloseDoesNotHideFirstByteTimeout(t *testing.T) {
+	client, peer := tunnelTCPPair(t)
+	upstream, target := tunnelTCPPair(t)
+	results := make(chan tunnelRelayResult, 1)
+	go func() {
+		results <- pumpPreparedTunnelReader(client, client, &preparedTunnel{upstreamConn: upstream},
+			tunnelPumpOptions{requireBidirectionalTraffic: true, firstByteTimeout: 50 * time.Millisecond})
+	}()
+	if _, err := peer.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(target); err != nil {
+		t.Fatal(err)
+	}
+	result := receiveTunnelResult(t, results)
+	if result.clientClosedFirst || result.proxyErr != ErrUpstreamTimeout || !shouldInvalidateTunnelLease(result) {
+		t.Fatalf("timeout after client half-close must remain a failure: %+v", result)
+	}
+	if success, known := result.passiveHealth(); !known || success {
+		t.Fatal("first-byte timeout must report a negative health result")
+	}
+}
+
+func TestTunnelPassiveHealthRetainsExistingSuccessfulSamples(t *testing.T) {
+	result := tunnelRelayResult{netOK: true, clientClosedFirst: true}
+	if success, known := result.passiveHealth(); !success || !known {
+		t.Fatal("an existing SOCKS5 success must still report a positive health result")
 	}
 }
