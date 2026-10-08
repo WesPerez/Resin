@@ -53,15 +53,26 @@ type tunnelRelayResult struct {
 	upstreamStage      string
 	upstreamErr        error
 	upstreamReadFailed bool
+	clientClosedFirst  bool
+}
+
+// A canceled failed exchange provides no node-health evidence. Preserve the
+// existing success accounting (including SOCKS5 one-way/empty exchanges).
+func (r tunnelRelayResult) passiveHealth() (success, known bool) {
+	return r.netOK, r.netOK || !r.clientClosedFirst
 }
 
 type tunnelCopyObserver struct {
 	reader  io.Reader
 	readErr error
+	onEnd   func(error)
 }
 
 func (o *tunnelCopyObserver) Read(p []byte) (int, error) {
 	n, err := o.reader.Read(p)
+	if err != nil && o.onEnd != nil {
+		o.onEnd(err)
+	}
 	if err != nil && !errors.Is(err, io.EOF) {
 		o.readErr = err
 	}
@@ -447,6 +458,11 @@ func pumpPreparedTunnelReader(
 		readErr error
 	}
 	var closeBothOnce sync.Once
+	// Observe source termination before either copy closes its peer. A browser
+	// can cancel unused CONNECTs in a batch; the resulting empty upstream EOF
+	// is not evidence that the shared proxy node failed.
+	const clientEnded, upstreamEnded = 1, 2
+	var firstEnd atomic.Int32
 	closeBoth := func() {
 		closeBothOnce.Do(func() {
 			_ = clientConn.Close()
@@ -465,18 +481,29 @@ func pumpPreparedTunnelReader(
 	ingressBytesCh := make(chan copyResult, 1)
 	egressBytesCh := make(chan copyResult, 1)
 	go func() {
-		var clientReader io.Reader = clientToUpstream
+		observedClient := &tunnelCopyObserver{reader: clientToUpstream, onEnd: func(err error) {
+			if isBenignTunnelCopyError(err) || isClientReadResetError(err) {
+				firstEnd.CompareAndSwap(0, clientEnded)
+			}
+		}}
+		var clientReader io.Reader = observedClient
 		if opts.firstByteTimeout > 0 {
-			clientReader = &firstByteReader{reader: clientToUpstream, onFirstByte: firstByteWatch.start}
+			clientReader = &firstByteReader{reader: observedClient, onFirstByte: firstByteWatch.start}
 		}
 		n, copyErr := io.Copy(session.upstreamConn, clientReader)
+		if copyErr != nil && observedClient.readErr == nil {
+			// A destination write failure belongs to the upstream, not the client.
+			firstEnd.CompareAndSwap(0, upstreamEnded)
+		}
 		if !isBenignTunnelCopyError(copyErr) || !closeWriteConn(session.upstreamConn) {
 			closeBoth()
 		}
 		egressBytesCh <- copyResult{n: n, err: copyErr}
 	}()
 	go func() {
-		observedUpstream := &tunnelCopyObserver{reader: session.upstreamConn}
+		observedUpstream := &tunnelCopyObserver{reader: session.upstreamConn, onEnd: func(error) {
+			firstEnd.CompareAndSwap(0, upstreamEnded)
+		}}
 		var upstreamReader io.Reader = observedUpstream
 		if opts.onFirstIngressByte != nil || opts.firstByteTimeout > 0 {
 			// 隧道首字耗时以目标站点返回的第一批字节为准，而不是 CONNECT/SOCKS 握手完成。
@@ -515,6 +542,9 @@ func pumpPreparedTunnelReader(
 		egressBytes:        egressResult.n,
 		netOK:              true,
 		upstreamReadFailed: ingressResult.readErr != nil,
+		clientClosedFirst: firstEnd.Load() == clientEnded && ingressResult.n == 0 && !firstByteWatch.timedOut() &&
+			isBenignTunnelCopyError(ingressResult.readErr) &&
+			(egressErrBenign || isClientReadResetError(egressResult.err)),
 	}
 	switch {
 	case firstByteWatch.timedOut():
@@ -554,7 +584,7 @@ func pumpPreparedTunnelReader(
 }
 
 func shouldInvalidateTunnelLease(result tunnelRelayResult) bool {
-	if result.netOK {
+	if result.netOK || result.clientClosedFirst {
 		return false
 	}
 	if result.upstreamReadFailed {

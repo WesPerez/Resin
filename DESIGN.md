@@ -384,6 +384,7 @@ Platform 过滤时，通过 `NodeEntry.MatchTagFilter` 方法，反向查询 Ref
 	* `success=true`：重置连续失败计数 (`FailureCount = 0`)。若节点当前处于熔断状态，立即恢复（`清空 CircuitOpenSince`）。
 	* `success=false`：原子递增连续失败计数。若计数达到配置的阈值 (`MaxConsecutiveFailures`)，触发熔断（`CircuitOpenSince = 当前时间`）。
 * `RecordPassiveResult(platformID string, id NodeHash, success bool)`：提交来自用户代理流量的被动网络结果。若对应 Platform 开启 `passive_circuit_breaker_disabled`，则忽略失败结果，不增加连续失败计数；成功结果仍作为正向健康反馈处理。
+  * 隧道在收到任何上游字节前由客户端先结束、且没有首字节超时或上游硬错误时，失败结果不提供节点健康证据，不上报成功或失败；请求日志仍保留实际失败与字节数，也不因此失效租约。上游先结束、真实超时和硬错误保持失败反馈，既有成功样本保持正向反馈。
 * `RecordLatency(id NodeHash, domain string, latency *Duration)`：提交节点对特定域名的延迟探测尝试。`latency=nil` 表示“仅记录本次探测尝试，不写延迟样本”；`latency!=nil` 时按 TD-EWMA 更新延迟统计。无论 `latency` 是否为空，都会更新 `LastLatencyProbeAttempt`，若域名属于 `LatencyAuthorities` 还会更新 `LastAuthorityLatencyProbeAttempt`。如果调用本次 `RecordLatency` 之前，节点的 `LatencyTable` 为空，需要通知各 Platform 重新过滤这个节点。
 * `UpdateNodeEgressIP(id NodeHash, ip *netip.Addr)`：记录一次出口 IP 探测尝试并可选更新出口 IP。`ip=nil` 表示“仅记录尝试”；`ip!=nil` 时更新出口 IP（若变更则触发 Platform 脏更新）。无论 `ip` 是否为空，都会更新 `LastEgressUpdateAttempt`。
 

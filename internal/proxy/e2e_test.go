@@ -1027,7 +1027,7 @@ func TestForwardProxy_CONNECTResponseFlushFailureDoesNotPenalizeNode(t *testing.
 	}
 }
 
-func TestForwardProxy_CONNECTZeroTrafficMarkedFailed(t *testing.T) {
+func TestForwardProxy_CONNECTClientClosesUnusedTunnelDoesNotPenalizeNode(t *testing.T) {
 	env := newProxyE2EEnv(t)
 	emitter := newMockEventEmitter()
 	health := &mockHealthRecorder{}
@@ -1117,17 +1117,10 @@ func TestForwardProxy_CONNECTZeroTrafficMarkedFailed(t *testing.T) {
 		t.Fatal("expected CONNECT log event")
 	}
 
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if health.resultCalls.Load() > 0 {
-			if health.lastSuccess.Load() != 0 {
-				t.Fatalf("RecordResult lastSuccess: got %d, want 0", health.lastSuccess.Load())
-			}
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+	if got := health.resultCalls.Load(); got != 0 {
+		t.Fatalf("client-closed unused tunnel must not change node health, got %d calls", got)
 	}
-	t.Fatal("expected RecordResult call for CONNECT zero-traffic failure")
 }
 
 func TestForwardProxy_CONNECTHalfTrafficNotMarkedZeroTraffic(t *testing.T) {
