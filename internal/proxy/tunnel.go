@@ -34,6 +34,7 @@ type preparedTunnel struct {
 	upstreamConn   net.Conn
 	recordResult   func(bool)
 	recoveryClosed atomic.Bool
+	guard          *guardDeadlineConn
 }
 
 type tunnelPrepareResult struct {
@@ -54,12 +55,13 @@ type tunnelRelayResult struct {
 	upstreamErr        error
 	upstreamReadFailed bool
 	clientClosedFirst  bool
+	guardExpired       bool
 }
 
 // A canceled failed exchange provides no node-health evidence. Preserve the
 // existing success accounting (including SOCKS5 one-way/empty exchanges).
 func (r tunnelRelayResult) passiveHealth() (success, known bool) {
-	return r.netOK, r.netOK || !r.clientClosedFirst
+	return r.netOK, r.netOK || (!r.clientClosedFirst && !r.guardExpired)
 }
 
 type tunnelCopyObserver struct {
@@ -281,11 +283,10 @@ func prepareConnectTunnel(
 			}
 		}
 
+		var guard *guardDeadlineConn
 		if routed.Route.LeaseGuarded {
-			if err := rawConn.SetDeadline(time.UnixMilli(routed.Route.LeaseGuardUntilMs)); err != nil {
-				_ = rawConn.Close()
-				return tunnelPrepareResult{route: routed.Route, proxyErr: ErrLeaseGuard}
-			}
+			guard = newGuardDeadlineConn(rawConn, time.UnixMilli(routed.Route.LeaseGuardUntilMs))
+			rawConn = guard
 		}
 		recordResult := func(ok bool) {
 			if deps.health != nil {
@@ -310,6 +311,7 @@ func prepareConnectTunnel(
 			session: &preparedTunnel{
 				upstreamConn: upstreamConn,
 				recordResult: recordResult,
+				guard:        guard,
 			},
 		}
 	}
@@ -546,7 +548,15 @@ func pumpPreparedTunnelReader(
 			isBenignTunnelCopyError(ingressResult.readErr) &&
 			(egressErrBenign || isClientReadResetError(egressResult.err)),
 	}
+	result.guardExpired = session.guard != nil && session.guard.expired.Load()
 	switch {
+	case result.guardExpired:
+		// Closing an expired guard can wake a simultaneous first-byte timer.
+		// That ambiguous sample must not penalize an otherwise healthy node.
+		result.netOK = false
+		result.proxyErr = ErrLeaseGuard
+		result.upstreamStage = "connect_lease_guard_expired"
+		result.upstreamErr = routing.ErrLeaseGuard
 	case firstByteWatch.timedOut():
 		result.netOK = false
 		result.proxyErr = ErrUpstreamTimeout
@@ -584,7 +594,7 @@ func pumpPreparedTunnelReader(
 }
 
 func shouldInvalidateTunnelLease(result tunnelRelayResult) bool {
-	if result.netOK || result.clientClosedFirst {
+	if result.netOK || result.clientClosedFirst || result.guardExpired {
 		return false
 	}
 	if result.upstreamReadFailed {

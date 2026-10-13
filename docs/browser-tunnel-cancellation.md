@@ -30,3 +30,17 @@ Remote CI covers a client closing an unused CONNECT, FIN/reset after sending
 data, upstream-first EOF, genuine first-byte timeout, and delayed replies after
 client half-close, plus existing proxy/routing regressions and race tests.
 Release uses the normal immutable candidate image and blue/green deployment.
+
+## Guarded native transports
+
+An account guard pins the node, public IP and lease generation and bounds the
+tunnel lifetime. Some native transports, including WebSocket connections, do
+not implement `net.Conn.SetDeadline`. Treating that error as a stale lease
+incorrectly rejects an otherwise healthy CONNECT with `LEASE_GUARD_FAILED`.
+
+Guarded tunnels now use an independent absolute close timer. Closing the tunnel
+stops that timer, half-close remains supported, and clearing an I/O deadline
+cannot extend the guard. Actual guard expiry is logged as
+`connect_lease_guard_expired` and is neutral to passive node health. Invalid or
+changed guards still fail closed; ordinary Sub2/API routes retain their existing
+recovery policy.
