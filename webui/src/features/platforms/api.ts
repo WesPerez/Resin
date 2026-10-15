@@ -60,6 +60,7 @@ function normalizeLease(raw: ApiPlatformLease): PlatformLease {
   return {
     platform_id: typeof raw.platform_id === "string" ? raw.platform_id : "",
     account: typeof raw.account === "string" ? raw.account : "",
+    display_name: typeof raw.display_name === "string" ? raw.display_name : "",
     node_hash: typeof raw.node_hash === "string" ? raw.node_hash : "",
     node_tag: typeof raw.node_tag === "string" ? raw.node_tag : "",
     egress_ip: typeof raw.egress_ip === "string" ? raw.egress_ip : "",
@@ -146,6 +147,7 @@ export async function listPlatformLeases(id: string, input: ListPlatformLeasesIn
   });
 
   const account = input.account?.trim();
+  if (input.search?.trim()) query.set("search", input.search.trim());
   if (account) {
     query.set("account", account);
   }
@@ -161,6 +163,13 @@ export async function deletePlatformLease(id: string, account: string): Promise<
   await apiRequest<void>(`${basePath}/${id}/leases/${encodeURIComponent(account)}`, {
     method: "DELETE",
   });
+}
+
+export async function setLeaseDisplayName(id: string, account: string, displayName: string): Promise<PlatformLease> {
+  return normalizeLease(await apiRequest<ApiPlatformLease>(`${basePath}/${id}/leases/${encodeURIComponent(account)}/display-name`, {
+    method: "PATCH",
+    body: { display_name: displayName },
+  }));
 }
 
 export async function clearAllPlatformLeases(id: string): Promise<void> {

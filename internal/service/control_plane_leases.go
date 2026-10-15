@@ -21,6 +21,7 @@ import (
 type LeaseResponse struct {
 	PlatformID        string `json:"platform_id"`
 	Account           string `json:"account"`
+	DisplayName       string `json:"display_name,omitempty"`
 	NodeHash          string `json:"node_hash"`
 	NodeTag           string `json:"node_tag"`
 	EgressIP          string `json:"egress_ip"`
@@ -65,6 +66,10 @@ func (s *ControlPlaneService) ListLeases(platformID string) ([]LeaseResponse, er
 		return nil, notFound("platform not found")
 	}
 	var result []LeaseResponse
+	names, err := s.leaseDisplayNames(platformID)
+	if err != nil {
+		return nil, err
+	}
 	s.Router.RangeLeases(platformID, func(account string, lease routing.Lease) bool {
 		result = append(result, leaseToResponse(model.Lease{
 			PlatformID:     platformID,
@@ -79,6 +84,9 @@ func (s *ControlPlaneService) ListLeases(platformID string) ([]LeaseResponse, er
 	})
 	if result == nil {
 		result = []LeaseResponse{}
+	}
+	for i := range result {
+		result[i].DisplayName = names[result[i].Account]
 	}
 	return result, nil
 }
@@ -166,6 +174,11 @@ func (s *ControlPlaneService) GetLease(platformID, account string) (*LeaseRespon
 		return nil, notFound("lease not found")
 	}
 	resp := leaseToResponse(*ml, s.resolveLeaseNodeTagFromHex(ml.NodeHash))
+	names, err := s.leaseDisplayNames(platformID)
+	if err != nil {
+		return nil, err
+	}
+	resp.DisplayName = names[account]
 	return &resp, nil
 }
 

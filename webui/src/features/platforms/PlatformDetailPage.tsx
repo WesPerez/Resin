@@ -25,6 +25,7 @@ import {
   deletePlatformLease,
   getPlatform,
   listPlatformLeases,
+  setLeaseDisplayName,
   resetPlatform,
   updatePlatform,
 } from "./api";
@@ -100,8 +101,7 @@ export function PlatformDetailPage() {
       return listPlatformLeases(platform.id, {
         limit: leasePageSize,
         offset: leasePage * leasePageSize,
-        account: debouncedLeaseSearch,
-        fuzzy: debouncedLeaseSearch ? true : undefined,
+        search: debouncedLeaseSearch,
         sort_by: "expiry",
         sort_order: "asc",
       });
@@ -317,7 +317,32 @@ export function PlatformDetailPage() {
     setLeasePage(0);
   };
 
+  const nameMutation = useMutation({
+    mutationFn: async ({ account, name }: { account: string; name: string }) => {
+      if (!platform) throw new Error(t("平台不存在"));
+      return setLeaseDisplayName(platform.id, account, name);
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["platform-leases", platform?.id] });
+      showToast("success", t("显示名称已保存，连接标识保持不变"));
+    },
+    onError: (error) => showToast("error", error instanceof Error ? error.message : t("保存失败")),
+  });
+
   const leaseColumns: ColumnDef<PlatformLease>[] = [
+    {
+      id: "display_name",
+      header: t("显示名称"),
+      cell: ({ row }) => (
+        <Button variant="ghost" disabled={nameMutation.isPending} onClick={(event) => {
+          event.stopPropagation();
+          const name = window.prompt(t("显示名称（应用缩写 + 稳定账号或对象 ID；留空恢复原标识）"), row.original.display_name || "");
+          if (name !== null) nameMutation.mutate({ account: row.original.account, name });
+        }}>
+          {row.original.display_name || t("设置名称")}
+        </Button>
+      ),
+    },
     {
       accessorKey: "account",
       header: t("账号"),
@@ -734,8 +759,8 @@ export function PlatformDetailPage() {
                         <Input
                           id="platform-lease-search"
                           type="search"
-                          placeholder={t("搜索账号")}
-                          aria-label={t("搜索账号")}
+                          placeholder={t("搜索账号或显示名称")}
+                          aria-label={t("搜索账号或显示名称")}
                           value={leaseSearch}
                           onChange={(event) => setLeaseSearch(event.target.value)}
                         />
