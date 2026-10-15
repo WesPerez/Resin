@@ -61,6 +61,7 @@ function normalizeLease(raw: ApiPlatformLease): PlatformLease {
     platform_id: typeof raw.platform_id === "string" ? raw.platform_id : "",
     account: typeof raw.account === "string" ? raw.account : "",
     display_name: typeof raw.display_name === "string" ? raw.display_name : "",
+    display_name_unavailable: raw.display_name_unavailable === true,
     node_hash: typeof raw.node_hash === "string" ? raw.node_hash : "",
     node_tag: typeof raw.node_tag === "string" ? raw.node_tag : "",
     egress_ip: typeof raw.egress_ip === "string" ? raw.egress_ip : "",

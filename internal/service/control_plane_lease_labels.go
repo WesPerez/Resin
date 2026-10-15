@@ -42,5 +42,6 @@ func (s *ControlPlaneService) SetLeaseDisplayName(platformID, account string, re
 		return nil, internal("save lease display name", err)
 	}
 	lease.DisplayName = name
+	lease.DisplayNameUnavailable = false
 	return lease, nil
 }

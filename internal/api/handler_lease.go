@@ -98,6 +98,10 @@ func HandleListLeases(cp *service.ControlPlaneService) http.HandlerFunc {
 			search = strings.ToLower(search)
 			filtered := make([]service.LeaseResponse, 0, len(leases))
 			for _, lease := range leases {
+				if lease.DisplayNameUnavailable {
+					writeServiceError(w, &service.ServiceError{Code: "INTERNAL", Message: "display name search temporarily unavailable; account filtering remains available"})
+					return
+				}
 				if strings.Contains(strings.ToLower(lease.Account), search) || strings.Contains(strings.ToLower(lease.DisplayName), search) {
 					filtered = append(filtered, lease)
 				}

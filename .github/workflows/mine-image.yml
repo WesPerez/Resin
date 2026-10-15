@@ -43,7 +43,28 @@ jobs:
           npm ci
           npm run build
 
-      - name: Setup Go
+      - name: Verify lease display names in built WebUI
+        run: |
+          python3 -m pip install playwright==1.55.0
+          python3 -m playwright install --with-deps chromium
+          npm --prefix webui run preview -- --host 127.0.0.1 --port 4173 > "$RUNNER_TEMP/lease-ui-preview.log" 2>&1 &
+          preview_pid=$!
+          trap 'kill "$preview_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:4173/ >/dev/null && break
+            sleep 1
+          done
+          python3 webui/tests/lease_display_names.py
+
+      - name: Preserve lease UI screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lease-ui-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/lease-ui-evidence/
+          retention-days: 3
+
+      - name: Setup Go for validation
         uses: actions/setup-go@v5
         with:
           go-version: 1.25.x

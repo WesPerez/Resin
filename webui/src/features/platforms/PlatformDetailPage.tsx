@@ -334,12 +334,12 @@ export function PlatformDetailPage() {
       id: "display_name",
       header: t("显示名称"),
       cell: ({ row }) => (
-        <Button variant="ghost" disabled={nameMutation.isPending} onClick={(event) => {
+        <Button variant="ghost" disabled={nameMutation.isPending || row.original.display_name_unavailable} onClick={(event) => {
           event.stopPropagation();
           const name = window.prompt(t("显示名称（应用缩写 + 稳定账号或对象 ID；留空恢复原标识）"), row.original.display_name || "");
           if (name !== null) nameMutation.mutate({ account: row.original.account, name });
         }}>
-          {row.original.display_name || t("设置名称")}
+          {row.original.display_name_unavailable ? t("名称暂不可用") : row.original.display_name || t("设置名称")}
         </Button>
       ),
     },

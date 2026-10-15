@@ -19,16 +19,17 @@ import (
 
 // LeaseResponse is the API response for a lease.
 type LeaseResponse struct {
-	PlatformID        string `json:"platform_id"`
-	Account           string `json:"account"`
-	DisplayName       string `json:"display_name,omitempty"`
-	NodeHash          string `json:"node_hash"`
-	NodeTag           string `json:"node_tag"`
-	EgressIP          string `json:"egress_ip"`
-	Expiry            string `json:"expiry"`
-	LastAccessed      string `json:"last_accessed"`
-	CreatedAtNs       string `json:"created_at_ns"`
-	LeaseGuardVersion int    `json:"lease_guard_version"`
+	PlatformID             string `json:"platform_id"`
+	Account                string `json:"account"`
+	DisplayName            string `json:"display_name,omitempty"`
+	DisplayNameUnavailable bool   `json:"display_name_unavailable,omitempty"`
+	NodeHash               string `json:"node_hash"`
+	NodeTag                string `json:"node_tag"`
+	EgressIP               string `json:"egress_ip"`
+	Expiry                 string `json:"expiry"`
+	LastAccessed           string `json:"last_accessed"`
+	CreatedAtNs            string `json:"created_at_ns"`
+	LeaseGuardVersion      int    `json:"lease_guard_version"`
 }
 
 func leaseToResponse(lease model.Lease, nodeTag string) LeaseResponse {
@@ -67,9 +68,6 @@ func (s *ControlPlaneService) ListLeases(platformID string) ([]LeaseResponse, er
 	}
 	var result []LeaseResponse
 	names, err := s.leaseDisplayNames(platformID)
-	if err != nil {
-		return nil, err
-	}
 	s.Router.RangeLeases(platformID, func(account string, lease routing.Lease) bool {
 		result = append(result, leaseToResponse(model.Lease{
 			PlatformID:     platformID,
@@ -87,6 +85,7 @@ func (s *ControlPlaneService) ListLeases(platformID string) ([]LeaseResponse, er
 	}
 	for i := range result {
 		result[i].DisplayName = names[result[i].Account]
+		result[i].DisplayNameUnavailable = err != nil
 	}
 	return result, nil
 }
@@ -175,10 +174,8 @@ func (s *ControlPlaneService) GetLease(platformID, account string) (*LeaseRespon
 	}
 	resp := leaseToResponse(*ml, s.resolveLeaseNodeTagFromHex(ml.NodeHash))
 	names, err := s.leaseDisplayNames(platformID)
-	if err != nil {
-		return nil, err
-	}
 	resp.DisplayName = names[account]
+	resp.DisplayNameUnavailable = err != nil
 	return &resp, nil
 }
 
