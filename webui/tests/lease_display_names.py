@@ -59,7 +59,12 @@ with sync_playwright() as pw:
         page.once('dialog', lambda dialog: dialog.accept('wd-account-42'))
         page.get_by_role('button', name='设置名称', exact=True).click()
         expect(page.get_by_role('button', name='wd-account-42', exact=True)).to_be_visible()
-        search = page.get_by_role('textbox', name='搜索账号或显示名称', exact=True)
+        # `type="search"` maps to the ARIA role `searchbox`, not `textbox`, so a
+        # role-based textbox lookup never matches this input. Address it by its
+        # stable id and assert the accessible name is really published.
+        search = page.locator('#platform-lease-search')
+        expect(search).to_have_attribute('aria-label', '搜索账号或显示名称')
+        expect(search).to_have_attribute('placeholder', '搜索账号或显示名称')
         for term in ('wd-account-42', 'legacy-42'):
             search.fill(term)
             expect(page.get_by_text('legacy-42', exact=True)).to_be_visible()

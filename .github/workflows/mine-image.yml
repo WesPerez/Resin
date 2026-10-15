@@ -50,10 +50,16 @@ jobs:
           npm --prefix webui run preview -- --host 127.0.0.1 --port 4173 > "$RUNNER_TEMP/lease-ui-preview.log" 2>&1 &
           preview_pid=$!
           trap 'kill "$preview_pid" 2>/dev/null || true' EXIT
+          ready=0
           for attempt in $(seq 1 30); do
-            curl -fsS http://127.0.0.1:4173/ui/ >/dev/null && break
+            if curl -fsS http://127.0.0.1:4173/ui/ >/dev/null; then ready=1; break; fi
             sleep 1
           done
+          if [ "$ready" != 1 ]; then
+            echo 'preview server never became ready'
+            tail -50 "$RUNNER_TEMP/lease-ui-preview.log" || true
+            exit 1
+          fi
           python3 webui/tests/lease_display_names.py
 
       - name: Preserve lease UI screenshots
