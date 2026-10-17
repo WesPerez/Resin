@@ -161,7 +161,7 @@ func HandleSetLeaseDisplayName(cp *service.ControlPlaneService) http.HandlerFunc
 			writeDecodeBodyError(w, err)
 			return
 		}
-		lease, err := cp.SetLeaseDisplayName(platformID, account, req)
+		lease, err := cp.SetLeaseDisplayNameContext(r.Context(), platformID, account, req)
 		if err != nil {
 			writeServiceError(w, err)
 			return

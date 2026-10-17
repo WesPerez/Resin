@@ -30,19 +30,21 @@ type LeaseResponse struct {
 	LastAccessed           string `json:"last_accessed"`
 	CreatedAtNs            string `json:"created_at_ns"`
 	LeaseGuardVersion      int    `json:"lease_guard_version"`
+	DisplayNameCASVersion  int    `json:"display_name_cas_version"`
 }
 
 func leaseToResponse(lease model.Lease, nodeTag string) LeaseResponse {
 	return LeaseResponse{
-		PlatformID:        lease.PlatformID,
-		Account:           lease.Account,
-		NodeHash:          lease.NodeHash,
-		NodeTag:           nodeTag,
-		EgressIP:          lease.EgressIP,
-		Expiry:            time.Unix(0, lease.ExpiryNs).UTC().Format(time.RFC3339Nano),
-		LastAccessed:      time.Unix(0, lease.LastAccessedNs).UTC().Format(time.RFC3339Nano),
-		CreatedAtNs:       strconv.FormatInt(lease.CreatedAtNs, 10),
-		LeaseGuardVersion: routing.LeaseGuardVersion,
+		PlatformID:            lease.PlatformID,
+		Account:               lease.Account,
+		NodeHash:              lease.NodeHash,
+		NodeTag:               nodeTag,
+		EgressIP:              lease.EgressIP,
+		Expiry:                time.Unix(0, lease.ExpiryNs).UTC().Format(time.RFC3339Nano),
+		LastAccessed:          time.Unix(0, lease.LastAccessedNs).UTC().Format(time.RFC3339Nano),
+		CreatedAtNs:           strconv.FormatInt(lease.CreatedAtNs, 10),
+		LeaseGuardVersion:     routing.LeaseGuardVersion,
+		DisplayNameCASVersion: 1,
 	}
 }
 

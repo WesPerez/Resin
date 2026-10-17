@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -57,6 +58,67 @@ func TestLeaseDisplayNameDoesNotChangeRoutingAndSearchIsCompatible(t *testing.T)
 	}
 	if !reflect.DeepEqual(before, *cp.Router.ReadLease(key)) {
 		t.Fatal("clear changed lease")
+	}
+}
+
+func TestLeaseDisplayNameAutomaticCAS(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+	id, account, _ := seedRotateLease(t, srv, cp, "display-cas", 1)
+	key := model.LeaseKey{PlatformID: id, Account: account}
+	before := *cp.Router.ReadLease(key)
+	path := "/api/v1/platforms/" + id + "/leases/" + account + "/display-name"
+	body := func() map[string]any {
+		return map[string]any{
+			"display_name": "hub-16", "if_empty": true, "expected_node_hash": before.NodeHash,
+			"expected_egress_ip": before.EgressIP, "expected_created_at_ns": strconv.FormatInt(before.CreatedAtNs, 10),
+		}
+	}
+	for field, value := range map[string]string{"expected_node_hash": strings.Repeat("b", 32), "expected_egress_ip": "192.0.2.254", "expected_created_at_ns": strconv.FormatInt(before.CreatedAtNs+1, 10)} {
+		request := body()
+		request[field] = value
+		rec := doJSONRequest(t, srv, http.MethodPatch, path, request, true)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("stale %s: %d %s", field, rec.Code, rec.Body.String())
+		}
+		got, err := cp.GetLease(id, account)
+		if err != nil || got.DisplayName != "" || !reflect.DeepEqual(before, *cp.Router.ReadLease(key)) {
+			t.Fatal("rejected CAS changed metadata or route")
+		}
+	}
+	for _, field := range []string{"expected_node_hash", "expected_egress_ip", "expected_created_at_ns"} {
+		request := body()
+		delete(request, field)
+		if rec := doJSONRequest(t, srv, http.MethodPatch, path, request, true); rec.Code != http.StatusBadRequest {
+			t.Fatalf("missing %s: %d", field, rec.Code)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		rec := doJSONRequest(t, srv, http.MethodPatch, path, body(), true)
+		if rec.Code != http.StatusOK || decodeJSONMap(t, rec)["display_name_cas_version"] != float64(1) {
+			t.Fatalf("CAS: %d %s", rec.Code, rec.Body.String())
+		}
+	}
+	get := doJSONRequest(t, srv, http.MethodGet, strings.TrimSuffix(path, "/display-name"), nil, true)
+	if get.Code != http.StatusOK || decodeJSONMap(t, get)["display_name_cas_version"] != float64(1) {
+		t.Fatal("GET did not advertise CAS capability")
+	}
+	if !reflect.DeepEqual(before, *cp.Router.ReadLease(key)) {
+		t.Fatal("CAS changed route")
+	}
+	if rec := doJSONRequest(t, srv, http.MethodPatch, path, map[string]any{"display_name": "manual"}, true); rec.Code != http.StatusOK {
+		t.Fatal("manual edit failed")
+	}
+	if rec := doJSONRequest(t, srv, http.MethodPatch, path, body(), true); rec.Code != http.StatusConflict {
+		t.Fatal("automatic edit replaced manual name")
+	}
+	got, err := cp.GetLease(id, account)
+	if err != nil || got.DisplayName != "manual" {
+		t.Fatal("manual name lost")
+	}
+	request := body()
+	request["display_name"] = ""
+	if rec := doJSONRequest(t, srv, http.MethodPatch, path, request, true); rec.Code != http.StatusBadRequest {
+		t.Fatal("automatic clear accepted")
 	}
 }
 
