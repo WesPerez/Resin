@@ -92,6 +92,20 @@ func (e *StateEngine) DirtyCount() int {
 		e.dirtySubscriptionNodes.Len()
 }
 
+// DirtyCounts reports the pending weak-persist work per set. A drain-only
+// shutdown deliberately discards the final flush, so the retiring slot must be
+// able to say exactly what it handed to the active slot instead of only a
+// total that cannot be attributed.
+func (e *StateEngine) DirtyCounts() map[string]int {
+	return map[string]int{
+		"nodes_static":       e.dirtyNodesStatic.Len(),
+		"nodes_dynamic":      e.dirtyNodesDynamic.Len(),
+		"node_latency":       e.dirtyNodeLatency.Len(),
+		"leases":             e.dirtyLeases.Len(),
+		"subscription_nodes": e.dirtySubscriptionNodes.Len(),
+	}
+}
+
 // classifyDirtySet splits a drained dirty-set snapshot into upsert values and
 // delete keys. For OpUpsert entries, the reader is called to fetch the current
 // in-memory value; a nil return is treated as a delete.

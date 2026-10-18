@@ -582,6 +582,14 @@ func (a *resinApp) shutdown(ctx context.Context) {
 	drainOnly := os.Getenv("RESIN_SHUTDOWN_PRESERVE_CONNECTIONS") == "1"
 	if drainOnly {
 		log.Println("Resin drain-only shutdown enabled; preserving tunnels and suppressing final state flush")
+		// Publish what this slot is handing over BEFORE the flush worker is told
+		// to discard, so a crash between the two still leaves a receipt that
+		// describes the same dirty sets the discard is about to skip.
+		if path, err := a.flushWorker.WriteDrainReceipt(a.envCfg.StateDir, true, time.Now()); err != nil {
+			log.Printf("Drain receipt unavailable: %v", err)
+		} else {
+			log.Printf("Drain receipt written: %s", path)
+		}
 		a.flushWorker.Discard()
 	}
 	if err := a.endpointManager.Shutdown(ctx, drainOnly); err != nil {
