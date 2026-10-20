@@ -288,10 +288,7 @@ func (m *endpointRuntimeManager) Shutdown(ctx context.Context, preserveConnectio
 	})
 	select {
 	case <-m.sourcesDone:
-		m.mu.Lock()
-		shutdownErrs = append(shutdownErrs, m.sourceErr)
-		m.sourceErr = nil // Report completed-source failure once, not forever.
-		m.mu.Unlock()
+		shutdownErrs = append(shutdownErrs, m.takeSourceError())
 	case <-ctx.Done():
 		shutdownErrs = append(shutdownErrs, ctx.Err())
 	}
@@ -302,7 +299,21 @@ func (m *endpointRuntimeManager) Shutdown(ctx context.Context, preserveConnectio
 
 // WaitQuiescent is a safety join, not a deadline promise. If Shutdown timed
 // out, the app must still join pending users before closing their databases.
-func (m *endpointRuntimeManager) WaitQuiescent() { <-m.sourcesDone }
+func (m *endpointRuntimeManager) WaitQuiescent() error {
+	if m == nil {
+		return nil
+	}
+	<-m.sourcesDone
+	return m.takeSourceError()
+}
+
+func (m *endpointRuntimeManager) takeSourceError() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	err := m.sourceErr
+	m.sourceErr = nil // Archive completed-source failure once, including safety joins.
+	return err
+}
 
 // retireLocked must be called with m.mu held, before publishing the removal.
 func (m *endpointRuntimeManager) retireLocked(runtime *managedEndpointRuntime) {

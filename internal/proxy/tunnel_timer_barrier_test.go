@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -8,11 +9,14 @@ import (
 func TestTunnelFirstByteWatch_StopJoinsInFlightRecovery(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
 	w := &tunnelFirstByteWatch{timeout: time.Millisecond, onTimeout: func() {
 		close(entered)
 		<-release
 	}}
 	w.start()
+	t.Cleanup(func() { closeRelease(); w.stop() })
 	select {
 	case <-entered:
 	case <-time.After(time.Second):
@@ -25,7 +29,7 @@ func TestTunnelFirstByteWatch_StopJoinsInFlightRecovery(t *testing.T) {
 		t.Fatal("stop returned while lease recovery was still running")
 	case <-time.After(20 * time.Millisecond):
 	}
-	close(release)
+	closeRelease()
 	select {
 	case <-done:
 	case <-time.After(time.Second):

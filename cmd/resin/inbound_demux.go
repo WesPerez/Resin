@@ -30,18 +30,19 @@ type inboundDemuxServer struct {
 	httpListener *connChannelListener
 	socksHandler inboundConnHandler
 
-	mu            sync.Mutex
-	outer         net.Listener
-	shuttingDown  bool
-	activeConns   map[net.Conn]struct{}
-	activeChanged chan struct{}
-	sniffConns    map[net.Conn]struct{}
-	workerWG      sync.WaitGroup
-	handlerWG     sync.WaitGroup
-	httpServeWG   sync.WaitGroup
-	httpServeErr  error
-	baseCtx       context.Context
-	cancelBase    context.CancelFunc
+	mu                      sync.Mutex
+	outer                   net.Listener
+	shuttingDown            bool
+	activeConns             map[net.Conn]struct{}
+	activeChanged           chan struct{}
+	sniffConns              map[net.Conn]struct{}
+	workerWG                sync.WaitGroup
+	handlerWG               sync.WaitGroup
+	httpServeWG             sync.WaitGroup
+	httpServeErr            error
+	httpShutdownErrReported bool
+	baseCtx                 context.Context
+	cancelBase              context.CancelFunc
 }
 
 func newInboundDemuxServer(httpServer *http.Server, socksHandler inboundConnHandler) *inboundDemuxServer {
@@ -155,8 +156,20 @@ func (s *inboundDemuxServer) httpServeError() error {
 	return s.httpServeErr
 }
 
+func (s *inboundDemuxServer) takeHTTPShutdownError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.httpServeErr == nil || s.httpShutdownErrReported {
+		return nil
+	}
+	s.httpShutdownErrReported = true
+	// Keep the original error available to the outer Serve loop. Shutdown
+	// archives it once without hiding the failed sink from its accept owner.
+	return s.httpServeErr
+}
+
 func (s *inboundDemuxServer) Shutdown(ctx context.Context, preserveConnections bool) (result error) {
-	defer func() { result = errors.Join(result, s.httpServeError()) }()
+	defer func() { result = errors.Join(result, s.takeHTTPShutdownError()) }()
 	if ctx == nil {
 		ctx = context.Background()
 	}

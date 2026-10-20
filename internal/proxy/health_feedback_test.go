@@ -11,10 +11,23 @@ import (
 )
 
 type blockedFeedback struct {
-	entered chan string
-	release chan struct{}
-	mu      sync.Mutex
-	results []string
+	entered     chan string
+	release     chan struct{}
+	releaseOnce sync.Once
+	mu          sync.Mutex
+	results     []string
+}
+
+func (f *blockedFeedback) closeRelease() { f.releaseOnce.Do(func() { close(f.release) }) }
+
+func cleanupFeedback(t *testing.T, b *HealthFeedbackBarrier, f *blockedFeedback) {
+	t.Helper()
+	t.Cleanup(func() {
+		f.closeRelease()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = b.StopAndWait(ctx)
+	})
 }
 
 func (f *blockedFeedback) record(kind string) {
@@ -35,6 +48,7 @@ func (f *blockedFeedback) RecordPassiveResult(platformID string, _ node.Hash, _ 
 func TestHealthFeedbackBarrier_JoinsResultAndLatencyBeforeReturn(t *testing.T) {
 	f := &blockedFeedback{entered: make(chan string, 2), release: make(chan struct{})}
 	b := NewHealthFeedbackBarrier(f)
+	cleanupFeedback(t, b, f)
 	recordPassiveResultAsync(b, routing.RouteResult{PlatformID: "platform"}, true)
 	recordLatencyAsync(b, node.Hash{}, "example.com", nil)
 	for i := 0; i < 2; i++ {
@@ -51,7 +65,7 @@ func TestHealthFeedbackBarrier_JoinsResultAndLatencyBeforeReturn(t *testing.T) {
 		t.Fatalf("barrier returned before callback completed: %v", err)
 	case <-time.After(20 * time.Millisecond):
 	}
-	close(f.release)
+	f.closeRelease()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -70,6 +84,7 @@ func TestHealthFeedbackBarrier_JoinsResultAndLatencyBeforeReturn(t *testing.T) {
 func TestHealthFeedbackBarrier_RejectsLateWritesAndReportsFailure(t *testing.T) {
 	f := &blockedFeedback{entered: make(chan string, 4), release: make(chan struct{})}
 	b := NewHealthFeedbackBarrier(f)
+	cleanupFeedback(t, b, f)
 	if err := b.StopAndWait(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -89,8 +104,9 @@ func TestHealthFeedbackBarrier_RejectsLateWritesAndReportsFailure(t *testing.T) 
 
 func TestHealthFeedbackBarrier_ConcurrentRegistrationAndStop(t *testing.T) {
 	f := &blockedFeedback{entered: make(chan string, 128), release: make(chan struct{})}
-	close(f.release)
+	f.closeRelease()
 	b := NewHealthFeedbackBarrier(f)
+	cleanupFeedback(t, b, f)
 	var callers sync.WaitGroup
 	for i := 0; i < 100; i++ {
 		callers.Add(1)
@@ -118,14 +134,19 @@ func TestHealthFeedbackBarrier_ConcurrentRegistrationAndStop(t *testing.T) {
 func TestHealthFeedbackBarrier_DeadlineDoesNotForgetPendingWriter(t *testing.T) {
 	f := &blockedFeedback{entered: make(chan string, 1), release: make(chan struct{})}
 	b := NewHealthFeedbackBarrier(f)
+	cleanupFeedback(t, b, f)
 	recordPassiveResultAsync(b, routing.RouteResult{}, true)
-	<-f.entered
+	select {
+	case <-f.entered:
+	case <-time.After(time.Second):
+		t.Fatal("feedback did not start")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	if err := b.StopAndWait(ctx); err != context.DeadlineExceeded {
 		t.Fatalf("blocked feedback did not fail deadline: %v", err)
 	}
-	close(f.release)
+	f.closeRelease()
 	if err := b.StopAndWait(context.Background()); err != nil {
 		t.Fatalf("pending writer could not later be joined: %v", err)
 	}

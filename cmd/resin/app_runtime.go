@@ -599,7 +599,9 @@ func (a *resinApp) shutdown(ctx context.Context) error {
 		shutdownErrs = append(shutdownErrs, fmt.Errorf("endpoint shutdown: %w", err))
 		// A context timeout is a failed deadline, not permission to close the
 		// DB under a live handler. Join before touching its sinks or final state.
-		a.endpointManager.WaitQuiescent()
+		if joinErr := a.endpointManager.WaitQuiescent(); joinErr != nil {
+			shutdownErrs = append(shutdownErrs, fmt.Errorf("endpoint safety join: %w", joinErr))
+		}
 	}
 	log.Println("Resin server stopped")
 	if a.transportPool != nil {
@@ -628,7 +630,9 @@ func (a *resinApp) shutdown(ctx context.Context) error {
 			shutdownErrs = append(shutdownErrs, err)
 			// Retain the original failure, but safely join accepted callbacks
 			// before stopping probes, GeoIP, and persistence they may use.
-			_ = a.healthFeedback.StopAndWait(context.Background())
+			if joinErr := a.healthFeedback.StopAndWait(context.Background()); joinErr != nil {
+				shutdownErrs = append(shutdownErrs, fmt.Errorf("feedback safety join: %w", joinErr))
+			}
 		}
 	}
 	a.topoRuntime.probeMgr.Stop()
