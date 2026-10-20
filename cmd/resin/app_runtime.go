@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -42,6 +43,7 @@ type resinApp struct {
 	requestlogSvc   *requestlog.Service
 	endpointManager *endpointRuntimeManager
 	transportPool   *proxy.OutboundTransportPool
+	healthFeedback  *proxy.HealthFeedbackBarrier
 }
 
 func run() error {
@@ -94,15 +96,13 @@ func run() error {
 		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 	}
 	defer cancel()
-	app.shutdown(ctx)
+	shutdownErr := app.shutdown(ctx)
 
-	if err := dbCloser.Close(); err != nil {
-		log.Printf("Persistence close error: %v", err)
-	}
+	closeErr := dbCloser.Close()
 	if runtimeErr != nil {
-		return fmt.Errorf("runtime server error: %w", runtimeErr)
+		runtimeErr = fmt.Errorf("runtime server error: %w", runtimeErr)
 	}
-	return nil
+	return errors.Join(runtimeErr, shutdownErr, closeErr)
 }
 
 func loadDotenvFile(path string) error {
@@ -441,12 +441,13 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 	if a.transportPool == nil {
 		a.transportPool = proxy.NewOutboundTransportPool(outboundTransportCfg)
 	}
+	a.healthFeedback = proxy.NewHealthFeedbackBarrier(a.topoRuntime.pool)
 
 	forwardProxy := proxy.NewForwardProxy(proxy.ForwardProxyConfig{
 		ProxyToken:        a.envCfg.ProxyToken,
 		Router:            a.topoRuntime.router,
 		Pool:              a.topoRuntime.pool,
-		Health:            a.topoRuntime.pool,
+		Health:            a.healthFeedback,
 		Events:            proxyEvents,
 		MetricsSink:       a.metricsManager,
 		OutboundTransport: outboundTransportCfg,
@@ -462,7 +463,7 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		Router:            a.topoRuntime.router,
 		Pool:              a.topoRuntime.pool,
 		PlatformLookup:    a.topoRuntime.pool,
-		Health:            a.topoRuntime.pool,
+		Health:            a.healthFeedback,
 		Matcher:           a.accountMatcher,
 		Events:            proxyEvents,
 		MetricsSink:       a.metricsManager,
@@ -474,7 +475,7 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		ProxyToken:       a.envCfg.ProxyToken,
 		Router:           a.topoRuntime.router,
 		Pool:             a.topoRuntime.pool,
-		Health:           a.topoRuntime.pool,
+		Health:           a.healthFeedback,
 		Events:           proxyEvents,
 		MetricsSink:      a.metricsManager,
 		ProxyBypassRules: a.envCfg.ProxyBypassRules,
@@ -578,7 +579,8 @@ func formatListenURL(listenAddress string, port int) string {
 	return "http://" + formatListenAddress(listenAddress, port)
 }
 
-func (a *resinApp) shutdown(ctx context.Context) {
+func (a *resinApp) shutdown(ctx context.Context) error {
+	var shutdownErrs []error
 	drainOnly := os.Getenv("RESIN_SHUTDOWN_PRESERVE_CONNECTIONS") == "1"
 	if drainOnly {
 		log.Println("Resin drain-only shutdown enabled; preserving tunnels and suppressing final state flush")
@@ -594,6 +596,10 @@ func (a *resinApp) shutdown(ctx context.Context) {
 	}
 	if err := a.endpointManager.Shutdown(ctx, drainOnly); err != nil {
 		log.Printf("Server shutdown error: %v", err)
+		shutdownErrs = append(shutdownErrs, fmt.Errorf("endpoint shutdown: %w", err))
+		// A context timeout is a failed deadline, not permission to close the
+		// DB under a live handler. Join before touching its sinks or final state.
+		a.endpointManager.WaitQuiescent()
 	}
 	log.Println("Resin server stopped")
 	if a.transportPool != nil {
@@ -612,17 +618,30 @@ func (a *resinApp) shutdown(ctx context.Context) {
 	a.topoRuntime.scheduler.Stop()
 	log.Println("Subscription scheduler stopped")
 
+	a.geoSvc.StopUpdates()
+	log.Println("GeoIP updates stopped")
+
+	// Proxy feedback may enqueue probes. Join it (and the GeoIP downloader)
+	// before stopping the probe sink, then stop persistence last.
+	if a.healthFeedback != nil {
+		if err := a.healthFeedback.StopAndWait(ctx); err != nil {
+			shutdownErrs = append(shutdownErrs, err)
+			// Retain the original failure, but safely join accepted callbacks
+			// before stopping probes, GeoIP, and persistence they may use.
+			_ = a.healthFeedback.StopAndWait(context.Background())
+		}
+	}
 	a.topoRuntime.probeMgr.Stop()
 	log.Println("Probe manager stopped")
-
-	a.geoSvc.Stop()
-	log.Println("GeoIP service stopped")
+	a.geoSvc.CloseReader()
+	log.Println("GeoIP reader closed")
 
 	// 2. Stop observability sinks (flush remaining data).
 	a.requestlogSvc.Stop()
 	log.Println("Request log service stopped")
 	if err := a.requestlogRepo.Close(); err != nil {
 		log.Printf("Request log repo close error: %v", err)
+		shutdownErrs = append(shutdownErrs, err)
 	}
 	log.Println("Request log repo closed")
 
@@ -630,6 +649,7 @@ func (a *resinApp) shutdown(ctx context.Context) {
 	log.Println("Metrics manager stopped")
 	if err := a.metricsDB.Close(); err != nil {
 		log.Printf("Metrics DB close error: %v", err)
+		shutdownErrs = append(shutdownErrs, err)
 	}
 	log.Println("Metrics DB closed")
 
@@ -637,10 +657,16 @@ func (a *resinApp) shutdown(ctx context.Context) {
 	if a.topoRuntime.singboxBuilder != nil {
 		if err := a.topoRuntime.singboxBuilder.Close(); err != nil {
 			log.Printf("SingboxBuilder close error: %v", err)
+			shutdownErrs = append(shutdownErrs, err)
 		}
 		log.Println("SingboxBuilder stopped")
 	}
 
-	a.flushWorker.Stop()
+	if drainOnly {
+		a.flushWorker.Stop()
+	} else if err := a.flushWorker.StopAndFlush(); err != nil {
+		shutdownErrs = append(shutdownErrs, fmt.Errorf("authoritative state flush: %w", err))
+	}
 	log.Println("Server stopped")
+	return errors.Join(shutdownErrs...)
 }

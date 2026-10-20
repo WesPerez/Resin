@@ -2,6 +2,7 @@ package state
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -28,7 +29,15 @@ type CacheFlushWorker struct {
 	discardFinalFlush atomic.Bool
 	wg                sync.WaitGroup
 	stopOnce          sync.Once
+	lifecycleMu       sync.Mutex
+	flushMu           sync.Mutex
+	started           bool
+	stopped           bool
 }
+
+// ErrFlushDiscarded means this worker belongs to a retired slot. It must not
+// write over the active slot's state, even when an authoritative flush is asked.
+var ErrFlushDiscarded = errors.New("state: final flush was discarded")
 
 // NewCacheFlushWorker creates a flush worker that pulls threshold/interval
 // from callbacks on each check cycle.
@@ -62,6 +71,12 @@ func NewCacheFlushWorker(
 
 // Start launches the background flush goroutine.
 func (w *CacheFlushWorker) Start() {
+	w.lifecycleMu.Lock()
+	defer w.lifecycleMu.Unlock()
+	if w.started || w.stopped {
+		return
+	}
+	w.started = true
 	w.wg.Add(1)
 	go w.run()
 }
@@ -69,15 +84,46 @@ func (w *CacheFlushWorker) Start() {
 // Stop signals the worker to stop and performs a final flush.
 // Blocks until the goroutine exits.
 func (w *CacheFlushWorker) Stop() {
+	if err := w.StopAndFlush(); err != nil && !errors.Is(err, ErrFlushDiscarded) {
+		log.Printf("[state] final flush error: %v", err)
+	}
+}
+
+// StopAndFlush stops the periodic writer, then performs an error-returning
+// final transaction. Callers MUST first stop and join all mutation sources;
+// this is not a write barrier for the router, API or asynchronous callbacks.
+// A successful retry supersedes an earlier periodic flush failure. Discard
+// and this operation are serialized: a discarded slot can never be flushed.
+func (w *CacheFlushWorker) StopAndFlush() error {
+	w.lifecycleMu.Lock()
+	defer w.lifecycleMu.Unlock()
+	if w.discardFinalFlush.Load() {
+		return ErrFlushDiscarded
+	}
+	w.stopped = true
 	w.stopOnce.Do(func() { close(w.stopCh) })
 	w.wg.Wait()
+	if err := w.flush(); err != nil {
+		return err
+	}
+	if pending := w.engine.DirtyCount(); pending != 0 {
+		return fmt.Errorf("state: final flush left %d dirty entries; mutation sources are not quiescent", pending)
+	}
+	return nil
 }
 
 // Discard prevents the final flush performed by Stop. Use it only when the
 // process is draining a blue/green slot that must not overwrite a newer
 // state snapshot owned by the active slot.
 func (w *CacheFlushWorker) Discard() {
+	w.lifecycleMu.Lock()
+	defer w.lifecycleMu.Unlock()
+	// Finish any transaction already in progress before publishing Discard.
+	// Once this point is reached no periodic or final writer can pass it.
+	w.flushMu.Lock()
 	w.discardFinalFlush.Store(true)
+	w.flushMu.Unlock()
+	w.stopped = true
 	w.stopOnce.Do(func() { close(w.stopCh) })
 	w.wg.Wait()
 }
@@ -137,10 +183,7 @@ func (w *CacheFlushWorker) run() {
 	for {
 		select {
 		case <-w.stopCh:
-			// Final flush before exit.
-			if !w.discardFinalFlush.Load() {
-				w.doFlush()
-			}
+			// Only StopAndFlush owns the final transaction and its error.
 			return
 		case <-ticker.C:
 			dirty := w.engine.DirtyCount()
@@ -159,7 +202,16 @@ func (w *CacheFlushWorker) run() {
 }
 
 func (w *CacheFlushWorker) doFlush() {
-	if err := w.engine.FlushDirtySets(w.readers); err != nil {
+	if err := w.flush(); err != nil && !errors.Is(err, ErrFlushDiscarded) {
 		log.Printf("[state] flush error (entries re-merged): %v", err)
 	}
+}
+
+func (w *CacheFlushWorker) flush() error {
+	w.flushMu.Lock()
+	defer w.flushMu.Unlock()
+	if w.discardFinalFlush.Load() {
+		return ErrFlushDiscarded
+	}
+	return w.engine.FlushDirtySets(w.readers)
 }

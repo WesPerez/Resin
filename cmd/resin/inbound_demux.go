@@ -37,6 +37,9 @@ type inboundDemuxServer struct {
 	activeChanged chan struct{}
 	sniffConns    map[net.Conn]struct{}
 	workerWG      sync.WaitGroup
+	handlerWG     sync.WaitGroup
+	httpServeWG   sync.WaitGroup
+	httpServeErr  error
 	baseCtx       context.Context
 	cancelBase    context.CancelFunc
 }
@@ -45,7 +48,7 @@ func newInboundDemuxServer(httpServer *http.Server, socksHandler inboundConnHand
 	if httpServer == nil {
 		httpServer = &http.Server{Handler: http.NotFoundHandler()}
 	}
-	return &inboundDemuxServer{
+	s := &inboundDemuxServer{
 		httpServer:    httpServer,
 		httpListener:  newConnChannelListener(),
 		socksHandler:  socksHandler,
@@ -53,6 +56,25 @@ func newInboundDemuxServer(httpServer *http.Server, socksHandler inboundConnHand
 		activeChanged: make(chan struct{}),
 		sniffConns:    make(map[net.Conn]struct{}),
 	}
+	handler := httpServer.Handler
+	if handler == nil {
+		handler = http.DefaultServeMux
+	}
+	httpServer.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		if s.shuttingDown {
+			s.mu.Unlock()
+			http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		s.handlerWG.Add(1)
+		s.mu.Unlock()
+		defer s.handlerWG.Done()
+		// Pass the original writer through, preserving Hijacker/Flusher. The
+		// handler lifetime extends beyond a hijacked connection's close hook.
+		handler.ServeHTTP(w, r)
+	})
+	return s
 }
 
 func (s *inboundDemuxServer) Serve(ln net.Listener) error {
@@ -61,13 +83,27 @@ func (s *inboundDemuxServer) Serve(ln net.Listener) error {
 	}
 
 	s.mu.Lock()
+	if s.shuttingDown {
+		s.mu.Unlock()
+		_ = ln.Close()
+		return http.ErrServerClosed
+	}
 	s.outer = ln
-	s.shuttingDown = false
 	s.baseCtx, s.cancelBase = context.WithCancel(context.Background())
+	s.httpServeWG.Add(1)
 	s.mu.Unlock()
 
 	go func() {
-		_ = s.httpServer.Serve(s.httpListener)
+		defer s.httpServeWG.Done()
+		if err := s.httpServer.Serve(s.httpListener); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			s.mu.Lock()
+			s.httpServeErr = err
+			outer := s.outer
+			s.mu.Unlock()
+			if outer != nil {
+				_ = outer.Close() // Stop accepting into a failed HTTP sink.
+			}
+		}
 	}()
 	defer s.httpListener.Close()
 
@@ -75,6 +111,9 @@ func (s *inboundDemuxServer) Serve(ln net.Listener) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if serveErr := s.httpServeError(); serveErr != nil {
+				return serveErr
+			}
 			if s.isShuttingDown() {
 				return http.ErrServerClosed
 			}
@@ -110,7 +149,14 @@ func inboundDemuxAcceptRetryDelay(err error, prev time.Duration) (time.Duration,
 	return next, true
 }
 
-func (s *inboundDemuxServer) Shutdown(ctx context.Context, preserveConnections bool) error {
+func (s *inboundDemuxServer) httpServeError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.httpServeErr
+}
+
+func (s *inboundDemuxServer) Shutdown(ctx context.Context, preserveConnections bool) (result error) {
+	defer func() { result = errors.Join(result, s.httpServeError()) }()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -158,6 +204,8 @@ func (s *inboundDemuxServer) Shutdown(ctx context.Context, preserveConnections b
 	waitDone := make(chan struct{})
 	go func() {
 		s.workerWG.Wait()
+		s.handlerWG.Wait()
+		s.httpServeWG.Wait()
 		close(waitDone)
 	}()
 
@@ -172,7 +220,6 @@ func (s *inboundDemuxServer) Shutdown(ctx context.Context, preserveConnections b
 		if s.httpServer != nil {
 			_ = s.httpServer.Close()
 		}
-		<-waitDone
 		if httpErr == nil {
 			return ctx.Err()
 		}
@@ -184,6 +231,8 @@ func (s *inboundDemuxServer) waitForConnectionDrain(ctx context.Context) error {
 	workersDone := make(chan struct{})
 	go func() {
 		s.workerWG.Wait()
+		s.handlerWG.Wait()
+		s.httpServeWG.Wait()
 		close(workersDone)
 	}()
 	select {
