@@ -12,7 +12,7 @@ import (
 
 func TestSchedulerAsyncUpdateRegistrationPrecedesDispatchAndStopJoins(t *testing.T) {
 	mgr := NewSubscriptionManager()
-	pool := NewGlobalNodePool(PoolConfig{SubLookup: mgr.Lookup})
+	pool := newTestPool(mgr)
 	sub := subscription.NewSubscription("sub", "Sub", "http://fixture", true, false)
 	mgr.Register(sub)
 	entered, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
