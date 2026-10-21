@@ -65,6 +65,9 @@ func maintenanceMarker(stateDir string) string {
 }
 
 func rejectRetainedMaintenance(stateDir string) error {
+	if _, err := os.Lstat(filepath.Join(stateDir, "candidate-preflight.json")); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("candidate preflight fence blocks normal startup; explicit authority commit required")
+	}
 	_, err := os.Lstat(maintenanceMarker(stateDir))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil

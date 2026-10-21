@@ -150,3 +150,44 @@ A call after the final linearization boundary invalidates before that refused
 call returns; this does not promise that arbitrary future untracked goroutines
 can be joined. Actual source lifecycle joins remain a prerequisite. Consumers
 must bind a clean stopped exit (not just file phase) and exact Docker instance.
+
+## Candidate-copy preflight (subsequent candidate; not activation)
+
+`resin preflight --snapshot-dir DIR --output-dir NEW_DIR --state-sha256 HEX
+--cache-sha256 HEX --lease-sha256 HEX --lease-count N` accepts a separately
+proven stopped snapshot. It compares both immutable source files against fixed
+hashes, reads the complete seven-field set, and creates a unique 0700 copy with
+0600 DBs. Source files never pass to PersistenceBootstrap. The real migrations,
+consistency repair, default prelude, topology restore and Router.RestoreLeases
+run on the copy without network, outbounds, listeners, observability, cleaners
+or scheduler. Platform rebuild's local workers are joined. Every restored lease
+is marked and flushed through the real final writer, checkpointed, closed and
+file-bound; complete router/cache/source lease sets must agree. All user schema
+objects and typed rows in state.db must remain logically identical, including
+labels/config/rules, or preflight refuses (it does not silently accept defaults
+or repair). Latency trimming can affect the candidate weak cache; this is not
+zero-change validation of all weak node telemetry.
+
+The receipt includes the sorted seven fields, source/candidate file identities,
+strong-state digest and explicit `outbound_validated=false` and
+`authority_activated=false`. Store stdout privately; account names may be
+sensitive. CLI errors do not print settings, source data or credentials. Failed
+stdout publication invalidates its candidate marker and returns nonzero; even
+`validated` never authorizes startup. A marker in the candidate state directory
+blocks normal run before migration regardless of phase. Partial copies remain
+for owner recovery; the tool neither removes markers nor deletes source/copy.
+
+When using the packaged image, bypass the normal Docker entrypoint explicitly:
+its recursive chown is a normal runtime prelude, not a read-only verifier.
+Mount snapshot read-only and a separate candidate workspace read-write; use
+`--network none`, read-only root and a private namespace, never the live slot's
+volumes. The future orchestrator must fix image digest/SHA, Docker instance,
+source config and mounts, journal before container create/start, and consume a
+successful clean exit plus private receipt, hashes and marker. These Docker
+steps are not yet an implemented production command. CLI context checks bound
+normal work, not uninterruptible kernel/driver I/O; a force-killed preflight is
+failed/unknown and its generation cannot be activated.
+
+A receipt proves candidate persistence/topology survival on its private copy;
+it cannot prove that old 40f produced a causally final snapshot. No source-stop,
+traffic routing, authority-commit or rollback permission follows from it.
