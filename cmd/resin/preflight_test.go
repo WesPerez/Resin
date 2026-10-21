@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -78,7 +79,7 @@ func preflightFixture(t *testing.T, change func(*state.StateEngine)) preflightOp
 	if err != nil {
 		t.Fatal(err)
 	}
-	return preflightOptions{snapshot: snapshot, output: filepath.Join(root, "candidate"), stateSHA: b.record.Databases[0].SHA256, cacheSHA: b.record.Databases[1].SHA256, leaseSHA: d, leaseCount: len(leases)}
+	return preflightOptions{transferID: strings.Repeat("d", 32), snapshot: snapshot, output: filepath.Join(root, "candidate"), stateSHA: b.record.Databases[0].SHA256, cacheSHA: b.record.Databases[1].SHA256, leaseSHA: d, leaseCount: len(leases)}
 }
 
 func sourceBytes(t *testing.T, o preflightOptions) [][]byte {
@@ -101,7 +102,7 @@ func TestPreflightActualBootstrapPreservesCompleteLeaseAndStrongState(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Phase != "validated" || r.LeaseCount != 1 || r.LeaseDigest != o.leaseSHA || r.OutboundValidated || r.AuthorityActivated {
+	if r.TransferID != o.transferID || r.Phase != "validated" || r.LeaseCount != 1 || r.LeaseDigest != o.leaseSHA || r.OutboundValidated || r.AuthorityActivated {
 		t.Fatalf("incorrect proof: %+v", r)
 	}
 	if !reflect.DeepEqual(before, sourceBytes(t, o)) {
@@ -123,6 +124,11 @@ func TestPreflightActualBootstrapPreservesCompleteLeaseAndStrongState(t *testing
 	}
 	if err := rejectRetainedMaintenance(filepath.Join(o.output, "state")); err == nil {
 		t.Fatal("validated copy started without authority commit")
+	}
+	raw, err := os.ReadFile(filepath.Join(o.output, "state", "candidate-preflight.json"))
+	var marker maintenanceRecord
+	if err != nil || json.Unmarshal(raw, &marker) != nil || marker.TransferID != o.transferID || marker.StrongDigest != r.StrongDigest || !reflect.DeepEqual(marker.Databases, r.Candidate) {
+		t.Fatal("candidate marker lost transaction/file bindings")
 	}
 	if _, err := os.Stat(filepath.Join(o.output, "log")); !os.IsNotExist(err) {
 		t.Fatal("observability initialized")
@@ -176,12 +182,16 @@ func TestPreflightRejectsActualRepairPruningAndKeepsSource(t *testing.T) {
 func TestPreflightFixedIdentityAndClosedSidecarGates(t *testing.T) {
 	o := preflightFixture(t, nil)
 	original := o
-	for _, kind := range []string{"digest", "count", "wal", "symlink", "cancel"} {
+	for _, kind := range []string{"digest", "count", "wal", "symlink", "cancel", "transfer_missing", "transfer_invalid"} {
 		t.Run(kind, func(t *testing.T) {
 			o = original
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			switch kind {
+			case "transfer_missing":
+				o.transferID = ""
+			case "transfer_invalid":
+				o.transferID = strings.Repeat("z", 32)
 			case "digest":
 				o.stateSHA = strings.Repeat("0", 64)
 			case "count":
@@ -223,7 +233,7 @@ type preflightBrokenWriter struct{}
 func (preflightBrokenWriter) Write([]byte) (int, error) { return 0, errors.New("fixture") }
 func TestPreflightOutputFailureKeepsCandidateFenced(t *testing.T) {
 	o := preflightFixture(t, nil)
-	args := []string{"--snapshot-dir", o.snapshot, "--output-dir", o.output, "--state-sha256", o.stateSHA, "--cache-sha256", o.cacheSHA, "--lease-sha256", o.leaseSHA, "--lease-count", strconv.Itoa(o.leaseCount)}
+	args := []string{"--transfer-id", o.transferID, "--snapshot-dir", o.snapshot, "--output-dir", o.output, "--state-sha256", o.stateSHA, "--cache-sha256", o.cacheSHA, "--lease-sha256", o.leaseSHA, "--lease-count", strconv.Itoa(o.leaseCount)}
 	if err := preflightCLI(args, preflightBrokenWriter{}); err == nil {
 		t.Fatal("failed receipt write succeeded")
 	}
@@ -232,10 +242,145 @@ func TestPreflightOutputFailureKeepsCandidateFenced(t *testing.T) {
 		t.Fatal(err)
 	}
 	var marker maintenanceRecord
-	if json.Unmarshal(raw, &marker) != nil || marker.Phase != "failed" {
+	if json.Unmarshal(raw, &marker) != nil || marker.Phase != "failed" || marker.TransferID != o.transferID || len(marker.Databases) != 2 || marker.StrongDigest == "" {
 		t.Fatal("output failure left validated marker")
 	}
 	if err := rejectRetainedMaintenance(filepath.Join(o.output, "state")); err == nil {
 		t.Fatal("failed candidate allowed startup")
+	}
+}
+
+func TestPreflightBoundedFixedFileBundle(t *testing.T) {
+	o := preflightFixture(t, nil)
+	r, err := candidatePreflight(context.Background(), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := makePreflightBundle(o, r, 64<<20)
+	if err != nil || b.Version != "resin-candidate-bundle/v1" || b.Receipt != r || len(b.Files) != 3 {
+		t.Fatalf("bundle refused: %v", err)
+	}
+	for i, name := range []string{"state/state.db", "cache/cache.db", "state/candidate-preflight.json"} {
+		raw, err := os.ReadFile(filepath.Join(o.output, filepath.FromSlash(name)))
+		if err != nil || b.Files[i].Name != name || !bytes.Equal(raw, b.Files[i].Data) {
+			t.Fatal("bundle file identity mismatch")
+		}
+	}
+	if _, err := makePreflightBundle(o, r, r.Candidate[0].Size+r.Candidate[1].Size); err == nil {
+		t.Fatal("aggregate budget ignored marker bytes")
+	}
+	if _, err := makePreflightBundle(o, r, 1); err == nil {
+		t.Fatal("oversize file exported")
+	}
+}
+
+func TestPreflightCLIExportBundle(t *testing.T) {
+	o := preflightFixture(t, nil)
+	args := []string{"--export-bundle", "--transfer-id", o.transferID, "--snapshot-dir", o.snapshot, "--output-dir", o.output, "--state-sha256", o.stateSHA, "--cache-sha256", o.cacheSHA, "--lease-sha256", o.leaseSHA, "--lease-count", strconv.Itoa(o.leaseCount)}
+	var out bytes.Buffer
+	if err := preflightCLI(args, &out); err != nil {
+		t.Fatal(err)
+	}
+	var b preflightBundle
+	if json.Unmarshal(out.Bytes(), &b) != nil || b.Receipt == nil || b.Receipt.TransferID != o.transferID || len(b.Files) != 3 || b.Receipt.AuthorityActivated {
+		t.Fatal("CLI bundle contract broken")
+	}
+}
+
+func TestPreflightEncodedBoundAndEffectiveConfiguration(t *testing.T) {
+	var out bytes.Buffer
+	w := &preflightLimitedWriter{out: &out, remaining: 4}
+	if _, err := w.Write([]byte("1234")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("5")); err == nil || out.String() != "1234" {
+		t.Fatal("encoded limit ignored")
+	}
+	t.Setenv("RESIN_ADMIN_TOKEN", "fixture-admin")
+	t.Setenv("RESIN_PROXY_TOKEN", "fixture-proxy")
+	c, err := config.LoadEnvConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	one, err := effectiveConfigDigest(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := *c
+	d.StateDir, d.CacheDir, d.LogDir, d.ListenAddress, d.ResinPort = "/new/state", "/new/cache", "/new/log", "127.0.0.1", 1234
+	two, err := effectiveConfigDigest(&d)
+	if err != nil || one != two {
+		t.Fatal("slot location affected effective config binding")
+	}
+	for _, change := range []func(*config.EnvConfig){
+		func(c *config.EnvConfig) { c.AdminToken += "different" },
+		func(c *config.EnvConfig) { c.MaxLatencyTableEntries++ },
+		func(c *config.EnvConfig) { c.DefaultPlatformStickyTTL++ },
+	} {
+		d = *c
+		change(&d)
+		two, err = effectiveConfigDigest(&d)
+		if err != nil || one == two {
+			t.Fatal("effective config drift not detected")
+		}
+	}
+}
+
+func TestMaintenanceEffectiveRuntimeBindsActualOverlayNotOnlyDBBytes(t *testing.T) {
+	dir := t.TempDir()
+	e, c, err := state.PersistenceBootstrap(dir, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	a := &resinApp{engine: e, runtimeCfg: &atomic.Pointer[config.RuntimeConfig]{}, maintenance: newMaintenanceController(dir, "", false)}
+	cfg := config.NewDefaultRuntimeConfig()
+	a.runtimeCfg.Store(cfg)
+	if err := a.bindMaintenanceRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	before := a.maintenance.record.RuntimeDigest
+	// Same DB bytes, different effective defaults: must NOT certify handoff.
+	changed := *cfg
+	changed.MaxConsecutiveFailures++
+	a.runtimeCfg.Store(&changed)
+	if err := a.bindMaintenanceRuntime(); err == nil {
+		t.Fatal("unpersisted runtime difference accepted")
+	}
+	if a.maintenance.record.RuntimeDigest != before {
+		t.Fatal("failed validation changed certificate")
+	}
+	two, err := effectiveRuntimeDigest(&changed)
+	if err != nil || two == before {
+		t.Fatal("runtime values not bound")
+	}
+}
+
+// A CI-only producer for the packaged-image sandbox test. Uses the exact same
+// real persistence fixture; no production DB/account/network is involved.
+func TestPreflightHostedContainerFixture(t *testing.T) {
+	destination := os.Getenv("RESIN_PREFLIGHT_FIXTURE_DIR")
+	if destination == "" {
+		t.Skip("explicit hosted fixture export only")
+	}
+	if os.Getenv("GITHUB_ACTIONS") != "true" {
+		t.Fatal("fixture export requires hosted workflow")
+	}
+	o := preflightFixture(t, nil)
+	if err := os.Mkdir(destination, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"state.db", "cache.db"} {
+		if err := copyPreflightFile(context.Background(), filepath.Join(o.snapshot, name), filepath.Join(destination, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := map[string]any{"state_sha256": o.stateSHA, "cache_sha256": o.cacheSHA, "lease_digest": o.leaseSHA, "lease_count": o.leaseCount, "transfer_id": o.transferID}
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(destination, "fixture.json"), raw, 0600); err != nil {
+		t.Fatal(err)
 	}
 }

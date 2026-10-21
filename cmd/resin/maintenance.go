@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Resinat/Resin/internal/buildinfo"
+	"github.com/Resinat/Resin/internal/config"
 	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/node"
 )
@@ -31,16 +32,19 @@ const maintenancePath = "/api/v1/system/maintenance"
 // retained marker blocks bootstrap before migrations/consistency repair. No
 // HTTP response, PID disappearance or dirty count is a handoff certificate.
 type maintenanceRecord struct {
-	Version     int                   `json:"version"`
-	TransferID  string                `json:"transfer_id"`
-	SourceSHA   string                `json:"source_sha"`
-	PID         int                   `json:"pid"`
-	StartedAtNs int64                 `json:"started_at_ns"`
-	Phase       string                `json:"phase"`
-	LeaseDigest string                `json:"lease_digest,omitempty"`
-	LeaseFormat string                `json:"lease_format"`
-	LeaseCount  int                   `json:"lease_count"`
-	Databases   []maintenanceDatabase `json:"databases,omitempty"`
+	StrongDigest  string                `json:"strong_logical_digest,omitempty"`
+	ConfigDigest  string                `json:"effective_config_digest,omitempty"`
+	RuntimeDigest string                `json:"effective_runtime_digest,omitempty"`
+	Version       int                   `json:"version"`
+	TransferID    string                `json:"transfer_id"`
+	SourceSHA     string                `json:"source_sha"`
+	PID           int                   `json:"pid"`
+	StartedAtNs   int64                 `json:"started_at_ns"`
+	Phase         string                `json:"phase"`
+	LeaseDigest   string                `json:"lease_digest,omitempty"`
+	LeaseFormat   string                `json:"lease_format"`
+	LeaseCount    int                   `json:"lease_count"`
+	Databases     []maintenanceDatabase `json:"databases,omitempty"`
 }
 
 type maintenanceDatabase struct {
@@ -291,6 +295,34 @@ func (a *resinApp) verifyMaintenanceLeases() error {
 	a.maintenance.mu.Lock()
 	a.maintenance.record.LeaseDigest = want
 	a.maintenance.record.LeaseCount = len(memory)
+	a.maintenance.mu.Unlock()
+	return nil
+}
+
+// Called after joined sources, seals and final flush. Bind the actual in-memory
+// effective values as well as the DB overlay/defaults a new binary will load.
+// The raw strong DB digest alone cannot detect changed unpersisted defaults.
+func (a *resinApp) bindMaintenanceRuntime() error {
+	if a.runtimeCfg == nil {
+		return errors.New("runtime configuration unavailable")
+	}
+	want, err := effectiveRuntimeDigest(a.runtimeCfg.Load())
+	if err != nil {
+		return err
+	}
+	stored, _, err := a.engine.GetSystemConfig()
+	if err != nil {
+		return err
+	}
+	if stored == nil {
+		stored = config.NewDefaultRuntimeConfig()
+	}
+	got, err := effectiveRuntimeDigest(stored)
+	if err != nil || got != want {
+		return errors.New("effective runtime/DB configuration mismatch")
+	}
+	a.maintenance.mu.Lock()
+	a.maintenance.record.RuntimeDigest = want
 	a.maintenance.mu.Unlock()
 	return nil
 }

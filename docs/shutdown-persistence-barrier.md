@@ -153,7 +153,7 @@ must bind a clean stopped exit (not just file phase) and exact Docker instance.
 
 ## Candidate-copy preflight (subsequent candidate; not activation)
 
-`resin preflight --snapshot-dir DIR --output-dir NEW_DIR --state-sha256 HEX
+`resin preflight --transfer-id HEX32 --snapshot-dir DIR --output-dir NEW_DIR --state-sha256 HEX
 --cache-sha256 HEX --lease-sha256 HEX --lease-count N` accepts a separately
 proven stopped snapshot. It compares both immutable source files against fixed
 hashes, reads the complete seven-field set, and creates a unique 0700 copy with
@@ -179,7 +179,7 @@ for owner recovery; the tool neither removes markers nor deletes source/copy.
 
 When using the packaged image, bypass the normal Docker entrypoint explicitly:
 its recursive chown is a normal runtime prelude, not a read-only verifier.
-Mount snapshot read-only and a separate candidate workspace read-write; use
+Mount snapshot read-only and a separate size-limited tmpfs candidate workspace; use
 `--network none`, read-only root and a private namespace, never the live slot's
 volumes. The future orchestrator must fix image digest/SHA, Docker instance,
 source config and mounts, journal before container create/start, and consume a
@@ -191,3 +191,27 @@ failed/unknown and its generation cannot be activated.
 A receipt proves candidate persistence/topology survival on its private copy;
 it cannot prove that old 40f produced a causally final snapshot. No source-stop,
 traffic routing, authority-commit or rollback permission follows from it.
+
+
+### Bounded export and effective configuration binding (subsequent candidate)
+
+`--export-bundle` exports JSON `resin-candidate-bundle/v1`, containing the receipt
+and exactly `state/state.db`, `cache/cache.db`, `state/candidate-preflight.json`
+as base64. Decoded aggregate size is at most 64 MiB; encoded output is less than
+96 MiB. Neither is a promise that a maximum-size DB fits memory/tmpfs during
+bootstrap. OOM/ENOSPC/output limits are failures, never permission to truncate or
+activate. A 150-second watchdog exists only in the preflight executable branch;
+it covers bootstrap and stdout, exits 124, and never runs for authority runtime.
+It cannot defeat kernel-uninterruptible I/O or prove post-SIGKILL cleanup.
+
+Source live native record and candidate receipt bind `effective_config_digest`:
+SHA256 of the parsed EnvConfig JSON, normalizing only StateDir/CacheDir/LogDir,
+ListenAddress/ResinPort (slot-local placement). Auth tokens and all other parsed
+values remain in the private digest input. This is a same-schema equality guard,
+not a compatible-version negotiation; changed schema/defaults conservatively
+refuse. The actual effective RuntimeConfig (including unsaved defaults) is separately
+bound by effective_runtime_digest after all source writers join and final flush.
+It must agree with the source DB overlay before certification, then agree with
+the candidate overlay. Labels and stored config remain covered by strong digest.
+Transfer, config, DB hashes and strong digest remain on the candidate marker,
+including export failure. No failed/validated marker permits normal startup.

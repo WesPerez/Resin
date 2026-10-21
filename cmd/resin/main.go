@@ -47,6 +47,12 @@ const downloadUserAgent = "clash.meta"
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "preflight" {
+		// Isolated copy only, never the authoritative runtime. Covers bootstrap,
+		// bundle encoding and blocked stdout if the parent deployer disappears.
+		// Exit 124 cannot authorize handoff; kernel-uninterruptible I/O remains
+		// an OS-level limit and requires explicit container containment.
+		watchdog := time.AfterFunc(150*time.Second, func() { os.Exit(124) })
+		defer watchdog.Stop()
 		if err := preflightCLI(os.Args[2:], os.Stdout); err != nil {
 			fatalf("%v", err)
 		}

@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Resinat/Resin/internal/buildinfo"
 	"github.com/Resinat/Resin/internal/config"
@@ -31,11 +32,13 @@ import (
 )
 
 type preflightOptions struct {
-	snapshot, output, stateSHA, cacheSHA, leaseSHA string
-	leaseCount                                     int
+	snapshot, output, stateSHA, cacheSHA, leaseSHA, transferID string
+	leaseCount                                                 int
+	exportBundle                                               bool
 }
 
 type preflightReceipt struct {
+	TransferID         string                `json:"transfer_id"`
 	Version            string                `json:"version"`
 	Phase              string                `json:"phase"`
 	CandidateSHA       string                `json:"candidate_sha"`
@@ -46,20 +49,75 @@ type preflightReceipt struct {
 	Source             []maintenanceDatabase `json:"source_databases"`
 	Candidate          []maintenanceDatabase `json:"candidate_databases"`
 	StrongDigest       string                `json:"strong_logical_digest"`
+	ConfigDigest       string                `json:"effective_config_digest"`
+	RuntimeDigest      string                `json:"effective_runtime_digest"`
 	OutboundValidated  bool                  `json:"outbound_validated"`
 	AuthorityActivated bool                  `json:"authority_activated"`
+}
+
+// Location is the only allowed environment difference between slots/copies.
+// Tokens and every other parsed effective value remain bound, without emitting
+// them. Hot runtime configuration is separately bound by the strong DB digest.
+func effectiveConfigDigest(env *config.EnvConfig) (string, error) {
+	// encoding/json replaces invalid UTF-8. Do not collapse distinct secret
+	// bytes or any other parsed string into the same configuration identity.
+	if !validUTF8Value(reflect.ValueOf(*env)) {
+		return "", errors.New("invalid configuration text")
+	}
+	c := *env
+	c.StateDir, c.CacheDir, c.LogDir, c.ListenAddress, c.ResinPort = "", "", "", "", 0
+	b, err := json.Marshal(c)
+	if err != nil {
+		return "", err
+	}
+	d := sha256.Sum256(b)
+	return hex.EncodeToString(d[:]), nil
+}
+
+func validUTF8Value(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.String:
+		return utf8.ValidString(v.String())
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			if !validUTF8Value(v.Field(i)) {
+				return false
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			if !validUTF8Value(v.Index(i)) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func effectiveRuntimeDigest(cfg *config.RuntimeConfig) (string, error) {
+	if cfg == nil {
+		return "", errors.New("effective runtime configuration absent")
+	}
+	b, err := json.Marshal(cfg)
+	if err != nil {
+		return "", err
+	}
+	d := sha256.Sum256(append([]byte("resin-effective-runtime/v1\n"), b...))
+	return hex.EncodeToString(d[:]), nil
 }
 
 func preflightCLI(args []string, output io.Writer) error {
 	fs := flag.NewFlagSet("preflight", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var o preflightOptions
+	fs.StringVar(&o.transferID, "transfer-id", "", "")
 	fs.StringVar(&o.snapshot, "snapshot-dir", "", "")
 	fs.StringVar(&o.output, "output-dir", "", "")
 	fs.StringVar(&o.stateSHA, "state-sha256", "", "")
 	fs.StringVar(&o.cacheSHA, "cache-sha256", "", "")
 	fs.StringVar(&o.leaseSHA, "lease-sha256", "", "")
 	fs.IntVar(&o.leaseCount, "lease-count", -1, "")
+	fs.BoolVar(&o.exportBundle, "export-bundle", false, "")
 	if fs.Parse(args) != nil || fs.NArg() != 0 {
 		return errors.New("invalid preflight arguments")
 	}
@@ -72,13 +130,84 @@ func preflightCLI(args []string, output io.Writer) error {
 	if err != nil {
 		return errors.New("candidate preflight refused; no activation; candidate copy retained if created")
 	}
-	if err := json.NewEncoder(output).Encode(r); err != nil {
+	var result any = r
+	if o.exportBundle {
+		result, err = makePreflightBundle(o, r, 64<<20)
+	}
+	if err == nil {
+		if o.exportBundle {
+			output = &preflightLimitedWriter{out: output, remaining: (96 << 20) - 1}
+		}
+		err = json.NewEncoder(output).Encode(result)
+	}
+	if err != nil {
 		marker := newMaintenanceController(filepath.Join(o.output, "state"), "", false)
 		marker.path = filepath.Join(o.output, "state", "candidate-preflight.json")
+		// Keep the original transfer/instance/file bindings on export failure.
+		// Even if this rewrite fails, the existing marker still fences startup.
+		if raw, readErr := os.ReadFile(marker.path); readErr == nil {
+			var recorded maintenanceRecord
+			if json.Unmarshal(raw, &recorded) == nil && recorded.TransferID == o.transferID {
+				marker.record = recorded
+			}
+		}
 		_ = marker.phase("failed")
 		return errors.New("preflight receipt output failed; no activation")
 	}
 	return nil
+}
+
+type preflightLimitedWriter struct {
+	out       io.Writer
+	remaining int
+}
+
+func (w *preflightLimitedWriter) Write(p []byte) (int, error) {
+	if len(p) > w.remaining {
+		return 0, errors.New("preflight encoded output limit exceeded")
+	}
+	n, err := w.out.Write(p)
+	w.remaining -= n
+	return n, err
+}
+
+type preflightBundleFile struct {
+	Name string `json:"name"`
+	Data []byte `json:"data"`
+}
+
+type preflightBundle struct {
+	Version string                `json:"version"`
+	Receipt *preflightReceipt     `json:"receipt"`
+	Files   []preflightBundleFile `json:"files"`
+}
+
+// The container writes only to a size-limited private tmpfs. Export exactly
+// these three files after persistence validation; never a tar archive, pathname
+// supplied by a caller, or an unbounded writable host bind. The caller must
+// require clean process exit and verify every file against Receipt before use.
+func makePreflightBundle(o preflightOptions, r *preflightReceipt, budget int64) (*preflightBundle, error) {
+	b := &preflightBundle{Version: "resin-candidate-bundle/v1", Receipt: r}
+	for _, name := range []string{"state/state.db", "cache/cache.db", "state/candidate-preflight.json"} {
+		path := filepath.Join(o.output, filepath.FromSlash(name))
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Size() > budget {
+			return nil, errors.New("preflight export file or size refused")
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		opened, statErr := f.Stat()
+		data, readErr := io.ReadAll(io.LimitReader(f, budget+1))
+		closeErr := f.Close()
+		if statErr != nil || !os.SameFile(info, opened) || readErr != nil || closeErr != nil || int64(len(data)) != info.Size() {
+			return nil, errors.New("preflight export changed or exceeded bound")
+		}
+		budget -= int64(len(data))
+		b.Files = append(b.Files, preflightBundleFile{Name: name, Data: data})
+	}
+	return b, nil
 }
 
 func readonlyDB(path string) (*sql.DB, error) {
@@ -214,12 +343,16 @@ func copyPreflightFile(ctx context.Context, source, target string) error {
 
 func candidatePreflight(ctx context.Context, o preflightOptions) (_ *preflightReceipt, resultErr error) {
 	hex64 := regexp.MustCompile(`^[0-9a-f]{64}$`)
-	if o.snapshot == "" || o.output == "" || o.leaseCount < 0 || !hex64.MatchString(o.stateSHA) || !hex64.MatchString(o.cacheSHA) || !hex64.MatchString(o.leaseSHA) {
+	if o.snapshot == "" || o.output == "" || !regexp.MustCompile(`^[0-9a-f]{32}$`).MatchString(o.transferID) || o.leaseCount < 0 || !hex64.MatchString(o.stateSHA) || !hex64.MatchString(o.cacheSHA) || !hex64.MatchString(o.leaseSHA) {
 		return nil, errors.New("missing fixed snapshot identity")
 	}
 	env, err := config.LoadEnvConfig()
 	if err != nil {
 		return nil, errors.New("invalid preflight environment")
+	}
+	configDigest, err := effectiveConfigDigest(env)
+	if err != nil {
+		return nil, err
 	}
 	source, err := filepath.Abs(o.snapshot)
 	if err != nil {
@@ -245,6 +378,19 @@ func candidatePreflight(ctx context.Context, o preflightOptions) (_ *preflightRe
 		return nil, errors.New("unsafe snapshot directory")
 	}
 	paths := []string{filepath.Join(source, "state.db"), filepath.Join(source, "cache.db")}
+	if o.exportBundle {
+		var size int64
+		for _, path := range paths {
+			info, err := os.Lstat(path)
+			if err != nil || !info.Mode().IsRegular() {
+				return nil, errors.New("unsafe preflight input")
+			}
+			size += info.Size()
+		}
+		if size > 64<<20 {
+			return nil, errors.New("preflight input exceeds export capacity")
+		}
+	}
 	bind := newMaintenanceController("", "", false)
 	if err := bind.bindClosedDatabases(ctx, paths...); err != nil {
 		return nil, err
@@ -276,6 +422,8 @@ func candidatePreflight(ctx context.Context, o preflightOptions) (_ *preflightRe
 	}
 	marker := newMaintenanceController(stateDir, "", false)
 	marker.path = filepath.Join(stateDir, "candidate-preflight.json")
+	marker.record.TransferID = o.transferID
+	marker.record.ConfigDigest = configDigest
 	if err := marker.phase("preparing"); err != nil {
 		return nil, err
 	}
@@ -315,6 +463,11 @@ func candidatePreflight(ctx context.Context, o preflightOptions) (_ *preflightRe
 	if cfg == nil {
 		cfg = config.NewDefaultRuntimeConfig()
 	}
+	runtimeDigest, err := effectiveRuntimeDigest(cfg)
+	if err != nil {
+		return nil, err
+	}
+	marker.record.RuntimeDigest = runtimeDigest
 	// Match normal startup's default-writing prelude, but only on the candidate
 	// copy. Any resulting logical strong-state change is conservatively refused.
 	if err := ensureDefaultAccountHeaderRule(engine); err != nil {
@@ -407,11 +560,13 @@ func candidatePreflight(ctx context.Context, o preflightOptions) (_ *preflightRe
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	marker.record.Databases = candidate
+	marker.record.StrongDigest = strongBefore
 	if err := marker.phase("validated"); err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return &preflightReceipt{Version: "resin-candidate-preflight/v1", Phase: "validated", CandidateSHA: buildinfo.GitCommit, LeaseFormat: "resin-lease-seven/v1", LeaseDigest: digest, LeaseCount: len(leases), Leases: leases, Source: before, Candidate: candidate, StrongDigest: strongBefore}, nil
+	return &preflightReceipt{RuntimeDigest: runtimeDigest, ConfigDigest: configDigest, TransferID: o.transferID, Version: "resin-candidate-preflight/v1", Phase: "validated", CandidateSHA: buildinfo.GitCommit, LeaseFormat: "resin-lease-seven/v1", LeaseDigest: digest, LeaseCount: len(leases), Leases: leases, Source: before, Candidate: candidate, StrongDigest: strongBefore}, nil
 }

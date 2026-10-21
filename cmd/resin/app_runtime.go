@@ -171,12 +171,17 @@ func loadDotenvFile(path string) error {
 }
 
 func newResinApp(envCfg *config.EnvConfig, engine *state.StateEngine) (*resinApp, error) {
+	configDigest, err := effectiveConfigDigest(envCfg)
+	if err != nil {
+		return nil, err
+	}
 	app := &resinApp{
 		envCfg:      envCfg,
 		engine:      engine,
 		maintenance: newMaintenanceController(envCfg.StateDir, envCfg.AdminToken, os.Getenv("RESIN_MAINTENANCE_ENABLED") == "1"),
 		runtimeCfg:  &atomic.Pointer[config.RuntimeConfig]{},
 	}
+	app.maintenance.record.ConfigDigest = configDigest
 	app.runtimeCfg.Store(loadRuntimeConfig(engine))
 	if err := ensureDefaultAccountHeaderRule(engine); err != nil {
 		return nil, err
@@ -808,6 +813,9 @@ func (a *resinApp) shutdownJoined(ctx context.Context, maintenance bool) error {
 			shutdownErrs = append(shutdownErrs, err)
 		}
 		if err := a.verifyMaintenanceLeases(); err != nil {
+			shutdownErrs = append(shutdownErrs, err)
+		}
+		if err := a.bindMaintenanceRuntime(); err != nil {
 			shutdownErrs = append(shutdownErrs, err)
 		}
 		shutdownErrs = append(shutdownErrs, a.maintenanceBarrierError(ctx))
