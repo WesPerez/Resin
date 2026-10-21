@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -47,6 +48,8 @@ type resinApp struct {
 	healthFeedback  *proxy.HealthFeedbackBarrier
 	engine          *state.StateEngine
 	maintenance     *maintenanceController
+	fenced          bool
+	authority       *authorityController
 }
 
 func run() error {
@@ -75,12 +78,24 @@ func run() error {
 		return err
 	}
 
+	app.startBackgroundServices()
 	serverErrCh := app.startServers()
+	return serveResinApp(app, dbCloser, serverErrCh)
+}
+
+// Shared post-activation lifetime, including the existing error-returning
+// final persistence boundary. Fenced startup does not invent a second drain.
+func serveResinApp(app *resinApp, dbCloser io.Closer, serverErrCh <-chan error) error {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	// Keep signals registered until drain completes; repeated retirement must
 	// not restore SIGTERM's default action while tunnels are still active.
 	defer signal.Stop(quit)
+	return serveResinAppUsingSignals(app, dbCloser, serverErrCh, quit)
+}
+
+func serveResinAppUsingSignals(app *resinApp, dbCloser io.Closer, serverErrCh <-chan error, quit <-chan os.Signal) error {
+	envCfg := app.envCfg
 	var runtimeErr error
 	select {
 	case <-app.maintenance.requested:
@@ -88,6 +103,11 @@ func run() error {
 	case sig := <-quit:
 		log.Printf("Received signal %s, shutting down", sig)
 	case runtimeErr = <-serverErrCh:
+	}
+	if app.authority != nil {
+		if err := app.authority.phase("stopping"); err != nil {
+			app.authority.fail()
+		}
 	}
 	maintenance := app.maintenance.closeAdmission()
 
@@ -127,6 +147,9 @@ func run() error {
 	// parked behind its restart fence for explicit recovery/force-stop.
 	closeErr := closeShutdownDatabases(ctx, maintenance, runtimeErr, shutdownErr,
 		func() error { return app.maintenanceBarrierError(ctx) }, dbCloser.Close, func() {
+			if app.authority != nil {
+				app.authority.fail()
+			}
 			_ = app.maintenance.phase("failed")
 			log.Println("Shutdown failed; source ownership/dirty state retained, databases remain open")
 			select {} // explicit owner recovery, never successful exit
@@ -171,19 +194,34 @@ func loadDotenvFile(path string) error {
 }
 
 func newResinApp(envCfg *config.EnvConfig, engine *state.StateEngine) (*resinApp, error) {
+	return constructResinApp(envCfg, engine, false)
+}
+
+// The fenced path restores this SAME runtime graph, not a substitute router.
+// It never constructs observability files, binds endpoints, warms outbounds or
+// starts background services. Its engine uses immutable read-only databases.
+func constructResinApp(envCfg *config.EnvConfig, engine *state.StateEngine, fenced bool) (*resinApp, error) {
 	configDigest, err := effectiveConfigDigest(envCfg)
 	if err != nil {
 		return nil, err
 	}
 	app := &resinApp{
+		fenced:      fenced,
 		envCfg:      envCfg,
 		engine:      engine,
 		maintenance: newMaintenanceController(envCfg.StateDir, envCfg.AdminToken, os.Getenv("RESIN_MAINTENANCE_ENABLED") == "1"),
 		runtimeCfg:  &atomic.Pointer[config.RuntimeConfig]{},
 	}
 	app.maintenance.record.ConfigDigest = configDigest
-	app.runtimeCfg.Store(loadRuntimeConfig(engine))
-	if err := ensureDefaultAccountHeaderRule(engine); err != nil {
+	cfg, _, err := engine.GetSystemConfig()
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		cfg = config.NewDefaultRuntimeConfig()
+	}
+	app.runtimeCfg.Store(cfg)
+	if err := prepareAccountHeaderRule(engine, fenced); err != nil {
 		return nil, err
 	}
 	app.accountMatcher = buildAccountMatcher(engine)
@@ -197,6 +235,9 @@ func newResinApp(envCfg *config.EnvConfig, engine *state.StateEngine) (*resinApp
 	if err := app.bootstrapFromPersistence(engine); err != nil {
 		return nil, err
 	}
+	if fenced {
+		return app, nil
+	}
 	if err := app.initObservability(); err != nil {
 		return nil, err
 	}
@@ -204,7 +245,6 @@ func newResinApp(envCfg *config.EnvConfig, engine *state.StateEngine) (*resinApp
 		return nil, err
 	}
 
-	app.startBackgroundServices()
 	return app, nil
 }
 
@@ -230,6 +270,7 @@ func (a *resinApp) initTopologyRuntime(engine *state.StateEngine) (*netutil.Retr
 				a.transportPool.Evict(hash)
 			}
 		},
+		a.fenced,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("topology runtime: %w", err)
@@ -329,16 +370,20 @@ func (a *resinApp) wireRetryDownloader(retryDL *netutil.RetryDownloader) {
 
 func (a *resinApp) bootstrapFromPersistence(engine *state.StateEngine) error {
 	// Phase 6: Bootstrap topology data from persistence.
-	if err := bootstrapTopology(engine, a.topoRuntime.subManager, a.topoRuntime.pool, a.envCfg); err != nil {
+	if err := bootstrapTopologyMode(engine, a.topoRuntime.subManager, a.topoRuntime.pool, a.envCfg, a.fenced); err != nil {
 		return err
 	}
 
 	// Phase 6.1: Bootstrap nodes (steps 3-6: static, subscription_nodes, dynamic, latency).
+	outboundMgr := a.topoRuntime.outboundMgr
+	if a.fenced {
+		outboundMgr = nil
+	}
 	if err := bootstrapNodes(
 		engine,
 		a.topoRuntime.pool,
 		a.topoRuntime.subManager,
-		a.topoRuntime.outboundMgr,
+		outboundMgr,
 		a.envCfg,
 		runtimeConfigSnapshot(a.runtimeCfg).LatencyAuthorities,
 	); err != nil {
@@ -355,6 +400,9 @@ func (a *resinApp) bootstrapFromPersistence(engine *state.StateEngine) error {
 	// Phase 9: Restore leases (AFTER rebuild so platform views are populated).
 	leases, err := engine.LoadAllLeases()
 	if err != nil {
+		if a.fenced {
+			return fmt.Errorf("fenced lease restore: %w", err)
+		}
 		log.Printf("Warning: load leases: %v", err)
 	} else if len(leases) > 0 {
 		a.topoRuntime.router.RestoreLeases(leases)
@@ -696,7 +744,7 @@ func (a *resinApp) shutdownJoined(ctx context.Context, maintenance bool) error {
 			shutdownErrs = append(shutdownErrs, err)
 		}
 	}
-	drainOnly := !maintenance && os.Getenv("RESIN_SHUTDOWN_PRESERVE_CONNECTIONS") == "1"
+	drainOnly := !maintenance && a.authority == nil && os.Getenv("RESIN_SHUTDOWN_PRESERVE_CONNECTIONS") == "1"
 	if drainOnly {
 		log.Println("Resin drain-only shutdown enabled; preserving tunnels and suppressing final state flush")
 		// Publish what this slot is handing over BEFORE the flush worker is told

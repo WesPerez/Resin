@@ -9,10 +9,75 @@ import resource
 import subprocess
 import sys
 import tempfile
+import time
 
 
 def call(args, **kwargs):
     return subprocess.run(args, check=True, timeout=30, capture_output=True, **kwargs)
+
+
+def check_packaged_fence(image, data, fixed):
+    # Materialize only CI synthetic output in a private, disposable generation.
+    # Never mount a real source writable and never send an activation POST here.
+    with tempfile.TemporaryDirectory(prefix='resin-fenced-ci-') as root:
+        root = Path(root)
+        for kind in ('state', 'cache'):
+            (root/kind).mkdir(mode=0o700)
+        names = ('state/state.db', 'cache/cache.db', 'state/candidate-preflight.json')
+        for name, body in zip(names, data):
+            target = root/name
+            target.write_bytes(body)
+            target.chmod(0o600)
+        fixed_args = ['docker', 'create', '--pull', 'never', '--network', 'none', '--read-only',
+                      '--user', '0:0', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',
+                      '--restart', 'no', '--log-driver', 'none', '--pids-limit', '128',
+                      '--memory', '512m', '--memory-swap', '512m', '--cpus', '1', '--shm-size', '1m']
+        for kind, dest in (('state','/var/lib/resin'), ('cache','/var/cache/resin')):
+            fixed_args += ['--mount', f'type=bind,src={root/kind},dst={dest}']
+        for path in ('/tmp', '/var/log/resin'):
+            fixed_args += ['--tmpfs', f'{path}:rw,noexec,nosuid,size=1m']
+        fixed_args += ['--env','RESIN_ADMIN_TOKEN=preflight-fixture','--env','RESIN_PROXY_TOKEN=preflight-fixture',
+                       '--entrypoint','/usr/local/bin/resin', image]
+        command = ['fenced', '--transfer-id', fixed['transfer_id'], '--marker-sha256', hashlib.sha256(data[2]).hexdigest(),
+                   '--authority-listen', '127.0.0.1:29601', '--deadline', '20s']
+        cid = call(fixed_args+command).stdout.decode().strip()
+        try:
+            call(['docker','start',cid])
+            ready = None
+            for _ in range(40):
+                status = subprocess.run(['docker','exec',cid,'wget','-qO-','-T','1',
+                                         '--header=Authorization: Bearer preflight-fixture',
+                                         'http://127.0.0.1:29601/authority'],capture_output=True,timeout=3)
+                if status.returncode == 0:
+                    ready = json.loads(status.stdout)
+                    break
+                time.sleep(.1)
+            assert ready and ready['phase']=='fenced_ready', 'packaged fenced readiness absent'
+            assert ready['candidate_sha']==os.environ['GITHUB_SHA']
+            assert ready['transfer_id']==fixed['transfer_id'] and not ready['writes_may_have_started']
+            assert not ready.get('activation_nonce')
+            no_data = subprocess.run(['docker','exec',cid,'wget','-qO-','-T','1','http://127.0.0.1:2260/'],
+                                     capture_output=True,timeout=3)
+            assert no_data.returncode != 0, 'fenced constructor bound ordinary endpoint'
+            call(['docker','kill','--signal','TERM',cid])
+            call(['docker','wait',cid])
+            info = json.loads(call(['docker','inspect',cid]).stdout)[0]
+            assert not info['State']['Running'] and info['State']['ExitCode'] != 0
+            record = json.loads((root/'state/candidate-authority.json').read_text())
+            assert record['phase']=='failed' and not record['writes_may_have_started']
+        finally:
+            call(['docker','rm','--force',cid]) # exact CI-owned synthetic container only
+        for name, body in zip(names, data):
+            assert (root/name).read_bytes()==body
+        for db in (root/'state/state.db',root/'cache/cache.db'):
+            assert not any(Path(str(db)+suffix).exists() for suffix in ('-wal','-shm','-journal'))
+        for args in (command, [], ['unknown-command']):
+            cid = call(fixed_args+args).stdout.decode().strip()
+            try:
+                result = subprocess.run(['docker','start','--attach',cid],capture_output=True,timeout=10)
+                assert result.returncode != 0, 'retained authority or unknown command bypassed'
+            finally:
+                call(['docker','rm','--force',cid])
 
 
 def main():
@@ -70,11 +135,13 @@ def main():
             assert marker['databases']==receipt['candidate_databases']
             assert marker['effective_runtime_digest']==receipt['effective_runtime_digest']
             assert marker['strong_logical_digest']==receipt['strong_logical_digest']
+            assert marker['effective_config_digest']==receipt['effective_config_digest']
+            check_packaged_fence(image,data,fixed)
         finally:
             # Only CI-owned synthetic containers, exact returned ID.
             call(['docker','rm','--force',cid])
     assert before=={n:hashlib.sha256((fixture/n).read_bytes()).hexdigest() for n in before}
-    print(json.dumps({'packaged_preflight':'passed','synthetic_fixture':True,'source_unchanged':True,'authority_activated':False}))
+    print(json.dumps({'packaged_preflight':'passed','packaged_fenced_start':'passed','synthetic_fixture':True,'source_unchanged':True,'authority_activated':False}))
 
 
 if __name__=='__main__': main()

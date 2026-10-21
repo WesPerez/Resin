@@ -36,6 +36,7 @@ type CacheReaders struct {
 type StateEngine struct {
 	*StateRepo
 	*CacheRepo
+	fenced bool // exclusive startup lifecycle, never toggled by ordinary requests
 
 	dirtyNodesStatic       *DirtySet[string]
 	dirtyNodesDynamic      *DirtySet[string]

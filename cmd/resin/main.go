@@ -46,6 +46,12 @@ type topologyRuntime struct {
 const downloadUserAgent = "clash.meta"
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "fenced" {
+		if err := fencedCLI(os.Args[2:]); err != nil {
+			fatalf("%v", err)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "preflight" {
 		// Isolated copy only, never the authoritative runtime. Covers bootstrap,
 		// bundle encoding and blocked stdout if the parent deployer disappears.
@@ -57,6 +63,9 @@ func main() {
 			fatalf("%v", err)
 		}
 		return
+	}
+	if len(os.Args) > 1 {
+		fatalf("unknown Resin command")
 	}
 	if err := run(); err != nil {
 		fatalf("%v", err)
@@ -219,6 +228,7 @@ func newTopologyRuntime(
 	downloader netutil.Downloader,
 	onProbeConnLifecycle func(netutil.ConnLifecycleOp),
 	onNodeRemoved func(node.Hash),
+	fenced bool,
 ) (*topologyRuntime, error) {
 	subManager := topology.NewSubscriptionManager()
 
@@ -253,6 +263,7 @@ func newTopologyRuntime(
 
 	singboxBuilder, err := outbound.NewSingboxBuilderWithConfig(outbound.SingboxBuilderConfig{
 		DNSUpstreams: envCfg.NodeDNSUpstreams,
+		DeferStart:   fenced,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("singbox builder: %w", err)
@@ -366,6 +377,11 @@ func bootstrapTopology(
 	pool *topology.GlobalNodePool,
 	envCfg *config.EnvConfig,
 ) error {
+	return bootstrapTopologyMode(engine, subManager, pool, envCfg, false)
+}
+
+func bootstrapTopologyMode(engine *state.StateEngine, subManager *topology.SubscriptionManager,
+	pool *topology.GlobalNodePool, envCfg *config.EnvConfig, fenced bool) error {
 	dbSubs, err := engine.ListSubscriptions()
 	if err != nil {
 		return fmt.Errorf("load subscriptions: %w", err)
@@ -390,7 +406,15 @@ func bootstrapTopology(
 	if err := validatePersistedPlatformNamesForV1(dbPlats); err != nil {
 		return fmt.Errorf("validate platform names for V1: %w", err)
 	}
-	if err := ensureDefaultPlatform(engine, envCfg, dbPlats); err != nil {
+	if fenced {
+		found := false
+		for _, p := range dbPlats {
+			found = found || p.ID == platform.DefaultPlatformID
+		}
+		if !found {
+			return fmt.Errorf("fenced startup requires existing default platform")
+		}
+	} else if err := ensureDefaultPlatform(engine, envCfg, dbPlats); err != nil {
 		return fmt.Errorf("ensure default platform: %w", err)
 	}
 	dbPlats, err = engine.ListPlatforms()
@@ -461,6 +485,22 @@ func ensureDefaultPlatform(
 }
 
 var defaultFallbackAccountHeaders = []string{"Authorization", "x-api-key"}
+
+func prepareAccountHeaderRule(engine *state.StateEngine, fenced bool) error {
+	if !fenced {
+		return ensureDefaultAccountHeaderRule(engine)
+	}
+	rules, err := engine.ListAccountHeaderRules()
+	if err != nil {
+		return err
+	}
+	for _, rule := range rules {
+		if rule.URLPrefix == "*" {
+			return nil
+		}
+	}
+	return fmt.Errorf("fenced startup requires existing account header fallback")
+}
 
 func ensureDefaultAccountHeaderRule(engine *state.StateEngine) error {
 	created, err := engine.EnsureAccountHeaderRule(model.AccountHeaderRule{
@@ -870,6 +910,11 @@ func restoreBootstrapNodeLatencies(
 	maxRegularEntries int,
 	latencyAuthorities []string,
 ) error {
+	return restoreBootstrapNodeLatenciesMode(engine, pool, maxRegularEntries, latencyAuthorities, false)
+}
+
+func restoreBootstrapNodeLatenciesMode(engine *state.StateEngine, pool *topology.GlobalNodePool,
+	maxRegularEntries int, latencyAuthorities []string, fenced bool) error {
 	latencies, err := engine.LoadAllNodeLatency()
 	if err != nil {
 		return fmt.Errorf("load node_latency: %w", err)
@@ -924,6 +969,9 @@ func restoreBootstrapNodeLatencies(
 			return regular[i].LastUpdatedNs > regular[j].LastUpdatedNs
 		})
 		if len(regular) > maxRegularEntries {
+			if fenced {
+				return fmt.Errorf("fenced latency restore requires preflight-normalized input")
+			}
 			for _, dropped := range regular[maxRegularEntries:] {
 				engine.MarkNodeLatencyDelete(dropped.NodeHash, dropped.Domain)
 				trimmedCount++
@@ -968,7 +1016,9 @@ func bootstrapNodes(
 		return err
 	}
 
-	warmupBootstrapOutbounds(hashes, outboundMgr)
+	if outboundMgr != nil {
+		warmupBootstrapOutbounds(hashes, outboundMgr)
+	}
 
 	if err := restoreBootstrapSubscriptionBindings(engine, pool, subManager); err != nil {
 		return err
@@ -976,11 +1026,12 @@ func bootstrapNodes(
 	if err := restoreBootstrapNodeDynamics(engine, pool); err != nil {
 		return err
 	}
-	if err := restoreBootstrapNodeLatencies(
+	if err := restoreBootstrapNodeLatenciesMode(
 		engine,
 		pool,
 		envCfg.MaxLatencyTableEntries,
 		latencyAuthorities,
+		outboundMgr == nil,
 	); err != nil {
 		return err
 	}

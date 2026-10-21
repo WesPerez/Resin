@@ -69,6 +69,12 @@ func maintenanceMarker(stateDir string) string {
 }
 
 func rejectRetainedMaintenance(stateDir string) error {
+	if _, err := os.Lstat(filepath.Join(stateDir, ".candidate-authority-owner")); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("retained candidate ownership blocks ordinary startup")
+	}
+	if _, err := os.Lstat(filepath.Join(stateDir, "candidate-authority.json")); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("retained candidate authority blocks ordinary startup; owner recovery required")
+	}
 	if _, err := os.Lstat(filepath.Join(stateDir, "candidate-preflight.json")); !errors.Is(err, os.ErrNotExist) {
 		return errors.New("candidate preflight fence blocks normal startup; explicit authority commit required")
 	}
@@ -96,6 +102,10 @@ func writeMaintenanceRecord(path string, record maintenanceRecord) error {
 
 // installed distinguishes the restart-fence rename from its durability ack.
 func installMaintenanceRecord(path string, record maintenanceRecord) (installed bool, result error) {
+	return installDurableRecord(path, record)
+}
+
+func installDurableRecord(path string, record any) (installed bool, result error) {
 	data, err := json.Marshal(record)
 	if err != nil {
 		return false, err
