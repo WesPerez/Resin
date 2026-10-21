@@ -95,7 +95,7 @@ jobs:
         run: go test ./...
 
       - name: Run proxy, routing, persistence and shutdown race tests
-        run: go test -race ./internal/proxy ./internal/routing ./internal/netutil ./internal/probe ./internal/state ./internal/service ./internal/api ./internal/geoip ./cmd/resin
+        run: go test -race ./internal/topology ./internal/proxy ./internal/routing ./internal/netutil ./internal/probe ./internal/state ./internal/service ./internal/api ./internal/geoip ./cmd/resin
 
       - name: Check entrypoint syntax
         run: sh -n docker/entrypoint.sh

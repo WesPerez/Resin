@@ -44,6 +44,8 @@ type resinApp struct {
 	endpointManager *endpointRuntimeManager
 	transportPool   *proxy.OutboundTransportPool
 	healthFeedback  *proxy.HealthFeedbackBarrier
+	engine          *state.StateEngine
+	maintenance     *maintenanceController
 }
 
 func run() error {
@@ -53,6 +55,10 @@ func run() error {
 
 	envCfg, err := config.LoadEnvConfig()
 	if err != nil {
+		return err
+	}
+
+	if err := rejectRetainedMaintenance(envCfg.StateDir); err != nil {
 		return err
 	}
 
@@ -74,11 +80,21 @@ func run() error {
 	// Keep signals registered until drain completes; repeated retirement must
 	// not restore SIGTERM's default action while tunnels are still active.
 	defer signal.Stop(quit)
-	runtimeErr := waitForShutdown(serverErrCh, quit)
+	var runtimeErr error
+	select {
+	case <-app.maintenance.requested:
+		log.Println("Maintenance requested; stopping admission and joining sources")
+	case sig := <-quit:
+		log.Printf("Received signal %s, shutting down", sig)
+	case runtimeErr = <-serverErrCh:
+	}
+	maintenance := app.maintenance.closeAdmission()
 
 	var ctx context.Context
 	var cancel context.CancelFunc
-	if os.Getenv("RESIN_SHUTDOWN_PRESERVE_CONNECTIONS") == "1" {
+	if maintenance {
+		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Minute)
+	} else if os.Getenv("RESIN_SHUTDOWN_PRESERVE_CONNECTIONS") == "1" {
 		drainTimeout := 10 * time.Minute
 		if raw := strings.TrimSpace(os.Getenv("RESIN_DRAIN_TIMEOUT")); raw != "" {
 			if parsed, err := time.ParseDuration(raw); err == nil && parsed >= 0 {
@@ -96,9 +112,46 @@ func run() error {
 		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 	}
 	defer cancel()
-	shutdownErr := app.shutdown(ctx)
+	if maintenance {
+		stopped, done := make(chan struct{}), make(chan struct{})
+		go app.maintenance.timeoutFailure(ctx, stopped, done)
+		defer func() { close(stopped); <-done }()
+	}
+	shutdownErr := app.shutdown(ctx, maintenance)
+	// Failure is not permission to close a DB under a still-owned writer, or
+	// discard dirty work after a failed final transaction. Keep the source
+	// parked behind its restart fence for explicit recovery/force-stop.
+	if maintenance && errors.Join(runtimeErr, shutdownErr, app.maintenanceBarrierError(ctx)) != nil {
+		_ = app.maintenance.phase("failed")
+		log.Println("Maintenance failed; source ownership retained, no database close or handoff")
+		select {} // intentional fail-closed ownership, not a successful drain wait
+	}
+	if errors.Is(shutdownErr, errShutdownOwnershipRetained) {
+		log.Println("Shutdown deadline expired; source ownership retained, databases remain open")
+		select {}
+	}
 
 	closeErr := dbCloser.Close()
+	if maintenance {
+		closeErr = errors.Join(closeErr, ctx.Err(), app.maintenanceBarrierError(ctx))
+		if errors.Join(runtimeErr, shutdownErr, closeErr) == nil {
+			closeErr = syncMaintenanceFiles(filepath.Join(envCfg.StateDir, "state.db"), filepath.Join(envCfg.CacheDir, "cache.db"))
+			if closeErr == nil {
+				closeErr = app.maintenance.bindClosedDatabases(filepath.Join(envCfg.StateDir, "state.db"), filepath.Join(envCfg.CacheDir, "cache.db"))
+			}
+		}
+		if errors.Join(runtimeErr, shutdownErr, closeErr) == nil {
+			closeErr = errors.Join(ctx.Err(), app.maintenanceBarrierError(ctx))
+			if closeErr == nil {
+				closeErr = app.maintenance.phase("complete")
+			}
+		} else {
+			closeErr = errors.Join(closeErr, app.maintenance.phase("failed"))
+		}
+		if errors.Join(runtimeErr, shutdownErr, closeErr) != nil {
+			closeErr = errors.Join(closeErr, app.maintenance.phase("failed"))
+		}
+	}
 	if runtimeErr != nil {
 		runtimeErr = fmt.Errorf("runtime server error: %w", runtimeErr)
 	}
@@ -117,8 +170,10 @@ func loadDotenvFile(path string) error {
 
 func newResinApp(envCfg *config.EnvConfig, engine *state.StateEngine) (*resinApp, error) {
 	app := &resinApp{
-		envCfg:     envCfg,
-		runtimeCfg: &atomic.Pointer[config.RuntimeConfig]{},
+		envCfg:      envCfg,
+		engine:      engine,
+		maintenance: newMaintenanceController(envCfg.StateDir, envCfg.AdminToken, os.Getenv("RESIN_MAINTENANCE_ENABLED") == "1"),
+		runtimeCfg:  &atomic.Pointer[config.RuntimeConfig]{},
 	}
 	app.runtimeCfg.Store(loadRuntimeConfig(engine))
 	if err := ensureDefaultAccountHeaderRule(engine); err != nil {
@@ -494,6 +549,7 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		socks5Inbound,
 		a.metricsManager,
 	)
+	endpointManager.maintenance = a.maintenance
 	cpService.EndpointRuntime = endpointManager
 	defaultEndpoint := service.NewDefaultEndpoint(a.envCfg.ResinPort)
 	if err := endpointManager.ApplyEndpoint(defaultEndpoint); err != nil {
@@ -579,9 +635,37 @@ func formatListenURL(listenAddress string, port int) string {
 	return "http://" + formatListenAddress(listenAddress, port)
 }
 
-func (a *resinApp) shutdown(ctx context.Context) error {
+var errShutdownOwnershipRetained = errors.New("shutdown deadline expired with retained source ownership")
+
+// The deadline bounds the owner's wait, not an unsafe close of live sources.
+// A synchronous Stop/SQL driver may ignore cancellation; its single owned
+// worker continues behind closed admission while run retains DB handles.
+func waitShutdownDeadline(ctx context.Context, stop func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- stop() }()
+	select {
+	case err := <-done:
+		if ctx.Err() != nil {
+			return errors.Join(err, ctx.Err(), errShutdownOwnershipRetained)
+		}
+		return err
+	case <-ctx.Done():
+		return errors.Join(ctx.Err(), errShutdownOwnershipRetained)
+	}
+}
+
+func (a *resinApp) shutdown(ctx context.Context, maintenance bool) error {
+	return waitShutdownDeadline(ctx, func() error { return a.shutdownJoined(ctx, maintenance) })
+}
+
+func (a *resinApp) shutdownJoined(ctx context.Context, maintenance bool) error {
 	var shutdownErrs []error
-	drainOnly := os.Getenv("RESIN_SHUTDOWN_PRESERVE_CONNECTIONS") == "1"
+	if maintenance {
+		if err := a.maintenance.phase("draining"); err != nil {
+			shutdownErrs = append(shutdownErrs, err)
+		}
+	}
+	drainOnly := !maintenance && os.Getenv("RESIN_SHUTDOWN_PRESERVE_CONNECTIONS") == "1"
 	if drainOnly {
 		log.Println("Resin drain-only shutdown enabled; preserving tunnels and suppressing final state flush")
 		// Publish what this slot is handing over BEFORE the flush worker is told
@@ -594,13 +678,18 @@ func (a *resinApp) shutdown(ctx context.Context) error {
 		}
 		a.flushWorker.Discard()
 	}
-	if err := a.endpointManager.Shutdown(ctx, drainOnly); err != nil {
+	if err := a.endpointManager.Shutdown(ctx, drainOnly || maintenance); err != nil {
 		log.Printf("Server shutdown error: %v", err)
 		shutdownErrs = append(shutdownErrs, fmt.Errorf("endpoint shutdown: %w", err))
-		// A context timeout is a failed deadline, not permission to close the
-		// DB under a live handler. Join before touching its sinks or final state.
-		if joinErr := a.endpointManager.WaitQuiescent(); joinErr != nil {
-			shutdownErrs = append(shutdownErrs, fmt.Errorf("endpoint safety join: %w", joinErr))
+		if maintenance {
+			shutdownErrs = append(shutdownErrs, a.maintenance.phase("failed"))
+		}
+		// Never progress to sink/DB close after an incomplete source drain.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return errors.Join(errors.Join(shutdownErrs...), errShutdownOwnershipRetained)
+		}
+		if joinErr := a.endpointManager.WaitQuiescentContext(ctx); joinErr != nil {
+			return errors.Join(errors.Join(shutdownErrs...), joinErr, errShutdownOwnershipRetained)
 		}
 	}
 	log.Println("Resin server stopped")
@@ -628,12 +717,16 @@ func (a *resinApp) shutdown(ctx context.Context) error {
 	if a.healthFeedback != nil {
 		if err := a.healthFeedback.StopAndWait(ctx); err != nil {
 			shutdownErrs = append(shutdownErrs, err)
-			// Retain the original failure, but safely join accepted callbacks
-			// before stopping probes, GeoIP, and persistence they may use.
-			if joinErr := a.healthFeedback.StopAndWait(context.Background()); joinErr != nil {
-				shutdownErrs = append(shutdownErrs, fmt.Errorf("feedback safety join: %w", joinErr))
+			if maintenance {
+				shutdownErrs = append(shutdownErrs, a.maintenance.phase("failed"))
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return errors.Join(errors.Join(shutdownErrs...), errShutdownOwnershipRetained)
 			}
 		}
+	}
+	if ctx.Err() != nil {
+		return errors.Join(ctx.Err(), errShutdownOwnershipRetained)
 	}
 	a.topoRuntime.probeMgr.Stop()
 	log.Println("Probe manager stopped")
@@ -645,7 +738,7 @@ func (a *resinApp) shutdown(ctx context.Context) error {
 	log.Println("Request log service stopped")
 	if err := a.requestlogRepo.Close(); err != nil {
 		log.Printf("Request log repo close error: %v", err)
-		shutdownErrs = append(shutdownErrs, err)
+
 	}
 	log.Println("Request log repo closed")
 
@@ -653,7 +746,7 @@ func (a *resinApp) shutdown(ctx context.Context) error {
 	log.Println("Metrics manager stopped")
 	if err := a.metricsDB.Close(); err != nil {
 		log.Printf("Metrics DB close error: %v", err)
-		shutdownErrs = append(shutdownErrs, err)
+
 	}
 	log.Println("Metrics DB closed")
 
@@ -666,10 +759,36 @@ func (a *resinApp) shutdown(ctx context.Context) error {
 		log.Println("SingboxBuilder stopped")
 	}
 
+	if ctx.Err() != nil {
+		return errors.Join(ctx.Err(), errShutdownOwnershipRetained)
+	}
+	if maintenance {
+		// Source ownership was joined before these terminal seals. The seals
+		// detect late rejected writes; they do not silently grant handoff.
+		a.engine.SealStrongWrites()
+		a.engine.SealWeakWrites()
+		if err := a.maintenance.phase("sources_stopped"); err != nil {
+			shutdownErrs = append(shutdownErrs, err)
+		}
+	}
 	if drainOnly {
 		a.flushWorker.Stop()
 	} else if err := a.flushWorker.StopAndFlush(); err != nil {
 		shutdownErrs = append(shutdownErrs, fmt.Errorf("authoritative state flush: %w", err))
+	}
+	if maintenance {
+		if err := a.engine.CheckpointDurable(ctx); err != nil {
+			shutdownErrs = append(shutdownErrs, err)
+		}
+		if err := a.verifyMaintenanceLeases(); err != nil {
+			shutdownErrs = append(shutdownErrs, err)
+		}
+		shutdownErrs = append(shutdownErrs, a.maintenanceBarrierError(ctx))
+		if errors.Join(shutdownErrs...) == nil {
+			if err := a.maintenance.phase("persisted"); err != nil {
+				shutdownErrs = append(shutdownErrs, err)
+			}
+		}
 	}
 	log.Println("Server stopped")
 	return errors.Join(shutdownErrs...)

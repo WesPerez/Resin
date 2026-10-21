@@ -19,8 +19,10 @@ import (
 // StateRepo wraps state.db and provides transactional CRUD for strong-persist data.
 // All writes are serialized by an internal mutex.
 type StateRepo struct {
-	db *sql.DB
-	mu sync.Mutex
+	db         *sql.DB
+	mu         sync.Mutex
+	sealed     bool
+	lateWrites bool
 }
 
 // newStateRepo creates a StateRepo for the given state.db connection.
@@ -83,6 +85,9 @@ func (r *StateRepo) SaveSystemConfig(cfg *config.RuntimeConfig, version int, upd
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.checkWriteAllowed(); err != nil {
+		return err
+	}
 
 	_, err = r.db.Exec(`
 		INSERT INTO system_config (id, config_json, version, updated_at_ns)
@@ -150,6 +155,9 @@ func (r *StateRepo) UpsertPlatform(p model.Platform) error {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.checkWriteAllowed(); err != nil {
+		return err
+	}
 
 	_, err = r.db.Exec(`
 		INSERT INTO platforms (id, name, sticky_ttl_ns, regex_filters_json, region_filters_json,
@@ -196,6 +204,9 @@ func isSQLiteUniqueConstraint(err error) bool {
 func (r *StateRepo) DeletePlatform(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.checkWriteAllowed(); err != nil {
+		return err
+	}
 
 	result, err := r.db.Exec("DELETE FROM platforms WHERE id = ?", id)
 	if err != nil {
@@ -307,6 +318,9 @@ func (r *StateRepo) UpsertSubscription(s model.Subscription) error {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.checkWriteAllowed(); err != nil {
+		return err
+	}
 
 	_, err := r.db.Exec(`
 			INSERT INTO subscriptions (id, name, source_type, url, content, update_interval_ns, enabled,
@@ -332,6 +346,9 @@ func (r *StateRepo) UpsertSubscription(s model.Subscription) error {
 func (r *StateRepo) DeleteSubscription(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.checkWriteAllowed(); err != nil {
+		return err
+	}
 
 	result, err := r.db.Exec("DELETE FROM subscriptions WHERE id = ?", id)
 	if err != nil {
@@ -374,6 +391,9 @@ func (r *StateRepo) ListSubscriptions() ([]model.Subscription, error) {
 func (r *StateRepo) InsertEndpoint(endpoint model.Endpoint) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.checkWriteAllowed(); err != nil {
+		return err
+	}
 
 	_, err := r.db.Exec(`
 		INSERT INTO endpoints (
@@ -393,6 +413,9 @@ func (r *StateRepo) InsertEndpoint(endpoint model.Endpoint) error {
 func (r *StateRepo) UpdateEndpoint(endpoint model.Endpoint) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.checkWriteAllowed(); err != nil {
+		return err
+	}
 
 	result, err := r.db.Exec(`
 		UPDATE endpoints SET
@@ -426,6 +449,9 @@ func (r *StateRepo) UpdateEndpoint(endpoint model.Endpoint) error {
 func (r *StateRepo) DeleteEndpoint(id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.checkWriteAllowed(); err != nil {
+		return err
+	}
 
 	result, err := r.db.Exec("DELETE FROM endpoints WHERE id = ?", id)
 	if err != nil {
@@ -522,6 +548,9 @@ func (r *StateRepo) EnsureAccountHeaderRule(rule model.AccountHeaderRule) (bool,
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.checkWriteAllowed(); err != nil {
+		return false, err
+	}
 
 	result, err := r.db.Exec(`
 		INSERT INTO account_header_rules (url_prefix, headers_json, updated_at_ns)
@@ -545,6 +574,9 @@ func (r *StateRepo) UpsertAccountHeaderRuleWithCreated(rule model.AccountHeaderR
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.checkWriteAllowed(); err != nil {
+		return false, err
+	}
 
 	tx, err := r.db.Begin()
 	if err != nil {
@@ -585,6 +617,9 @@ func (r *StateRepo) UpsertAccountHeaderRuleWithCreated(rule model.AccountHeaderR
 func (r *StateRepo) DeleteAccountHeaderRule(prefix string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.checkWriteAllowed(); err != nil {
+		return err
+	}
 
 	result, err := r.db.Exec("DELETE FROM account_header_rules WHERE url_prefix = ?", prefix)
 	if err != nil {

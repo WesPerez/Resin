@@ -44,6 +44,7 @@ type endpointRuntimeManager struct {
 	tokenAPI         http.Handler
 	socks5           inboundConnHandler
 	metricsSink      proxy.MetricsEventSink
+	maintenance      *maintenanceController
 	runtimes         map[string]*managedEndpointRuntime
 	statuses         map[string]service.EndpointRuntimeStatus
 	started          bool
@@ -123,9 +124,14 @@ func (m *endpointRuntimeManager) ApplyEndpoint(endpoint model.Endpoint) error {
 		m.apiHandler,
 		m.tokenAPI,
 	)
+	var socksHandler inboundConnHandler = &endpointSocksGate{current: currentConfig, next: m.socks5}
+	if m.maintenance != nil {
+		httpHandler = m.maintenance.wrapHTTP(httpHandler)
+		socksHandler = &maintenanceSOCKS{controller: m.maintenance, next: socksHandler}
+	}
 	runtime.server = newInboundDemuxServer(
-		&http.Server{Handler: httpHandler},
-		&endpointSocksGate{current: currentConfig, next: m.socks5},
+		&http.Server{Handler: httpHandler, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 30 * time.Second},
+		socksHandler,
 	)
 	old := m.runtimes[endpoint.ID]
 	m.runtimes[endpoint.ID] = runtime
@@ -305,6 +311,19 @@ func (m *endpointRuntimeManager) WaitQuiescent() error {
 	}
 	<-m.sourcesDone
 	return m.takeSourceError()
+}
+
+// WaitQuiescentContext does not consume ownership on a failed wait.
+func (m *endpointRuntimeManager) WaitQuiescentContext(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	select {
+	case <-m.sourcesDone:
+		return m.takeSourceError()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (m *endpointRuntimeManager) takeSourceError() error {

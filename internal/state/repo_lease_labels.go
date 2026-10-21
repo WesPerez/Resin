@@ -20,6 +20,9 @@ func (r *StateRepo) SetLeaseDisplayNameIfEmpty(ctx context.Context, platformID, 
 		return "", ErrLeaseDisplayNameBusy
 	}
 	defer r.mu.Unlock()
+	if err := r.checkWriteAllowed(); err != nil {
+		return "", err
+	}
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -76,6 +79,9 @@ func (r *StateRepo) LeaseDisplayNames(platformID string) (map[string]string, err
 func (r *StateRepo) SetLeaseDisplayName(platformID, account, name string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.checkWriteAllowed(); err != nil {
+		return err
+	}
 	if name == "" {
 		_, err := r.db.Exec("DELETE FROM lease_display_names WHERE platform_id = ? AND account = ?", platformID, account)
 		return err

@@ -2,6 +2,7 @@ package topology
 
 import (
 	"context"
+	"errors"
 	"log"
 	"runtime"
 	"sync"
@@ -33,8 +34,13 @@ type SubscriptionScheduler struct {
 	// subscription transitions from disabled to enabled.
 	onSubReenabledNode func(hash node.Hash)
 
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	stopCh      chan struct{}
+	wg          sync.WaitGroup
+	lifecycleMu sync.Mutex
+	stopped     bool
+	started     bool
+	stopOnce    sync.Once
+	lateUpdates bool
 }
 
 // SchedulerConfig configures the SubscriptionScheduler.
@@ -71,6 +77,12 @@ func NewSubscriptionScheduler(cfg SchedulerConfig) *SubscriptionScheduler {
 
 // Start launches the background scheduler goroutine.
 func (s *SubscriptionScheduler) Start() {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.stopped || s.started {
+		return
+	}
+	s.started = true
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -80,8 +92,11 @@ func (s *SubscriptionScheduler) Start() {
 
 // Stop signals the scheduler to stop and waits for it to finish.
 func (s *SubscriptionScheduler) Stop() {
-	close(s.stopCh)
+	s.lifecycleMu.Lock()
+	s.stopped = true
+	s.stopOnce.Do(func() { close(s.stopCh) })
 	s.cancelDownload()
+	s.lifecycleMu.Unlock()
 	s.wg.Wait()
 }
 
@@ -114,7 +129,9 @@ func (s *SubscriptionScheduler) ForceRefreshAll() {
 // ForceRefreshAllAsync triggers ForceRefreshAll in a background goroutine.
 // The goroutine is tracked by scheduler waitgroup so Stop() waits for exit.
 func (s *SubscriptionScheduler) ForceRefreshAllAsync() {
-	s.wg.Add(1)
+	if !s.admitUpdate() {
+		return
+	}
 	go func() {
 		defer s.wg.Done()
 		s.ForceRefreshAll()
@@ -190,7 +207,40 @@ func (s *SubscriptionScheduler) runUpdatesWithWorkerLimit(subs []*subscription.S
 // UpdateSubscription fetches and parses outside the lock, then diffs and
 // applies the result under WithSubLock. This keeps the lock scope narrow
 // (no I/O under lock) while still preventing concurrent diff/apply races.
+// admitUpdate registers ownership before dispatch and serializes registration
+// with Stop. Go scheduling after the API handler returns cannot evade the join.
+func (s *SubscriptionScheduler) admitUpdate() bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.stopped {
+		s.lateUpdates = true
+		return false
+	}
+	s.wg.Add(1)
+	return true
+}
+
+// UpdateSubscriptionAsync is the only asynchronous control-plane entry.
+func (s *SubscriptionScheduler) UpdateSubscriptionAsync(sub *subscription.Subscription) error {
+	if !s.admitUpdate() {
+		return errors.New("scheduler: update rejected after stop")
+	}
+	go func() {
+		defer s.wg.Done()
+		s.updateSubscription(sub)
+	}()
+	return nil
+}
+
 func (s *SubscriptionScheduler) UpdateSubscription(sub *subscription.Subscription) {
+	if !s.admitUpdate() {
+		return
+	}
+	defer s.wg.Done()
+	s.updateSubscription(sub)
+}
+
+func (s *SubscriptionScheduler) updateSubscription(sub *subscription.Subscription) {
 	attemptStartedNs := time.Now().UnixNano()
 	attemptSeq := sub.NextAttemptSeq()
 	attemptURL := sub.URL()
@@ -385,6 +435,10 @@ func (s *SubscriptionScheduler) handleUpdateFailure(
 // routable views. Disabling a subscription makes its nodes invisible to
 // platform tag-regex matching; enabling makes them visible again.
 func (s *SubscriptionScheduler) SetSubscriptionEnabled(sub *subscription.Subscription, enabled bool) {
+	if !s.admitUpdate() {
+		return
+	}
+	defer s.wg.Done()
 	wasEnabled := false
 	var candidateHashes []node.Hash
 	wasDisabled := make(map[node.Hash]struct{})
@@ -431,6 +485,10 @@ func (s *SubscriptionScheduler) SetSubscriptionEnabled(sub *subscription.Subscri
 // RenameSubscription updates the subscription name and re-triggers platform
 // re-evaluation for all managed nodes (since tags include the sub name).
 func (s *SubscriptionScheduler) RenameSubscription(sub *subscription.Subscription, newName string) {
+	if !s.admitUpdate() {
+		return
+	}
+	defer s.wg.Done()
 	sub.WithOpLock(func() {
 		sub.SetName(newName)
 		// Re-add all managed hashes to trigger platform re-filter.
@@ -449,4 +507,13 @@ func (s *SubscriptionScheduler) RenameSubscription(sub *subscription.Subscriptio
 
 func (s *SubscriptionScheduler) fetchViaDownloader(url string) ([]byte, error) {
 	return s.downloader.Download(s.downloadCtx, url)
+}
+
+func (s *SubscriptionScheduler) BarrierError() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if !s.stopped || s.lateUpdates {
+		return errors.New("scheduler: lifecycle boundary not certified")
+	}
+	return nil
 }

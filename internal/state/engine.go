@@ -3,6 +3,7 @@ package state
 import (
 	"fmt"
 	"log"
+	"sync"
 
 	"github.com/Resinat/Resin/internal/model"
 )
@@ -40,6 +41,9 @@ type StateEngine struct {
 	dirtyNodeLatency       *DirtySet[NodeLatencyDirtyKey]
 	dirtyLeases            *DirtySet[LeaseDirtyKey]
 	dirtySubscriptionNodes *DirtySet[SubscriptionNodeDirtyKey]
+	mutationMu             sync.Mutex
+	weakSealed             bool
+	lateMarks              bool
 }
 
 // newStateEngine creates a StateEngine with the given repos.
@@ -57,29 +61,83 @@ func newStateEngine(stateRepo *StateRepo, cacheRepo *CacheRepo) *StateEngine {
 
 // --- Weak-persist methods (dirty-mark only) ---
 
-func (e *StateEngine) MarkNodeStatic(hash string)        { e.dirtyNodesStatic.MarkUpsert(hash) }
-func (e *StateEngine) MarkNodeStaticDelete(hash string)  { e.dirtyNodesStatic.MarkDelete(hash) }
-func (e *StateEngine) MarkNodeDynamic(hash string)       { e.dirtyNodesDynamic.MarkUpsert(hash) }
-func (e *StateEngine) MarkNodeDynamicDelete(hash string) { e.dirtyNodesDynamic.MarkDelete(hash) }
+func (e *StateEngine) MarkNodeStatic(hash string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+	e.dirtyNodesStatic.MarkUpsert(hash)
+}
+func (e *StateEngine) MarkNodeStaticDelete(hash string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+	e.dirtyNodesStatic.MarkDelete(hash)
+}
+func (e *StateEngine) MarkNodeDynamic(hash string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+	e.dirtyNodesDynamic.MarkUpsert(hash)
+}
+func (e *StateEngine) MarkNodeDynamicDelete(hash string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+	e.dirtyNodesDynamic.MarkDelete(hash)
+}
 
 func (e *StateEngine) MarkNodeLatency(nodeHash, domain string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+
 	e.dirtyNodeLatency.MarkUpsert(NodeLatencyDirtyKey{NodeHash: nodeHash, Domain: domain})
 }
 func (e *StateEngine) MarkNodeLatencyDelete(nodeHash, domain string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+
 	e.dirtyNodeLatency.MarkDelete(NodeLatencyDirtyKey{NodeHash: nodeHash, Domain: domain})
 }
 
 func (e *StateEngine) MarkLease(platformID, account string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+
 	e.dirtyLeases.MarkUpsert(LeaseDirtyKey{PlatformID: platformID, Account: account})
 }
 func (e *StateEngine) MarkLeaseDelete(platformID, account string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+
 	e.dirtyLeases.MarkDelete(LeaseDirtyKey{PlatformID: platformID, Account: account})
 }
 
 func (e *StateEngine) MarkSubscriptionNode(subID, nodeHash string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+
 	e.dirtySubscriptionNodes.MarkUpsert(SubscriptionNodeDirtyKey{SubscriptionID: subID, NodeHash: nodeHash})
 }
 func (e *StateEngine) MarkSubscriptionNodeDelete(subID, nodeHash string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+
 	e.dirtySubscriptionNodes.MarkDelete(SubscriptionNodeDirtyKey{SubscriptionID: subID, NodeHash: nodeHash})
 }
 
