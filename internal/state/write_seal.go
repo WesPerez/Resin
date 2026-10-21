@@ -14,6 +14,9 @@ var ErrWritesSealed = errors.New("state: authoritative writes are sealed")
 func (r *StateRepo) checkWriteAllowed() error {
 	if r.sealed {
 		r.lateWrites = true
+		if r.onLateWrite != nil {
+			r.onLateWrite()
+		}
 		return ErrWritesSealed
 	}
 	return nil
@@ -29,7 +32,9 @@ func (r *StateRepo) SealStrongWrites() {
 }
 
 func (r *StateRepo) StrongWriteBarrierError() error {
-	r.mu.Lock()
+	if !r.mu.TryLock() {
+		return errors.New("state: strong writer still owns the boundary")
+	}
 	defer r.mu.Unlock()
 	if !r.sealed || r.lateWrites {
 		return errors.New("state: strong write boundary is not certified")
@@ -76,9 +81,14 @@ func (e *StateEngine) CheckpointDurable(ctx context.Context) error {
 // marks never disappear silently: retain dirty work for a failed flush/retry,
 // but their existence invalidates handoff. No disk write is admitted here.
 func (e *StateEngine) admitWeakMark() bool {
+	e.markEntries.Add(1)
+	e.markEpoch.Add(1)
 	e.mutationMu.Lock()
 	if e.weakSealed {
 		e.lateMarks = true
+		if e.onLateMark != nil {
+			e.onLateMark()
+		}
 	}
 	return true
 }
@@ -90,10 +100,51 @@ func (e *StateEngine) SealWeakWrites() {
 }
 
 func (e *StateEngine) WeakWriteBarrierError() error {
-	e.mutationMu.Lock()
+	if !e.mutationMu.TryLock() {
+		return errors.New("state: weak writer still owns the boundary")
+	}
 	defer e.mutationMu.Unlock()
 	if !e.weakSealed || e.lateMarks {
 		return errors.New("state: weak mutation boundary is not certified")
+	}
+	return nil
+}
+
+// FinalizeMaintenance serializes the last certificate write with both mutation
+// gates. Known source lifecycles must already be joined. A rejected late call
+// after this boundary durably invalidates the certificate before it returns;
+// this is a safety latch, not a substitute for joining source ownership.
+// certify/invalidate must not call back into StateEngine or acquire its locks.
+func (e *StateEngine) FinalizeMaintenance(ctx context.Context, certify func() error, invalidate func()) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !e.StateRepo.mu.TryLock() {
+		return errors.New("state: strong finalization boundary occupied")
+	}
+	defer e.StateRepo.mu.Unlock()
+	if !e.mutationMu.TryLock() {
+		return errors.New("state: weak finalization boundary occupied")
+	}
+	defer e.mutationMu.Unlock()
+	strongEpoch, weakEpoch := e.writeEpoch.Load(), e.markEpoch.Load()
+	if e.writeEntries.Load() != 0 || e.markEntries.Load() != 0 || !e.sealed || e.lateWrites || !e.weakSealed || e.lateMarks {
+		return errors.New("state: final maintenance boundary is not certified")
+	}
+	e.onLateWrite, e.onLateMark = invalidate, invalidate
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := certify(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		invalidate()
+		return err
+	}
+	if e.writeEntries.Load() != 0 || e.markEntries.Load() != 0 || e.writeEpoch.Load() != strongEpoch || e.markEpoch.Load() != weakEpoch {
+		invalidate()
+		return errors.New("state: late entry overlapped final acknowledgement")
 	}
 	return nil
 }

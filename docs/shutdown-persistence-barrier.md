@@ -51,7 +51,7 @@ asynchronous feedback registration/stop races, timer recovery joins, retired
 endpoint joins, and post-hijack handler lifetime. No production requests are
 used to manufacture these tests.
 
-## Opt-in maintenance-to-stop candidate (not yet hosted or deployed)
+## Opt-in maintenance-to-stop candidate (not deployed; exact final hosted required)
 
 `RESIN_MAINTENANCE_ENABLED=1` enables authenticated GET/POST
 `/api/v1/system/maintenance` using the nonempty admin Bearer token. A POST
@@ -116,3 +116,37 @@ join and recoverable authoritative state, or an explicitly authorized bounded
 cold-loss/data-repair protocol. No such authorization or proof exists here.
 Production Resin switching remains prohibited. No protection hash, global
 circuit policy, historical lease or normal node is changed by this candidate.
+
+## Final close/certificate decisions (candidate correction)
+
+The actual run() close decision now rejects retained-owner/deadline/final-flush
+failures before evaluating any barrier or closer, including ordinary shutdown.
+It parks with dirty state and DBs owned; a private failed restart fence is
+attempted. Barrier reads use TryLock and context short-circuit. The timeout
+marker writer is joined before finalization. Feedback/scheduler registration,
+strong SQL and weak dirty gates cover the complete durability acknowledgement
+in that lock order; refused late calls synchronously invalidate the marker.
+Failed invalidation retains ownership rather than returning success. These
+latches supplement, never replace, the proven source joins.
+
+Closed DB confirmation uses context-aware quick_check and a second hash/stat,
+rejects unsafe/nonempty WAL, rollback journal and shared-memory sidecars. File
+sync/hash/driver calls can still be stalled by the kernel; the deadline does
+not guarantee a hard exit. A forced kill retains a failed/unknown marker and
+committed SQLite recovery, not the unflushed weak memory. Hosted subprocess
+fixtures kill a failed parked owner and verify startup rejection/read-only
+SQLite integrity; they are not a production systemd interruption proof.
+
+A versioned shared vector is validated using actual Go model.Lease encoding
+and consumed byte-for-byte by the bluegreen Python fixtures. Invalid UTF-8
+is rejected rather than silently normalized. No candidate bootstrap/cutover
+has been authorized for the old 40f source.
+
+Normal flush failure deliberately uses the same presence-only restart fence
+with no transfer nonce; this record is never consumable as maintenance complete.
+A finalizer tracks entry counters/epochs before lock acquisition as well as
+source seals: an entry overlapping durability acknowledgement rejects success.
+A call after the final linearization boundary invalidates before that refused
+call returns; this does not promise that arbitrary future untracked goroutines
+can be joined. Actual source lifecycle joins remain a prerequisite. Consumers
+must bind a clean stopped exit (not just file phase) and exact Docker instance.

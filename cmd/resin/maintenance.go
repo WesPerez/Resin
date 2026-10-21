@@ -18,6 +18,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Resinat/Resin/internal/buildinfo"
 	"github.com/Resinat/Resin/internal/model"
@@ -37,6 +38,7 @@ type maintenanceRecord struct {
 	StartedAtNs int64                 `json:"started_at_ns"`
 	Phase       string                `json:"phase"`
 	LeaseDigest string                `json:"lease_digest,omitempty"`
+	LeaseFormat string                `json:"lease_format"`
 	LeaseCount  int                   `json:"lease_count"`
 	Databases   []maintenanceDatabase `json:"databases,omitempty"`
 }
@@ -77,7 +79,7 @@ func newMaintenanceController(stateDir, token string, enabled bool) *maintenance
 	return &maintenanceController{path: maintenanceMarker(stateDir), token: token,
 		enabled: enabled, install: installMaintenanceRecord, requested: make(chan struct{}),
 		record: maintenanceRecord{Version: 1, SourceSHA: buildinfo.GitCommit,
-			PID: os.Getpid(), StartedAtNs: time.Now().UnixNano(), Phase: "running"}}
+			PID: os.Getpid(), StartedAtNs: time.Now().UnixNano(), Phase: "running", LeaseFormat: "resin-lease-seven/v1"}}
 }
 
 func writeMaintenanceRecord(path string, record maintenanceRecord) error {
@@ -221,6 +223,29 @@ func (m *maintenanceController) wrapHTTP(next http.Handler) http.Handler {
 	})
 }
 
+// Only the owner, with write gates held and the timeout writer joined, may
+// call complete. Check the one deadline on both sides of the durability ack.
+func (m *maintenanceController) complete(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if m.record.Phase != "persisted" || len(m.record.Databases) != 2 || m.record.LeaseDigest == "" {
+		return errors.New("incomplete maintenance cannot be certified")
+	}
+	m.record.Phase = "complete"
+	if err := writeMaintenanceRecord(m.path, m.record); err != nil {
+		m.record.Phase = "failed"
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		m.record.Phase = "failed"
+		return errors.Join(err, writeMaintenanceRecord(m.path, m.record))
+	}
+	return nil
+}
+
 type maintenanceSOCKS struct {
 	controller *maintenanceController
 	next       inboundConnHandler
@@ -316,6 +341,12 @@ func (a *resinApp) verifyMaintenanceReferences(leases []model.Lease) error {
 // canonicalLeaseDigest does not normalize identifiers or timestamps. JSON
 // integer encoding retains nanosecond identity without float64 conversion.
 func canonicalLeaseDigest(leases []model.Lease) (string, error) {
+	for _, lease := range leases {
+		if !utf8.ValidString(lease.PlatformID) || !utf8.ValidString(lease.Account) ||
+			!utf8.ValidString(lease.NodeHash) || !utf8.ValidString(lease.EgressIP) {
+			return "", errors.New("lease identity contains invalid UTF-8")
+		}
+	}
 	sort.Slice(leases, func(i, j int) bool {
 		if leases[i].PlatformID == leases[j].PlatformID {
 			return leases[i].Account < leases[j].Account
@@ -361,13 +392,23 @@ func syncMaintenanceFiles(paths ...string) error {
 
 // Bind complete to the closed, fsynced file set, not just DirtyCount or SQL
 // commit. A nonempty remaining WAL is not a closed-file snapshot boundary.
-func (m *maintenanceController) bindClosedDatabases(paths ...string) error {
+func (m *maintenanceController) bindClosedDatabases(ctx context.Context, paths ...string) error {
 	var databases []maintenanceDatabase
 	for _, path := range paths {
-		if wal, err := os.Stat(path + "-wal"); err == nil && wal.Size() != 0 {
-			return errors.New("nonempty WAL remains after database close")
-		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := ctx.Err(); err != nil {
 			return err
+		}
+		for _, suffix := range []string{"-wal", "-journal", "-shm"} {
+			info, err := os.Lstat(path + suffix)
+			if err == nil && (!info.Mode().IsRegular() || info.Size() != 0) {
+				return errors.New("nonempty or unsafe SQLite sidecar remains after close")
+			} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+		before, err := os.Lstat(path)
+		if err != nil || !before.Mode().IsRegular() {
+			return errors.Join(err, errors.New("unsafe closed database file"))
 		}
 		file, err := os.Open(path)
 		if err != nil {
@@ -392,13 +433,31 @@ func (m *maintenanceController) bindClosedDatabases(paths ...string) error {
 			return err
 		}
 		var check string
-		checkErr := db.QueryRow("PRAGMA quick_check").Scan(&check)
+		checkErr := db.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&check)
 		closeDBErr := db.Close()
 		if err := errors.Join(checkErr, closeDBErr); err != nil {
 			return err
 		}
 		if check != "ok" {
 			return errors.New("closed database integrity confirmation failed")
+		}
+		// Integrity reads cannot substitute for a stable file identity. Bind the
+		// same inode and independently hash again after the read-only check.
+		after, err := os.Lstat(path)
+		if err != nil || !os.SameFile(before, after) || after.Size() != info.Size() || after.ModTime() != info.ModTime() {
+			return errors.Join(err, errors.New("closed database changed during confirmation"))
+		}
+		again, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		second := sha256.New()
+		_, readErr = io.Copy(second, again)
+		if err := errors.Join(readErr, again.Close(), ctx.Err()); err != nil {
+			return err
+		}
+		if hex.EncodeToString(second.Sum(nil)) != hex.EncodeToString(digest.Sum(nil)) {
+			return errors.New("closed database digest changed during confirmation")
 		}
 		databases = append(databases, maintenanceDatabase{Path: path, Size: info.Size(), SHA256: hex.EncodeToString(digest.Sum(nil))})
 	}
@@ -420,10 +479,48 @@ func (m *maintenanceController) timeoutFailure(ctx context.Context, stopped <-ch
 }
 
 func (a *resinApp) maintenanceBarrierError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	var feedbackErr error
 	if a.healthFeedback != nil {
 		feedbackErr = a.healthFeedback.StopAndWait(ctx)
 	}
 	return errors.Join(ctx.Err(), a.engine.StrongWriteBarrierError(), a.engine.WeakWriteBarrierError(),
 		a.topoRuntime.scheduler.BarrierError(), feedbackErr)
+}
+
+// Lock order: feedback registration -> scheduler registration -> strong SQL
+// gate -> weak dirty gate -> marker. No callback under these gates reenters a
+// source. All accepted source work must already have been joined by shutdown.
+func (a *resinApp) finalizeMaintenance(ctx context.Context) error {
+	invalidate := func() {
+		if err := a.maintenance.phase("failed"); err != nil {
+			// Cannot acknowledge a refused late source with a stale complete file.
+			// Keep ownership for explicit recovery rather than exiting success.
+			select {}
+		}
+	}
+	finalizeEngine := func() error {
+		return a.engine.FinalizeMaintenance(ctx,
+			func() error { return a.maintenance.complete(ctx) }, invalidate)
+	}
+	finalizeScheduler := func() error {
+		return a.topoRuntime.scheduler.FinalizeStopped(finalizeEngine, invalidate)
+	}
+	var err error
+	if a.healthFeedback != nil {
+		err = a.healthFeedback.FinalizeStopped(finalizeScheduler, invalidate)
+	} else {
+		err = finalizeScheduler()
+	}
+	if err != nil {
+		return errors.Join(err, a.maintenance.phase("failed"))
+	}
+	a.maintenance.mu.Lock()
+	defer a.maintenance.mu.Unlock()
+	if a.maintenance.record.Phase != "complete" || ctx.Err() != nil {
+		return errors.Join(ctx.Err(), errors.New("terminal maintenance certificate invalidated"))
+	}
+	return nil
 }

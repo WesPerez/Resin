@@ -27,7 +27,7 @@ func maintenanceLeaseFixture(t *testing.T) (*resinApp, model.Lease, []string) {
 	if err := e.UpsertPlatform(model.Platform{ID: lease.PlatformID, Name: "Fixture", StickyTTLNs: int64(time.Hour), ReverseProxyMissAction: "TREAT_AS_EMPTY", AllocationPolicy: "BALANCED"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.UpsertSubscription(model.Subscription{ID: "sub", Name: "Sub", URL: "https://fixture.invalid", Enabled: true, CreatedAtNs: 1, UpdatedAtNs: 1}); err != nil {
+	if err := e.UpsertSubscription(model.Subscription{ID: "sub", Name: "Sub", URL: "https://fixture.invalid", UpdateIntervalNs: int64(time.Minute), Enabled: true, CreatedAtNs: 1, UpdatedAtNs: 1}); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.BulkUpsertNodesStatic([]model.NodeStatic{{Hash: lease.NodeHash, RawOptions: json.RawMessage(`{"type":"http","server":"127.0.0.1","server_port":1}`), CreatedAtNs: 1}}); err != nil {

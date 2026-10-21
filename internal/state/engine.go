@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Resinat/Resin/internal/model"
 )
@@ -44,6 +45,9 @@ type StateEngine struct {
 	mutationMu             sync.Mutex
 	weakSealed             bool
 	lateMarks              bool
+	onLateMark             func()
+	markEpoch              atomic.Uint64
+	markEntries            atomic.Int64
 }
 
 // newStateEngine creates a StateEngine with the given repos.
@@ -66,6 +70,7 @@ func (e *StateEngine) MarkNodeStatic(hash string) {
 		return
 	}
 	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
 	e.dirtyNodesStatic.MarkUpsert(hash)
 }
 func (e *StateEngine) MarkNodeStaticDelete(hash string) {
@@ -73,6 +78,7 @@ func (e *StateEngine) MarkNodeStaticDelete(hash string) {
 		return
 	}
 	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
 	e.dirtyNodesStatic.MarkDelete(hash)
 }
 func (e *StateEngine) MarkNodeDynamic(hash string) {
@@ -80,6 +86,7 @@ func (e *StateEngine) MarkNodeDynamic(hash string) {
 		return
 	}
 	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
 	e.dirtyNodesDynamic.MarkUpsert(hash)
 }
 func (e *StateEngine) MarkNodeDynamicDelete(hash string) {
@@ -87,6 +94,7 @@ func (e *StateEngine) MarkNodeDynamicDelete(hash string) {
 		return
 	}
 	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
 	e.dirtyNodesDynamic.MarkDelete(hash)
 }
 
@@ -95,6 +103,7 @@ func (e *StateEngine) MarkNodeLatency(nodeHash, domain string) {
 		return
 	}
 	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
 
 	e.dirtyNodeLatency.MarkUpsert(NodeLatencyDirtyKey{NodeHash: nodeHash, Domain: domain})
 }
@@ -103,6 +112,7 @@ func (e *StateEngine) MarkNodeLatencyDelete(nodeHash, domain string) {
 		return
 	}
 	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
 
 	e.dirtyNodeLatency.MarkDelete(NodeLatencyDirtyKey{NodeHash: nodeHash, Domain: domain})
 }
@@ -112,6 +122,7 @@ func (e *StateEngine) MarkLease(platformID, account string) {
 		return
 	}
 	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
 
 	e.dirtyLeases.MarkUpsert(LeaseDirtyKey{PlatformID: platformID, Account: account})
 }
@@ -120,6 +131,7 @@ func (e *StateEngine) MarkLeaseDelete(platformID, account string) {
 		return
 	}
 	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
 
 	e.dirtyLeases.MarkDelete(LeaseDirtyKey{PlatformID: platformID, Account: account})
 }
@@ -129,6 +141,7 @@ func (e *StateEngine) MarkSubscriptionNode(subID, nodeHash string) {
 		return
 	}
 	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
 
 	e.dirtySubscriptionNodes.MarkUpsert(SubscriptionNodeDirtyKey{SubscriptionID: subID, NodeHash: nodeHash})
 }
@@ -137,6 +150,7 @@ func (e *StateEngine) MarkSubscriptionNodeDelete(subID, nodeHash string) {
 		return
 	}
 	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
 
 	e.dirtySubscriptionNodes.MarkDelete(SubscriptionNodeDirtyKey{SubscriptionID: subID, NodeHash: nodeHash})
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -103,7 +104,7 @@ func TestCheckpointFailureOrDeadlineNeverCertifies(t *testing.T) {
 func TestEveryStrongMutationIsSealed(t *testing.T) {
 	r := newTestStateRepo(t)
 	p := model.Platform{ID: "p", Name: "Fixture", ReverseProxyMissAction: "TREAT_AS_EMPTY", AllocationPolicy: "BALANCED"}
-	sub := model.Subscription{ID: "s", Name: "Sub", URL: "https://fixture.invalid"}
+	sub := model.Subscription{ID: "s", Name: "Sub", URL: "https://fixture.invalid", UpdateIntervalNs: int64(time.Minute)}
 	ep := model.Endpoint{ID: "ep", Port: 1234}
 	rule := model.AccountHeaderRule{URLPrefix: "https://fixture.invalid", Headers: []string{"X-Account"}}
 	r.SealStrongWrites()
@@ -132,5 +133,89 @@ func TestEveryStrongMutationIsSealed(t *testing.T) {
 	}
 	if err := r.StrongWriteBarrierError(); err == nil {
 		t.Fatal("late write attempts certified")
+	}
+}
+
+func TestBarrierReadsDoNotWaitForOwnedWriter(t *testing.T) {
+	e, _, _ := newTestEngine(t)
+	e.StateRepo.mu.Lock()
+	if err := e.StrongWriteBarrierError(); err == nil {
+		t.Fatal("owned strong writer certified")
+	}
+	e.StateRepo.mu.Unlock()
+	e.mutationMu.Lock()
+	if err := e.WeakWriteBarrierError(); err == nil {
+		t.Fatal("owned weak writer certified")
+	}
+	e.mutationMu.Unlock()
+}
+
+func TestFinalCertificateSerializedAndLateCallsInvalidate(t *testing.T) {
+	for _, strong := range []bool{false, true} {
+		e, _, _ := newTestEngine(t)
+		e.SealStrongWrites()
+		e.SealWeakWrites()
+		entered, release, writeDone := make(chan struct{}), make(chan struct{}), make(chan struct{})
+		var certified, invalidated atomic.Bool
+		result := make(chan error, 1)
+		go func() {
+			result <- e.FinalizeMaintenance(context.Background(), func() error {
+				close(entered)
+				<-release
+				certified.Store(true)
+				return nil
+			}, func() { invalidated.Store(true) })
+		}()
+		<-entered
+		go func() {
+			if strong {
+				_ = e.SetLeaseDisplayName("p", "a", "late")
+			} else {
+				e.MarkLease("p", "a")
+			}
+			close(writeDone)
+		}()
+		deadline := time.Now().Add(time.Second)
+		for (strong && e.writeEntries.Load() == 0) || (!strong && e.markEntries.Load() == 0) {
+			if time.Now().After(deadline) {
+				t.Fatal("late entry did not register")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		select {
+		case <-writeDone:
+			t.Fatal("write passed held final gate")
+		default:
+		}
+		close(release)
+		if err := <-result; err == nil {
+			t.Fatal("overlapping late entry produced successful finalization")
+		}
+		<-writeDone
+		if !certified.Load() || !invalidated.Load() {
+			t.Fatal("late call did not invalidate certificate")
+		}
+		if !strong && e.DirtyCount() != 1 {
+			t.Fatal("late dirty work disappeared")
+		}
+	}
+}
+
+func TestFinalCertificateRejectsLateOrExpiredAck(t *testing.T) {
+	e, _, _ := newTestEngine(t)
+	e.SealStrongWrites()
+	e.SealWeakWrites()
+	e.MarkLease("p", "late")
+	called := false
+	if err := e.FinalizeMaintenance(context.Background(), func() error { called = true; return nil }, func() {}); err == nil || called {
+		t.Fatal("late source certified")
+	}
+	e, _, _ = newTestEngine(t)
+	e.SealStrongWrites()
+	e.SealWeakWrites()
+	ctx, cancel := context.WithCancel(context.Background())
+	invalidated := false
+	if err := e.FinalizeMaintenance(ctx, func() error { cancel(); return nil }, func() { invalidated = true }); !errors.Is(err, context.Canceled) || !invalidated {
+		t.Fatal("expired ack certified")
 	}
 }

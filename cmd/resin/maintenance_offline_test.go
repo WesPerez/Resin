@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,21 +31,34 @@ func TestMaintenanceClosedDatabasesIntegrityManifest(t *testing.T) {
 	if err := syncMaintenanceFiles(paths...); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.bindClosedDatabases(paths...); err != nil {
+	if err := m.bindClosedDatabases(context.Background(), paths...); err != nil {
 		t.Fatal(err)
 	}
 	if len(m.record.Databases) != 2 {
 		t.Fatal("not a two database group")
 	}
-	for _, d := range m.record.Databases {
-		if len(d.SHA256) != 64 || d.Size == 0 {
-			t.Fatal("file identity missing")
+	for i, d := range m.record.Databases {
+		body, err := os.ReadFile(paths[i])
+		digest := sha256.Sum256(body)
+		if err != nil || d.Path != paths[i] || d.SHA256 != hex.EncodeToString(digest[:]) || d.Size != int64(len(body)) {
+			t.Fatal("file identity does not match independent read")
+		}
+	}
+	for _, suffix := range []string{"-shm", "-journal"} {
+		if err := os.WriteFile(paths[0]+suffix, []byte("pending"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.bindClosedDatabases(context.Background(), paths...); err == nil {
+			t.Fatal("unsafe sidecar certified")
+		}
+		if err := os.Remove(paths[0] + suffix); err != nil {
+			t.Fatal(err)
 		}
 	}
 	if err := os.WriteFile(paths[0]+"-wal", []byte("pending"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.bindClosedDatabases(paths...); err == nil {
+	if err := m.bindClosedDatabases(context.Background(), paths...); err == nil {
 		t.Fatal("nonempty WAL certified")
 	}
 	if err := os.Remove(paths[0] + "-wal"); err != nil {
@@ -52,19 +67,19 @@ func TestMaintenanceClosedDatabasesIntegrityManifest(t *testing.T) {
 	if err := os.WriteFile(paths[1], []byte("not a database"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.bindClosedDatabases(paths...); err == nil {
+	if err := m.bindClosedDatabases(context.Background(), paths...); err == nil {
 		t.Fatal("corrupt closed DB certified")
 	}
 	if err := os.WriteFile(paths[1], nil, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.bindClosedDatabases(paths...); err == nil {
+	if err := m.bindClosedDatabases(context.Background(), paths...); err == nil {
 		t.Fatal("empty closed DB certified")
 	}
 	if err := os.Remove(paths[1]); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.bindClosedDatabases(paths...); err == nil {
+	if err := m.bindClosedDatabases(context.Background(), paths...); err == nil {
 		t.Fatal("missing closed DB certified")
 	}
 }

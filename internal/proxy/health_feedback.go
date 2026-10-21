@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Resinat/Resin/internal/node"
@@ -16,13 +17,16 @@ import (
 // Call StopAndWait only AFTER all owning handlers have stopped. It does not
 // drain connections or background topology workers on behalf of the caller.
 type HealthFeedbackBarrier struct {
-	target   HealthRecorder
-	mu       sync.Mutex
-	wg       sync.WaitGroup
-	closed   bool
-	late     uint64
-	waitOnce sync.Once
-	done     chan struct{}
+	target     HealthRecorder
+	mu         sync.Mutex
+	wg         sync.WaitGroup
+	closed     bool
+	late       uint64
+	waitOnce   sync.Once
+	done       chan struct{}
+	onLate     func()
+	entryEpoch atomic.Uint64
+	entries    atomic.Int64
 }
 
 func NewHealthFeedbackBarrier(target HealthRecorder) *HealthFeedbackBarrier {
@@ -30,10 +34,16 @@ func NewHealthFeedbackBarrier(target HealthRecorder) *HealthFeedbackBarrier {
 }
 
 func (b *HealthFeedbackBarrier) begin() bool {
+	b.entries.Add(1)
+	b.entryEpoch.Add(1)
+	defer b.entries.Add(-1)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.closed {
 		b.late++
+		if b.onLate != nil {
+			b.onLate()
+		}
 		return false
 	}
 	if b.target == nil {
@@ -113,6 +123,34 @@ func (b *HealthFeedbackBarrier) StopAndWait(ctx context.Context) error {
 	defer b.mu.Unlock()
 	if b.late != 0 {
 		return fmt.Errorf("proxy: %d health feedback calls arrived after the barrier closed", b.late)
+	}
+	return nil
+}
+
+// FinalizeStopped holds the registration gate while the owner certifies its
+// other stopped sources. It never waits for work: StopAndWait must have joined
+// it first. next/invalidate must not reenter this feedback barrier.
+func (b *HealthFeedbackBarrier) FinalizeStopped(next func() error, invalidate func()) error {
+	if !b.mu.TryLock() {
+		return fmt.Errorf("proxy: final feedback boundary occupied")
+	}
+	defer b.mu.Unlock()
+	select {
+	case <-b.done:
+	default:
+		return fmt.Errorf("proxy: feedback still owns work")
+	}
+	epoch := b.entryEpoch.Load()
+	if b.entries.Load() != 0 || !b.closed || b.late != 0 {
+		return fmt.Errorf("proxy: final feedback boundary not certified")
+	}
+	b.onLate = invalidate
+	if err := next(); err != nil {
+		return err
+	}
+	if b.entries.Load() != 0 || b.entryEpoch.Load() != epoch {
+		invalidate()
+		return fmt.Errorf("proxy: late feedback entry overlapped certificate")
 	}
 	return nil
 }

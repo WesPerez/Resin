@@ -6,6 +6,7 @@ import (
 	"log"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Resinat/Resin/internal/netutil"
@@ -34,13 +35,16 @@ type SubscriptionScheduler struct {
 	// subscription transitions from disabled to enabled.
 	onSubReenabledNode func(hash node.Hash)
 
-	stopCh      chan struct{}
-	wg          sync.WaitGroup
-	lifecycleMu sync.Mutex
-	stopped     bool
-	started     bool
-	stopOnce    sync.Once
-	lateUpdates bool
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
+	lifecycleMu  sync.Mutex
+	stopped      bool
+	started      bool
+	stopOnce     sync.Once
+	lateUpdates  bool
+	onLateUpdate func()
+	entryEpoch   atomic.Uint64
+	entries      atomic.Int64
 }
 
 // SchedulerConfig configures the SubscriptionScheduler.
@@ -210,10 +214,16 @@ func (s *SubscriptionScheduler) runUpdatesWithWorkerLimit(subs []*subscription.S
 // admitUpdate registers ownership before dispatch and serializes registration
 // with Stop. Go scheduling after the API handler returns cannot evade the join.
 func (s *SubscriptionScheduler) admitUpdate() bool {
+	s.entries.Add(1)
+	s.entryEpoch.Add(1)
+	defer s.entries.Add(-1)
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 	if s.stopped {
 		s.lateUpdates = true
+		if s.onLateUpdate != nil {
+			s.onLateUpdate()
+		}
 		return false
 	}
 	s.wg.Add(1)
@@ -510,10 +520,35 @@ func (s *SubscriptionScheduler) fetchViaDownloader(url string) ([]byte, error) {
 }
 
 func (s *SubscriptionScheduler) BarrierError() error {
-	s.lifecycleMu.Lock()
+	if !s.lifecycleMu.TryLock() {
+		return errors.New("scheduler: lifecycle boundary occupied")
+	}
 	defer s.lifecycleMu.Unlock()
 	if !s.stopped || s.lateUpdates {
 		return errors.New("scheduler: lifecycle boundary not certified")
+	}
+	return nil
+}
+
+// FinalizeStopped pins the registration latch across the terminal certificate.
+// The owner already called Stop and joined accepted work. next/invalidate must
+// not call back into this scheduler. A later refused call invalidates first.
+func (s *SubscriptionScheduler) FinalizeStopped(next func() error, invalidate func()) error {
+	if !s.lifecycleMu.TryLock() {
+		return errors.New("scheduler: final boundary occupied")
+	}
+	defer s.lifecycleMu.Unlock()
+	epoch := s.entryEpoch.Load()
+	if s.entries.Load() != 0 || !s.stopped || s.lateUpdates {
+		return errors.New("scheduler: final boundary not certified")
+	}
+	s.onLateUpdate = invalidate
+	if err := next(); err != nil {
+		return err
+	}
+	if s.entries.Load() != 0 || s.entryEpoch.Load() != epoch {
+		invalidate()
+		return errors.New("scheduler: late entry overlapped certificate")
 	}
 	return nil
 }

@@ -16,6 +16,9 @@ var ErrLeaseDisplayNameBusy = errors.New("lease display name storage busy")
 // Names describe a stable application key and retain the existing lifetime
 // contract across expiry/renewal. This operation cannot replace a manual name.
 func (r *StateRepo) SetLeaseDisplayNameIfEmpty(ctx context.Context, platformID, account, name string) (string, error) {
+	r.writeEntries.Add(1)
+	r.writeEpoch.Add(1)
+	defer r.writeEntries.Add(-1)
 	if !r.mu.TryLock() {
 		return "", ErrLeaseDisplayNameBusy
 	}
@@ -77,6 +80,9 @@ func (r *StateRepo) LeaseDisplayNames(platformID string) (map[string]string, err
 // SetLeaseDisplayName only updates strong-persist display metadata, never the
 // router or its weak-persist lease cache. Empty names remove the override.
 func (r *StateRepo) SetLeaseDisplayName(platformID, account, name string) error {
+	r.writeEntries.Add(1)
+	r.writeEpoch.Add(1)
+	defer r.writeEntries.Add(-1)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.checkWriteAllowed(); err != nil {

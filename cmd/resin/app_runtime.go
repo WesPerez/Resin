@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -112,38 +113,39 @@ func run() error {
 		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 	}
 	defer cancel()
+	stopTimeoutWatch := func() {}
 	if maintenance {
 		stopped, done := make(chan struct{}), make(chan struct{})
 		go app.maintenance.timeoutFailure(ctx, stopped, done)
-		defer func() { close(stopped); <-done }()
+		var once sync.Once
+		stopTimeoutWatch = func() { once.Do(func() { close(stopped); <-done }) }
+		defer stopTimeoutWatch()
 	}
 	shutdownErr := app.shutdown(ctx, maintenance)
 	// Failure is not permission to close a DB under a still-owned writer, or
 	// discard dirty work after a failed final transaction. Keep the source
 	// parked behind its restart fence for explicit recovery/force-stop.
-	if maintenance && errors.Join(runtimeErr, shutdownErr, app.maintenanceBarrierError(ctx)) != nil {
-		_ = app.maintenance.phase("failed")
-		log.Println("Maintenance failed; source ownership retained, no database close or handoff")
-		select {} // intentional fail-closed ownership, not a successful drain wait
-	}
-	if errors.Is(shutdownErr, errShutdownOwnershipRetained) {
-		log.Println("Shutdown deadline expired; source ownership retained, databases remain open")
-		select {}
-	}
-
-	closeErr := dbCloser.Close()
+	closeErr := closeShutdownDatabases(ctx, maintenance, runtimeErr, shutdownErr,
+		func() error { return app.maintenanceBarrierError(ctx) }, dbCloser.Close, func() {
+			_ = app.maintenance.phase("failed")
+			log.Println("Shutdown failed; source ownership/dirty state retained, databases remain open")
+			select {} // explicit owner recovery, never successful exit
+		})
 	if maintenance {
-		closeErr = errors.Join(closeErr, ctx.Err(), app.maintenanceBarrierError(ctx))
+		closeErr = errors.Join(closeErr, app.maintenanceBarrierError(ctx))
 		if errors.Join(runtimeErr, shutdownErr, closeErr) == nil {
 			closeErr = syncMaintenanceFiles(filepath.Join(envCfg.StateDir, "state.db"), filepath.Join(envCfg.CacheDir, "cache.db"))
 			if closeErr == nil {
-				closeErr = app.maintenance.bindClosedDatabases(filepath.Join(envCfg.StateDir, "state.db"), filepath.Join(envCfg.CacheDir, "cache.db"))
+				closeErr = app.maintenance.bindClosedDatabases(ctx, filepath.Join(envCfg.StateDir, "state.db"), filepath.Join(envCfg.CacheDir, "cache.db"))
 			}
 		}
 		if errors.Join(runtimeErr, shutdownErr, closeErr) == nil {
-			closeErr = errors.Join(ctx.Err(), app.maintenanceBarrierError(ctx))
+			// Join the timeout writer BEFORE the terminal certificate. Its result
+			// is latched in the controller, never changed after successful return.
+			stopTimeoutWatch()
+			closeErr = app.maintenanceBarrierError(ctx)
 			if closeErr == nil {
-				closeErr = app.maintenance.phase("complete")
+				closeErr = app.finalizeMaintenance(ctx)
 			}
 		} else {
 			closeErr = errors.Join(closeErr, app.maintenance.phase("failed"))
@@ -636,6 +638,30 @@ func formatListenURL(listenAddress string, port int) string {
 }
 
 var errShutdownOwnershipRetained = errors.New("shutdown deadline expired with retained source ownership")
+var errShutdownPersistenceRetained = errors.New("shutdown persistence failed with retained dirty state")
+
+// This is run's actual close decision, injectable to verify that no closer or
+// barrier is called on a retained source. A production retain never returns.
+// Never eagerly evaluate a locked barrier after timeout or failed final flush.
+func closeShutdownDatabases(ctx context.Context, maintenance bool, runtimeErr, shutdownErr error,
+	barrier, closeDB func() error, retain func()) error {
+	err := errors.Join(ctx.Err(), shutdownErr)
+	if maintenance {
+		err = errors.Join(err, runtimeErr)
+	}
+	if ctx.Err() != nil || errors.Is(shutdownErr, errShutdownOwnershipRetained) ||
+		errors.Is(shutdownErr, errShutdownPersistenceRetained) || (maintenance && err != nil) {
+		retain()
+		return errShutdownOwnershipRetained // injected test retain may return
+	}
+	if maintenance {
+		if err := barrier(); err != nil {
+			retain()
+			return errors.Join(err, errShutdownOwnershipRetained)
+		}
+	}
+	return closeDB()
+}
 
 // The deadline bounds the owner's wait, not an unsafe close of live sources.
 // A synchronous Stop/SQL driver may ignore cancellation; its single owned
@@ -774,7 +800,8 @@ func (a *resinApp) shutdownJoined(ctx context.Context, maintenance bool) error {
 	if drainOnly {
 		a.flushWorker.Stop()
 	} else if err := a.flushWorker.StopAndFlush(); err != nil {
-		shutdownErrs = append(shutdownErrs, fmt.Errorf("authoritative state flush: %w", err))
+		shutdownErrs = append(shutdownErrs, errors.Join(errShutdownPersistenceRetained,
+			fmt.Errorf("authoritative state flush: %w", err)))
 	}
 	if maintenance {
 		if err := a.engine.CheckpointDurable(ctx); err != nil {
