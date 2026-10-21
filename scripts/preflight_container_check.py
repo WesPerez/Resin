@@ -29,7 +29,7 @@ def check_packaged_fence(image, data, fixed):
             target.write_bytes(body)
             target.chmod(0o600)
         fixed_args = ['docker', 'create', '--pull', 'never', '--network', 'none', '--read-only',
-                      '--user', '0:0', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',
+                      '--user', f'{os.getuid()}:{os.getgid()}', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',
                       '--restart', 'no', '--log-driver', 'none', '--pids-limit', '128',
                       '--memory', '512m', '--memory-swap', '512m', '--cpus', '1', '--shm-size', '1m']
         for kind, dest in (('state','/var/lib/resin'), ('cache','/var/cache/resin')):
@@ -52,7 +52,9 @@ def check_packaged_fence(image, data, fixed):
                     ready = json.loads(status.stdout)
                     break
                 time.sleep(.1)
-            assert ready and ready['phase']=='fenced_ready', 'packaged fenced readiness absent'
+            info = json.loads(call(['docker','inspect',cid]).stdout)[0]
+            assert info['Config']['User']==f'{os.getuid()}:{os.getgid()}'
+            assert ready and ready['phase']=='fenced_ready', f"packaged fenced readiness absent (status={info['State']['Status']}, exit={info['State']['ExitCode']})"
             assert ready['candidate_sha']==os.environ['GITHUB_SHA']
             assert ready['transfer_id']==fixed['transfer_id'] and not ready['writes_may_have_started']
             assert not ready.get('activation_nonce')
