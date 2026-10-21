@@ -82,14 +82,14 @@ func (r *StateRepo) GetSystemConfig() (*config.RuntimeConfig, int, error) {
 
 // SaveSystemConfig persists the runtime config with the given version.
 func (r *StateRepo) SaveSystemConfig(cfg *config.RuntimeConfig, version int, updatedAtNs int64) error {
+	r.writeEntries.Add(1)
+	r.writeEpoch.Add(1)
+	defer r.writeEntries.Add(-1)
 	data, err := json.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal system_config: %w", err)
 	}
 
-	r.writeEntries.Add(1)
-	r.writeEpoch.Add(1)
-	defer r.writeEntries.Add(-1)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.checkWriteAllowed(); err != nil {
@@ -112,6 +112,9 @@ func (r *StateRepo) SaveSystemConfig(cfg *config.RuntimeConfig, version int, upd
 // UpsertPlatform inserts or updates a platform by ID.
 // If the name collides with a different platform's name, ErrConflict is returned.
 func (r *StateRepo) UpsertPlatform(p model.Platform) error {
+	r.writeEntries.Add(1)
+	r.writeEpoch.Add(1)
+	defer r.writeEntries.Add(-1)
 	p.Name = platform.NormalizePlatformName(p.Name)
 	if err := platform.ValidatePlatformName(p.Name); err != nil {
 		return fmt.Errorf("platform name: %w", err)
@@ -160,9 +163,6 @@ func (r *StateRepo) UpsertPlatform(p model.Platform) error {
 		return fmt.Errorf("encode platform %s region_filters: %w", p.ID, err)
 	}
 
-	r.writeEntries.Add(1)
-	r.writeEpoch.Add(1)
-	defer r.writeEntries.Add(-1)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.checkWriteAllowed(); err != nil {
@@ -317,6 +317,9 @@ func (r *StateRepo) ListPlatforms() ([]model.Platform, error) {
 // UpsertSubscription inserts or updates a subscription by ID.
 // On update, created_at_ns is preserved (not overwritten).
 func (r *StateRepo) UpsertSubscription(s model.Subscription) error {
+	r.writeEntries.Add(1)
+	r.writeEpoch.Add(1)
+	defer r.writeEntries.Add(-1)
 	// Validate minimum update interval (30 seconds).
 	const minInterval = int64(30 * time.Second)
 	if s.UpdateIntervalNs < minInterval {
@@ -329,9 +332,6 @@ func (r *StateRepo) UpsertSubscription(s model.Subscription) error {
 		return fmt.Errorf("source_type: must be remote or local, got %q", s.SourceType)
 	}
 
-	r.writeEntries.Add(1)
-	r.writeEpoch.Add(1)
-	defer r.writeEntries.Add(-1)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.checkWriteAllowed(); err != nil {
@@ -569,14 +569,14 @@ func scanEndpoint(scan endpointScanner) (model.Endpoint, error) {
 // EnsureAccountHeaderRule inserts a rule by url_prefix only when it does not
 // already exist and reports whether the row was newly created.
 func (r *StateRepo) EnsureAccountHeaderRule(rule model.AccountHeaderRule) (bool, error) {
+	r.writeEntries.Add(1)
+	r.writeEpoch.Add(1)
+	defer r.writeEntries.Add(-1)
 	headersJSON, err := encodeStringSliceJSON(rule.Headers)
 	if err != nil {
 		return false, fmt.Errorf("encode account header rule %q headers: %w", rule.URLPrefix, err)
 	}
 
-	r.writeEntries.Add(1)
-	r.writeEpoch.Add(1)
-	defer r.writeEntries.Add(-1)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.checkWriteAllowed(); err != nil {
@@ -598,14 +598,14 @@ func (r *StateRepo) EnsureAccountHeaderRule(rule model.AccountHeaderRule) (bool,
 // UpsertAccountHeaderRuleWithCreated inserts or updates a rule by url_prefix and
 // reports whether the row was newly created.
 func (r *StateRepo) UpsertAccountHeaderRuleWithCreated(rule model.AccountHeaderRule) (bool, error) {
+	r.writeEntries.Add(1)
+	r.writeEpoch.Add(1)
+	defer r.writeEntries.Add(-1)
 	headersJSON, err := encodeStringSliceJSON(rule.Headers)
 	if err != nil {
 		return false, fmt.Errorf("encode account header rule %q headers: %w", rule.URLPrefix, err)
 	}
 
-	r.writeEntries.Add(1)
-	r.writeEpoch.Add(1)
-	defer r.writeEntries.Add(-1)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.checkWriteAllowed(); err != nil {
