@@ -3,6 +3,8 @@ package state
 import (
 	"fmt"
 	"log"
+	"sync"
+	"sync/atomic"
 
 	"github.com/Resinat/Resin/internal/model"
 )
@@ -34,12 +36,19 @@ type CacheReaders struct {
 type StateEngine struct {
 	*StateRepo
 	*CacheRepo
+	fenced bool // exclusive startup lifecycle, never toggled by ordinary requests
 
 	dirtyNodesStatic       *DirtySet[string]
 	dirtyNodesDynamic      *DirtySet[string]
 	dirtyNodeLatency       *DirtySet[NodeLatencyDirtyKey]
 	dirtyLeases            *DirtySet[LeaseDirtyKey]
 	dirtySubscriptionNodes *DirtySet[SubscriptionNodeDirtyKey]
+	mutationMu             sync.Mutex
+	weakSealed             bool
+	lateMarks              bool
+	onLateMark             func()
+	markEpoch              atomic.Uint64
+	markEntries            atomic.Int64
 }
 
 // newStateEngine creates a StateEngine with the given repos.
@@ -57,29 +66,93 @@ func newStateEngine(stateRepo *StateRepo, cacheRepo *CacheRepo) *StateEngine {
 
 // --- Weak-persist methods (dirty-mark only) ---
 
-func (e *StateEngine) MarkNodeStatic(hash string)        { e.dirtyNodesStatic.MarkUpsert(hash) }
-func (e *StateEngine) MarkNodeStaticDelete(hash string)  { e.dirtyNodesStatic.MarkDelete(hash) }
-func (e *StateEngine) MarkNodeDynamic(hash string)       { e.dirtyNodesDynamic.MarkUpsert(hash) }
-func (e *StateEngine) MarkNodeDynamicDelete(hash string) { e.dirtyNodesDynamic.MarkDelete(hash) }
+func (e *StateEngine) MarkNodeStatic(hash string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
+	e.dirtyNodesStatic.MarkUpsert(hash)
+}
+func (e *StateEngine) MarkNodeStaticDelete(hash string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
+	e.dirtyNodesStatic.MarkDelete(hash)
+}
+func (e *StateEngine) MarkNodeDynamic(hash string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
+	e.dirtyNodesDynamic.MarkUpsert(hash)
+}
+func (e *StateEngine) MarkNodeDynamicDelete(hash string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
+	e.dirtyNodesDynamic.MarkDelete(hash)
+}
 
 func (e *StateEngine) MarkNodeLatency(nodeHash, domain string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
+
 	e.dirtyNodeLatency.MarkUpsert(NodeLatencyDirtyKey{NodeHash: nodeHash, Domain: domain})
 }
 func (e *StateEngine) MarkNodeLatencyDelete(nodeHash, domain string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
+
 	e.dirtyNodeLatency.MarkDelete(NodeLatencyDirtyKey{NodeHash: nodeHash, Domain: domain})
 }
 
 func (e *StateEngine) MarkLease(platformID, account string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
+
 	e.dirtyLeases.MarkUpsert(LeaseDirtyKey{PlatformID: platformID, Account: account})
 }
 func (e *StateEngine) MarkLeaseDelete(platformID, account string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
+
 	e.dirtyLeases.MarkDelete(LeaseDirtyKey{PlatformID: platformID, Account: account})
 }
 
 func (e *StateEngine) MarkSubscriptionNode(subID, nodeHash string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
+
 	e.dirtySubscriptionNodes.MarkUpsert(SubscriptionNodeDirtyKey{SubscriptionID: subID, NodeHash: nodeHash})
 }
 func (e *StateEngine) MarkSubscriptionNodeDelete(subID, nodeHash string) {
+	if !e.admitWeakMark() {
+		return
+	}
+	defer e.mutationMu.Unlock()
+	defer e.markEntries.Add(-1)
+
 	e.dirtySubscriptionNodes.MarkDelete(SubscriptionNodeDirtyKey{SubscriptionID: subID, NodeHash: nodeHash})
 }
 
@@ -90,6 +163,20 @@ func (e *StateEngine) DirtyCount() int {
 		e.dirtyNodeLatency.Len() +
 		e.dirtyLeases.Len() +
 		e.dirtySubscriptionNodes.Len()
+}
+
+// DirtyCounts reports the pending weak-persist work per set. A drain-only
+// shutdown deliberately discards the final flush, so the retiring slot must be
+// able to say exactly what it handed to the active slot instead of only a
+// total that cannot be attributed.
+func (e *StateEngine) DirtyCounts() map[string]int {
+	return map[string]int{
+		"nodes_static":       e.dirtyNodesStatic.Len(),
+		"nodes_dynamic":      e.dirtyNodesDynamic.Len(),
+		"node_latency":       e.dirtyNodeLatency.Len(),
+		"leases":             e.dirtyLeases.Len(),
+		"subscription_nodes": e.dirtySubscriptionNodes.Len(),
+	}
 }
 
 // classifyDirtySet splits a drained dirty-set snapshot into upsert values and

@@ -35,20 +35,28 @@ func (r *managedEndpointRuntime) current() model.Endpoint {
 }
 
 type endpointRuntimeManager struct {
-	mu            sync.Mutex
-	listenAddress string
-	proxyToken    string
-	forward       http.Handler
-	reverse       http.Handler
-	apiHandler    http.Handler
-	tokenAPI      http.Handler
-	socks5        inboundConnHandler
-	metricsSink   proxy.MetricsEventSink
-	runtimes      map[string]*managedEndpointRuntime
-	statuses      map[string]service.EndpointRuntimeStatus
-	started       bool
-	stopping      bool
-	serverErrCh   chan error
+	mu               sync.Mutex
+	listenAddress    string
+	proxyToken       string
+	forward          http.Handler
+	reverse          http.Handler
+	apiHandler       http.Handler
+	tokenAPI         http.Handler
+	socks5           inboundConnHandler
+	metricsSink      proxy.MetricsEventSink
+	maintenance      *maintenanceController
+	runtimes         map[string]*managedEndpointRuntime
+	statuses         map[string]service.EndpointRuntimeStatus
+	started          bool
+	stopping         bool
+	serverErrCh      chan error
+	retirementWG     sync.WaitGroup
+	serveWG          sync.WaitGroup
+	shutdownMu       sync.Mutex
+	stoppingRuntimes []*managedEndpointRuntime
+	sourcesOnce      sync.Once
+	sourcesDone      chan struct{}
+	sourceErr        error
 }
 
 func newEndpointRuntimeManager(
@@ -70,6 +78,7 @@ func newEndpointRuntimeManager(
 		runtimes:      make(map[string]*managedEndpointRuntime),
 		statuses:      make(map[string]service.EndpointRuntimeStatus),
 		serverErrCh:   make(chan error, 1),
+		sourcesDone:   make(chan struct{}),
 	}
 }
 
@@ -115,9 +124,14 @@ func (m *endpointRuntimeManager) ApplyEndpoint(endpoint model.Endpoint) error {
 		m.apiHandler,
 		m.tokenAPI,
 	)
+	var socksHandler inboundConnHandler = &endpointSocksGate{current: currentConfig, next: m.socks5}
+	if m.maintenance != nil {
+		httpHandler = m.maintenance.wrapHTTP(httpHandler)
+		socksHandler = &maintenanceSOCKS{controller: m.maintenance, next: socksHandler}
+	}
 	runtime.server = newInboundDemuxServer(
-		&http.Server{Handler: httpHandler},
-		&endpointSocksGate{current: currentConfig, next: m.socks5},
+		&http.Server{Handler: httpHandler, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 30 * time.Second},
+		socksHandler,
 	)
 	old := m.runtimes[endpoint.ID]
 	m.runtimes[endpoint.ID] = runtime
@@ -126,7 +140,7 @@ func (m *endpointRuntimeManager) ApplyEndpoint(endpoint model.Endpoint) error {
 		m.startRuntimeLocked(runtime)
 	}
 	if old != nil {
-		go stopManagedEndpoint(old, 5*time.Second)
+		m.retireLocked(old)
 	}
 	return nil
 }
@@ -136,15 +150,19 @@ func (m *endpointRuntimeManager) RemoveEndpoint(id string) {
 		return
 	}
 	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		return
+	}
 	runtime := m.runtimes[id]
 	delete(m.runtimes, id)
 	delete(m.statuses, id)
-	m.mu.Unlock()
 	if runtime != nil {
 		// Release the port before returning so a following start can rebind it.
 		_ = runtime.listener.Close()
-		go stopManagedEndpoint(runtime, 5*time.Second)
+		m.retireLocked(runtime)
 	}
+	m.mu.Unlock()
 }
 
 func (m *endpointRuntimeManager) EndpointStatus(id string) service.EndpointRuntimeStatus {
@@ -189,7 +207,9 @@ func (m *endpointRuntimeManager) startRuntimeLocked(runtime *managedEndpointRunt
 	endpoint := runtime.current()
 	m.statuses[endpoint.ID] = service.EndpointRuntimeStatus{State: "active"}
 	log.Printf("Endpoint %s starting on %s", endpoint.ID, formatListenAddress(m.listenAddress, endpoint.Port))
+	m.serveWG.Add(1)
 	go func() {
+		defer m.serveWG.Done()
 		err := runtime.server.Serve(runtime.listener)
 		if err == nil || errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
 			return
@@ -201,9 +221,15 @@ func (m *endpointRuntimeManager) startRuntimeLocked(runtime *managedEndpointRunt
 func (m *endpointRuntimeManager) handleRuntimeError(runtime *managedEndpointRuntime, err error) {
 	endpoint := runtime.current()
 	m.mu.Lock()
+	if m.sourceErr == nil {
+		m.sourceErr = fmt.Errorf("endpoint serve: %w", err)
+	}
 	if m.runtimes[endpoint.ID] == runtime {
 		delete(m.runtimes, endpoint.ID)
 		m.statuses[endpoint.ID] = service.EndpointRuntimeStatus{State: "error", LastError: err.Error()}
+		if !m.stopping {
+			m.retireLocked(runtime)
+		}
 	}
 	stopping := m.stopping
 	m.mu.Unlock()
@@ -219,13 +245,20 @@ func (m *endpointRuntimeManager) Shutdown(ctx context.Context, preserveConnectio
 	if m == nil {
 		return nil
 	}
-	m.mu.Lock()
-	m.stopping = true
-	runtimes := make([]*managedEndpointRuntime, 0, len(m.runtimes))
-	for _, runtime := range m.runtimes {
-		runtimes = append(runtimes, runtime)
+	m.shutdownMu.Lock()
+	defer m.shutdownMu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	m.runtimes = make(map[string]*managedEndpointRuntime)
+	m.mu.Lock()
+	if !m.stopping {
+		m.stopping = true
+		for _, runtime := range m.runtimes {
+			m.stoppingRuntimes = append(m.stoppingRuntimes, runtime)
+		}
+		m.runtimes = make(map[string]*managedEndpointRuntime)
+	}
+	runtimes := m.stoppingRuntimes
 	m.mu.Unlock()
 
 	errCh := make(chan error, len(runtimes))
@@ -234,29 +267,102 @@ func (m *endpointRuntimeManager) Shutdown(ctx context.Context, preserveConnectio
 		wg.Add(1)
 		go func(runtime *managedEndpointRuntime) {
 			defer wg.Done()
-			if err := runtime.server.Shutdown(ctx, preserveConnections); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			if err := runtime.server.Shutdown(ctx, preserveConnections); err != nil {
 				errCh <- err
 			}
 			_ = runtime.listener.Close()
 		}(runtime)
 	}
 	wg.Wait()
+	// Apply/Remove retire old listeners asynchronously. They no longer appear
+	// in runtimes, but may still own a handler and its last lease event.
+	// Registration is under mu and stopping prevents any later Add.
 	close(errCh)
 	var shutdownErrs []error
 	for err := range errCh {
 		shutdownErrs = append(shutdownErrs, err)
 	}
+	m.sourcesOnce.Do(func() {
+		go func() {
+			m.serveWG.Wait()
+			m.retirementWG.Wait()
+			for _, runtime := range runtimes {
+				_ = runtime.server.waitForConnectionDrain(context.Background())
+			}
+			close(m.sourcesDone)
+		}()
+	})
+	select {
+	case <-m.sourcesDone:
+		shutdownErrs = append(shutdownErrs, m.takeSourceError())
+	case <-ctx.Done():
+		shutdownErrs = append(shutdownErrs, ctx.Err())
+	}
+	// A failed attempt is not cached as a permanent historical failure. A later
+	// attempt can only succeed once every tracked source has really exited.
 	return errors.Join(shutdownErrs...)
 }
 
-func stopManagedEndpoint(runtime *managedEndpointRuntime, timeout time.Duration) {
+// WaitQuiescent is a safety join, not a deadline promise. If Shutdown timed
+// out, the app must still join pending users before closing their databases.
+func (m *endpointRuntimeManager) WaitQuiescent() error {
+	if m == nil {
+		return nil
+	}
+	<-m.sourcesDone
+	return m.takeSourceError()
+}
+
+// WaitQuiescentContext does not consume ownership on a failed wait.
+func (m *endpointRuntimeManager) WaitQuiescentContext(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	select {
+	case <-m.sourcesDone:
+		return m.takeSourceError()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *endpointRuntimeManager) takeSourceError() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	err := m.sourceErr
+	m.sourceErr = nil // Archive completed-source failure once, including safety joins.
+	return err
+}
+
+// retireLocked must be called with m.mu held, before publishing the removal.
+func (m *endpointRuntimeManager) retireLocked(runtime *managedEndpointRuntime) {
+	m.retirementWG.Add(1)
+	go func() {
+		defer m.retirementWG.Done()
+		if err := stopManagedEndpoint(runtime, 5*time.Second); err != nil {
+			log.Printf("Retired endpoint did not quiesce within its close deadline: %v", err)
+			m.mu.Lock()
+			if m.sourceErr == nil {
+				m.sourceErr = fmt.Errorf("retired endpoint close: %w", err)
+			}
+			m.mu.Unlock()
+		}
+		// Timeout is not removal from ownership. Keep this runtime registered
+		// until even an uncooperative final handler exits. Shutdown's own ctx
+		// bounds its wait on this proof, without forgetting the pending source.
+		_ = runtime.server.waitForConnectionDrain(context.Background())
+	}()
+}
+
+func stopManagedEndpoint(runtime *managedEndpointRuntime, timeout time.Duration) error {
 	if runtime == nil {
-		return
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	_ = runtime.server.Shutdown(ctx, false)
+	err := runtime.server.Shutdown(ctx, false)
 	_ = runtime.listener.Close()
+	return err
 }
 
 type endpointSocksGate struct {

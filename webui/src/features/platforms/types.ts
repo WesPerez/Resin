@@ -51,6 +51,8 @@ export type PlatformUpdateInput = {
 export type PlatformLease = {
   platform_id: string;
   account: string;
+  display_name?: string;
+  display_name_unavailable?: boolean;
   node_hash: string;
   node_tag: string;
   egress_ip: string;
@@ -65,6 +67,7 @@ export type ListPlatformLeasesInput = {
   limit?: number;
   offset?: number;
   account?: string;
+  search?: string;
   fuzzy?: boolean;
   sort_by?: PlatformLeaseSortBy;
   sort_order?: SortOrder;

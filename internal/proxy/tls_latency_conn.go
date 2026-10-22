@@ -60,7 +60,9 @@ func (c *tlsLatencyConn) Read(b []byte) (int, error) {
 			if startNano > 0 {
 				latency := time.Duration(time.Now().UnixNano() - startNano)
 				if c.onLatency != nil {
-					go c.onLatency(latency)
+					// Register feedback before the copying worker can return. The
+					// callback owns asynchronous dispatch and its shutdown barrier.
+					c.onLatency(latency)
 				}
 			}
 		}
