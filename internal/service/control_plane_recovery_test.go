@@ -199,3 +199,46 @@ func TestRecoveryLease_ConcurrentCASPreservesTunnelsAndRejectsStale(t *testing.T
 		t.Fatal("stale report created cooldown")
 	}
 }
+
+func TestFailureClassForReason_MapsCooldownClasses(t *testing.T) {
+	cases := map[string]routing.FailureClass{
+		"transport_error": routing.FailureTransport,
+		"empty_stream":    routing.FailureUnclassified,
+		"invalid_stream":  routing.FailureUnclassified,
+	}
+	for reason, want := range cases {
+		got, ok := failureClassForReason(reason)
+		if !ok || got != want {
+			t.Fatalf("failureClassForReason(%q) = (%v, %v), want (%v, true)", reason, got, ok, want)
+		}
+	}
+	for _, rejected := range []string{"challenge", "rate_limited", "429", ""} {
+		if _, ok := failureClassForReason(rejected); ok {
+			t.Fatalf("reason %q must not be accepted for rotation", rejected)
+		}
+	}
+}
+
+func TestReportLeaseFailure_TransportReasonRotatesAndCoolsObservedNode(t *testing.T) {
+	cp, plat := newLeaseInheritanceTestService()
+	plat.StickyTTLNs = int64(time.Hour)
+	recoveryTestNode(t, cp, "class-a", "198.51.100.1")
+	first, err := cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{"example.com:443"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryTestNode(t, cp, "class-b", "198.51.100.2")
+	req := recoveryFailure(first.Lease)
+	req.Reason = "transport_error"
+	result, err := cp.ReportLeaseFailure(plat.Name, "account", req)
+	if err != nil || result.Status != "rotated" {
+		t.Fatalf("transport report: %+v %v", result, err)
+	}
+	hash, err := node.ParseHex(first.Lease.NodeHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cp.Router.TargetCooling(plat.ID, "account", req.TargetHost, hash, netip.MustParseAddr(first.Lease.EgressIP)) {
+		t.Fatal("transport report did not cool the observed node")
+	}
+}

@@ -83,3 +83,72 @@ func TestSameIPRotation_NeverReusesGeneration(t *testing.T) {
 		t.Fatal("old A deleted new A")
 	}
 }
+
+func TestTargetCooldownForClass_UpperBounds(t *testing.T) {
+	cases := []struct {
+		name      string
+		class     FailureClass
+		requested time.Duration
+		want      time.Duration
+	}{
+		{"transport caps ten minutes", FailureTransport, 10 * time.Minute, 30 * time.Second},
+		{"transport keeps a shorter request", FailureTransport, 10 * time.Second, 10 * time.Second},
+		{"unclassified keeps the request", FailureUnclassified, 10 * time.Minute, 10 * time.Minute},
+		{"unknown class keeps the request", FailureClass(99), 2 * time.Minute, 2 * time.Minute},
+		{"transport ignores a zero request", FailureTransport, 0, 0},
+		{"unclassified ignores a negative request", FailureUnclassified, -time.Second, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := targetCooldownForClass(tc.class, tc.requested); got != tc.want {
+				t.Fatalf("targetCooldownForClass(%v, %s) = %s, want %s", tc.class, tc.requested, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRotateLease_RecordsClassSpecificTargetCooldown(t *testing.T) {
+	cases := []struct {
+		name  string
+		class FailureClass
+		want  time.Duration
+	}{
+		{"transport", FailureTransport, 30 * time.Second},
+		{"unclassified", FailureUnclassified, 10 * time.Minute},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := newRouterTestPool()
+			plat := platform.NewPlatform("p-"+tc.name, "Platform "+tc.name, nil, nil)
+			plat.StickyTTLNs = int64(time.Hour)
+			pool.addPlatform(plat)
+			a, entryA := newRoutableEntry(t, `{"class":"a"}`, "198.51.100.1")
+			b, entryB := newRoutableEntry(t, `{"class":"b"}`, "198.51.100.2")
+			pool.addEntry(a, entryA)
+			pool.addEntry(b, entryB)
+			pool.rebuildPlatformView(plat)
+			router := newTestRouter(pool, nil)
+			initial, err := router.RouteRequest(plat.Name, "account", "example.com")
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := time.Now()
+			next, _, err := router.RecoverLease(plat.ID, "account", initial.NodeHash, initial.LeaseCreatedAtNs, "example.com",
+				RotateLeaseOptions{ExcludeEgressIP: true, PreserveConnections: true, FailureCooldown: 10 * time.Minute, FailureClass: tc.class})
+			if err != nil {
+				t.Fatalf("recover: %v", err)
+			}
+			if next == nil || next.NodeHash == initial.NodeHash.Hex() {
+				t.Fatalf("rotation did not replace the observed node: %+v", next)
+			}
+			entry, ok := router.targetCooldowns[targetCooldownKey{plat.ID, "account", "example.com", initial.NodeHash}]
+			if !ok {
+				t.Fatalf("no target cooldown recorded: %v", router.targetCooldowns)
+			}
+			remaining := entry.until.Sub(before)
+			if remaining < tc.want-time.Second || remaining > tc.want+2*time.Second {
+				t.Fatalf("target cooldown ~%s, want ~%s", remaining, tc.want)
+			}
+		})
+	}
+}

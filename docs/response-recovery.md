@@ -22,10 +22,18 @@ a floating-point number), and one of `empty_stream`, `invalid_stream`, or
 report client cancellation, quota exhaustion, or an unread response as failure.
 
 Report uses node plus generation CAS. A matching report cools the observed node
-and exit IP for ten minutes for this platform/account/target domain, then
-selects an alternative outside all matching cooldowns. The lease is still
-account-global: a replacement is used by subsequent requests from the account.
-Other accounts, target cooldowns, and global node health are unaffected.
+and exit IP for this platform/account/target domain, then selects an alternative
+outside all matching cooldowns. Only explicit `transport_error` reports and
+in-process tunnel failures shorten the requested cooldown to at most 30 seconds;
+shorter requests stay unchanged. `empty_stream`, `invalid_stream` and unclassified
+callers keep the existing requested TTL (ten minutes for this report API), with
+the existing ten-minute storage cap. Legacy clients may report challenge pages
+as `invalid_stream`; Resin cannot infer the site cause from that reason, so this
+change preserves its cooldown. Identifying 429, `Retry-After` and challenges
+remains the caller's responsibility; account rate limits are not changed here.
+The lease is still account-global: a replacement is used by subsequent requests
+from the account. Other accounts, target cooldowns, and global node health are
+unaffected.
 
 Statuses are `available` (acquire), `rotated` (report), `stale_lease`,
 `no_alternative`, and `recovery_limited`. A recovery limit or disabled automatic
