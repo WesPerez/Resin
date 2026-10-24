@@ -109,15 +109,29 @@ func (s *ControlPlaneService) acquireRecoveryLease(platformName, account string,
 	return &RecoveryLeaseResponse{RecoveryVersion: 1, Status: status, Lease: lease}, nil
 }
 
+// failureClassForReason maps the accepted report reasons to the target-cooldown
+// class applied to the observed node. Only explicit transport failures receive
+// a shorter TTL. Legacy callers may report challenge pages as invalid_stream;
+// that reason cannot distinguish a site response from broken content.
+func failureClassForReason(reason string) (routing.FailureClass, bool) {
+	switch reason {
+	case "transport_error":
+		return routing.FailureTransport, true
+	case "empty_stream", "invalid_stream":
+		return routing.FailureUnclassified, true
+	default:
+		return routing.FailureUnclassified, false
+	}
+}
+
 // ReportLeaseFailure changes only the observed account generation, preserving
 // active tunnels and excluding its previous exit from the replacement selection.
 func (s *ControlPlaneService) ReportLeaseFailure(platformName, account string, req ReportLeaseFailureRequest) (*RecoveryLeaseResponse, error) {
 	if err := validateRecoveryIdentity(platformName, account, req.TargetHost); err != nil {
 		return nil, err
 	}
-	switch req.Reason {
-	case "empty_stream", "invalid_stream", "transport_error":
-	default:
+	class, ok := failureClassForReason(req.Reason)
+	if !ok {
 		return nil, invalidArg("reason: unsupported recovery reason")
 	}
 	hash, err := node.ParseHex(req.ExpectedNodeHash)
@@ -133,7 +147,10 @@ func (s *ControlPlaneService) ReportLeaseFailure(platformName, account string, r
 		return nil, notFound("platform not found")
 	}
 	lease, _, err := s.Router.RecoverLease(plat.ID, account, hash, created, req.TargetHost,
-		routing.RotateLeaseOptions{ExcludeEgressIP: true, PreserveConnections: true, ApplyTargetCooldown: true, FailureCooldown: 10 * time.Minute})
+		routing.RotateLeaseOptions{
+			ExcludeEgressIP: true, PreserveConnections: true, ApplyTargetCooldown: true,
+			FailureCooldown: 10 * time.Minute, FailureClass: class,
+		})
 	status := "rotated"
 	if errors.Is(err, routing.ErrLeaseChanged) {
 		status = "stale_lease"

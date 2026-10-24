@@ -73,6 +73,9 @@ type RotateLeaseOptions struct {
 	PreserveConnections bool
 	ApplyTargetCooldown bool
 	FailureCooldown     time.Duration
+	// FailureClass selects the class-specific cooldown upper bound. The zero
+	// value (FailureUnclassified) keeps the requested cooldown unchanged.
+	FailureClass FailureClass
 	// Set only by the in-process dialer after a candidate has connected.
 	VerifiedPreferred bool
 	ExcludedNodes     []node.Hash
@@ -153,8 +156,8 @@ func (r *Router) rotateLease(platformID, account string, expectedNode node.Hash,
 		if automatic {
 			guardErr = r.checkRecoveryLocked(platformID, account, now)
 		}
-		if options.FailureCooldown > 0 && !errors.Is(guardErr, ErrRecoveryDisabled) {
-			r.recordTargetCooldownLocked(platformID, account, target, current, now, options.FailureCooldown)
+		if cooldown := targetCooldownForClass(options.FailureClass, options.FailureCooldown); cooldown > 0 && !errors.Is(guardErr, ErrRecoveryDisabled) {
+			r.recordTargetCooldownLocked(platformID, account, target, current, now, cooldown)
 		}
 		if guardErr != nil {
 			rotateErr = guardErr

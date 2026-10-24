@@ -206,6 +206,7 @@ func prepareConnectTunnel(
 		if grant != nil && ctx.Err() == nil {
 			_, _, _ = deps.router.CommitRecovery(grant, target, routing.RotateLeaseOptions{
 				ExcludeEgressIP: true, PreserveConnections: true, ApplyTargetCooldown: true, FailureCooldown: 10 * time.Minute,
+				FailureClass:  routing.FailureTransport,
 				ExcludedNodes: excluded,
 			})
 		}
@@ -284,6 +285,7 @@ func prepareConnectTunnel(
 			next, _, commitErr := deps.router.CommitRecovery(grant, target, routing.RotateLeaseOptions{
 				PreferredNode: routed.Route.NodeHash, ExpectedTargetIP: routed.Route.EgressIP, VerifiedPreferred: true,
 				PreserveConnections: true, ApplyTargetCooldown: true, FailureCooldown: 10 * time.Minute,
+				FailureClass: routing.FailureTransport,
 			})
 			if commitErr != nil && !errors.Is(commitErr, routing.ErrRecoveryLimited) && !errors.Is(commitErr, routing.ErrRecoveryDisabled) {
 				_ = rawConn.Close()
@@ -408,13 +410,17 @@ func invalidateTunnelLease(router *routing.Router, route routing.RouteResult, ac
 
 // Recover directly from the completed tunnel's structured failure. Log retention
 // and log enablement cannot affect this path; client cancellation is filtered by
-// shouldInvalidateTunnelLease before it reaches here.
+// shouldInvalidateTunnelLease before it reaches here. In-process events are
+// transport-class: the proxy never interprets an application response here.
 func recoverTunnelLease(router *routing.Router, route routing.RouteResult, account, target string) {
 	if router == nil || route.LeaseGuarded || account == "" || route.PlatformID == "" || route.NodeHash.IsZero() || route.LeaseCreatedAtNs == 0 {
 		return
 	}
 	_, _, err := router.RecoverLease(route.PlatformID, account, route.NodeHash, route.LeaseCreatedAtNs, target,
-		routing.RotateLeaseOptions{ExcludeEgressIP: true, PreserveConnections: true, ApplyTargetCooldown: true, FailureCooldown: 10 * time.Minute})
+		routing.RotateLeaseOptions{
+			ExcludeEgressIP: true, PreserveConnections: true, ApplyTargetCooldown: true,
+			FailureCooldown: 10 * time.Minute, FailureClass: routing.FailureTransport,
+		})
 	if err == nil {
 		log.Printf("proxy sticky lease recovered: platform_id=%s observed_node_hash=%s", route.PlatformID, route.NodeHash.Hex())
 	}

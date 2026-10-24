@@ -14,6 +14,37 @@ const (
 	maxTargetCooldownTTL = 10 * time.Minute
 )
 
+// FailureClass selects the target-cooldown upper bound for one recovery event.
+// Unclassified is the zero value, so an existing caller keeps its requested
+// cooldown instead of silently receiving a shorter one.
+type FailureClass int
+
+const (
+	FailureUnclassified FailureClass = iota // preserve the caller's requested TTL
+	FailureTransport                        // tunnel/network failure: short cooldown
+)
+
+const (
+	// Class bounds only shorten the requested cooldown; recordTargetCooldownLocked
+	// still caps every entry at maxTargetCooldownTTL.
+	transportTargetCooldown = 30 * time.Second
+)
+
+// targetCooldownForClass turns a requested failure cooldown into the
+// class-specific upper bound. A non-positive request records nothing, which
+// preserves the existing opt-in behavior of RotateLeaseOptions.FailureCooldown.
+func targetCooldownForClass(class FailureClass, requested time.Duration) time.Duration {
+	if requested <= 0 {
+		return 0
+	}
+	switch class {
+	case FailureTransport:
+		return min(requested, transportTargetCooldown)
+	default:
+		return requested
+	}
+}
+
 type targetCooldownKey struct {
 	platformID string
 	account    string
