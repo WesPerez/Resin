@@ -9,6 +9,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Resinat/Resin/internal/config"
+	"github.com/Resinat/Resin/internal/model"
 	"github.com/Resinat/Resin/internal/state"
 )
 
@@ -276,7 +280,7 @@ func TestLiveDigestReadsCommittedWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.Close()
-	// The write uses the ordinary state API and remains visible regardless of\n+	// whether SQLite has checkpointed the main file yet.
+	// The write remains visible whether SQLite checkpointed the main file yet.
 	e, c, err := state.PersistenceBootstrap(o.snapshot, o.snapshot)
 	if err != nil {
 		t.Fatal(err)
@@ -307,5 +311,146 @@ func TestLiveControlRejectsUnauthenticatedPause(t *testing.T) {
 	json.NewEncoder(&output).Encode(b.status())
 	if strings.Contains(output.String(), "secret") {
 		t.Fatal("status leaked secret")
+	}
+}
+
+func TestLiveBridgePreservesAbsoluteHTTPSAndQuery(t *testing.T) {
+	_, candidate := fixtureBridge(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.RequestURI != "https://example.invalid/path?q=one%20two" || r.Host != "example.invalid" {
+			t.Errorf("bridge changed target: %q host %q", r.RequestURI, r.Host)
+		}
+		io.WriteString(w, "preserved")
+	}))
+	c, err := net.Dial("tcp", strings.TrimPrefix(candidate.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(3 * time.Second))
+	io.WriteString(c, "GET https://example.invalid/path?q=one%20two HTTP/1.1\r\nHost: example.invalid\r\nConnection: close\r\n\r\n")
+	r, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: "GET"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	body, _ := io.ReadAll(r.Body)
+	if r.StatusCode != 200 || string(body) != "preserved" {
+		t.Fatalf("%d %q", r.StatusCode, body)
+	}
+}
+
+func TestLiveStagePersistsHistoricalLeaseAndRejectsExpiredEpoch(t *testing.T) {
+	o := preflightFixture(t, func(e *state.StateEngine) {
+		subs, err := e.ListSubscriptions()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, sub := range subs {
+			sub.Enabled = false
+			if err := e.UpsertSubscription(sub); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	t.Setenv("RESIN_LIVE_SOURCE", "127.0.0.1:1")
+	t.Setenv("RESIN_LIVE_BIND", "127.0.0.2")
+	env, err := config.LoadEnvConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.StateDir, env.CacheDir, env.LogDir = o.snapshot, o.snapshot, filepath.Join(t.TempDir(), "log")
+	e, closer, err := state.PersistenceBootstrapLive(env.StateDir, env.CacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := newResinApp(env, e)
+	if err != nil {
+		closer.Close()
+		t.Fatal(err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := app.shutdown(ctx, false); err != nil {
+				t.Error(err)
+			}
+			closer.Close()
+		}
+	}()
+	b := app.liveBridge
+	cutoff := time.Now().UnixNano()
+	rows := []model.Lease{{PlatformID: "fixture-platform", Account: "historical-missing-node", NodeHash: strings.Repeat("b", 32), EgressIP: "203.0.113.10", CreatedAtNs: cutoff - 1000000, LastAccessedNs: cutoff - 500000, ExpiryNs: cutoff + int64(time.Hour)}}
+	digest, err := canonicalLeaseDigest(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	strong, err := liveStrongDigest(context.Background(), filepath.Join(env.StateDir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch, err := b.pause(3 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := liveStageRequest{Epoch: epoch, CutoffNs: cutoff, LeaseDigest: digest, StrongDigest: strong, Leases: rows}
+	bad := req
+	bad.LeaseDigest = strings.Repeat("0", 64)
+	if b.stage(context.Background(), bad) == nil {
+		t.Fatal("bad digest accepted")
+	}
+	if err := b.stage(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	got, err := e.LoadAllLeases()
+	if err != nil || !reflect.DeepEqual(got, rows) {
+		t.Fatalf("persisted %v: %v", got, err)
+	}
+	b.mu.Lock()
+	b.resumeLocked()
+	b.mu.Unlock()
+	if b.activate(context.Background(), epoch, digest) == nil {
+		t.Fatal("expired activation accepted")
+	}
+	epoch, err = b.pause(3 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Epoch = epoch
+	req.CutoffNs = time.Now().UnixNano()
+	if err := b.stage(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.activate(context.Background(), epoch, digest); err != nil {
+		t.Fatal(err)
+	}
+	if b.status()["phase"] != "local" {
+		t.Fatal("activation failed")
+	}
+	if local, err := readLiveRestart(env.StateDir); err != nil || !local {
+		t.Fatalf("restart permission: %v %v", local, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := app.shutdown(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	closer.Close()
+	closed = true
+	reopened, rc, err := state.PersistenceBootstrapLive(env.StateDir, env.CacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	got, err = reopened.LoadAllLeases()
+	if err != nil || len(got) != 1 || got[0].NodeHash != rows[0].NodeHash {
+		t.Fatalf("historical lease lost on restart: %v %v", got, err)
+	}
+	if err := os.WriteFile(filepath.Join(env.StateDir, liveMarker), []byte(`{"phase":"intent"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readLiveRestart(env.StateDir); err == nil {
+		t.Fatal("unknown authority accepted")
 	}
 }

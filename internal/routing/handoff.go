@@ -18,14 +18,12 @@ func (r *Router) ValidateHandoffLeases(rows []model.Lease, cutoff int64) error {
 		key := model.LeaseKey{PlatformID: l.PlatformID, Account: l.Account}
 		h, err := node.ParseHex(l.NodeHash)
 		ip, ipErr := netip.ParseAddr(l.EgressIP)
-		plat, exists := r.pool.GetPlatform(l.PlatformID)
+		_, exists := r.pool.GetPlatform(l.PlatformID)
 		if err != nil || ipErr != nil || h.IsZero() || !ip.IsValid() || l.Account == "" || !exists || seen[key] || l.CreatedAtNs <= 0 || l.ExpiryNs <= cutoff || l.LastAccessedNs < l.CreatedAtNs || l.CreatedAtNs > cutoff || l.LastAccessedNs > cutoff || l.ExpiryNs <= l.CreatedAtNs {
 			return errors.New("invalid handoff lease")
 		}
-		entry, exists := r.pool.GetEntry(h)
-		if !exists || entry.Outbound.Load() == nil || entry.GetEgressIP() != ip || !plat.View().Contains(h) {
-			return errors.New("handoff lease outbound is not ready on the same node and IP")
-		}
+		// Historical leases may outlive a removed node. Preserve their identity;
+		// the owner separately verifies currently usable bindings before cutover.
 		seen[key] = true
 	}
 	return nil

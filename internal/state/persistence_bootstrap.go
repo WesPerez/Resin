@@ -28,6 +28,17 @@ func (c *persistenceCloser) Close() error {
 //  3. Run consistency repair (cross-db orphan cleanup).
 //  4. Construct and return StateEngine.
 func PersistenceBootstrap(stateDir, cacheDir string) (engine *StateEngine, closer io.Closer, err error) {
+	return persistenceBootstrap(stateDir, cacheDir, false)
+}
+
+// A live handoff preserves the source's complete lease set, including dormant
+// rows whose node disappeared. Routing decides usability; startup must not
+// silently delete an imported account binding before its owner can inspect it.
+func PersistenceBootstrapLive(stateDir, cacheDir string) (engine *StateEngine, closer io.Closer, err error) {
+	return persistenceBootstrap(stateDir, cacheDir, true)
+}
+
+func persistenceBootstrap(stateDir, cacheDir string, preserveLeases bool) (engine *StateEngine, closer io.Closer, err error) {
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		return nil, nil, fmt.Errorf("create state dir %s: %w", stateDir, err)
 	}
@@ -61,7 +72,7 @@ func PersistenceBootstrap(stateDir, cacheDir string) (engine *StateEngine, close
 		return nil, nil, fmt.Errorf("migrate cache.db: %w", err)
 	}
 
-	if err := RepairConsistency(stateDBPath, cacheDB); err != nil {
+	if err := repairConsistency(stateDBPath, cacheDB, preserveLeases); err != nil {
 		stateDB.Close()
 		cacheDB.Close()
 		return nil, nil, fmt.Errorf("repair consistency: %w", err)

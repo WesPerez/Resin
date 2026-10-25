@@ -11,7 +11,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -190,6 +189,10 @@ func bridgePump(client net.Conn, cr io.Reader, upstream net.Conn, ur io.Reader) 
 }
 
 func (b *liveBridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("X-Resin-Live-Probe") != "" {
+		b.probeHTTP(w, r)
+		return
+	}
 	local, release, err := b.enter(r.Context())
 	if err != nil {
 		return
@@ -278,20 +281,31 @@ func bridgeBytes(dst io.Writer, src io.Reader, n int) ([]byte, error) {
 }
 
 func (b *liveBridge) forwardHTTP(w http.ResponseWriter, r *http.Request, release func()) {
+	var dialMu sync.Mutex
 	var upstream net.Conn
 	var cleanup func()
+	closed := false
 	transport := &http.Transport{
 		DisableKeepAlives:     true,
 		ForceAttemptHTTP2:     false,
 		ExpectContinueTimeout: time.Second,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			var err error
-			upstream, cleanup, err = b.dial(ctx)
-			return upstream, err
+			c, done, err := b.dial(ctx)
+			dialMu.Lock()
+			defer dialMu.Unlock()
+			if closed && done != nil {
+				done()
+				return nil, context.Canceled
+			}
+			upstream, cleanup = c, done
+			return c, err
 		},
 	}
 	defer transport.CloseIdleConnections()
 	defer func() {
+		dialMu.Lock()
+		defer dialMu.Unlock()
+		closed = true
 		if cleanup != nil {
 			cleanup()
 		}
@@ -300,7 +314,13 @@ func (b *liveBridge) forwardHTTP(w http.ResponseWriter, r *http.Request, release
 	out.RequestURI = ""
 	out.GetBody = nil
 	if out.URL.IsAbs() {
-		transport.Proxy = func(*http.Request) (*url.URL, error) { return &url.URL{Scheme: "http", Host: b.source}, nil }
+		// Preserve the client's absolute request target, including https://.
+		// Transport must speak plain HTTP to Resin, not turn that target into
+		// a second CONNECT/TLS exchange. Opaque is the wire request target.
+		out.URL.Opaque = out.URL.String()
+		out.URL.Scheme = "http"
+		out.URL.RawQuery = ""
+		out.URL.ForceQuery = false
 	} else {
 		out.URL.Scheme = "http"
 		out.URL.Host = b.source
@@ -329,7 +349,10 @@ func (b *liveBridge) forwardHTTP(w http.ResponseWriter, r *http.Request, release
 		if buffer.Flush() != nil {
 			return
 		}
-		b.tunnel(upstream, release)
+		dialMu.Lock()
+		c := upstream
+		dialMu.Unlock()
+		b.tunnel(c, release)
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() { defer wg.Done(); io.Copy(duplex, buffer); duplex.Close() }()

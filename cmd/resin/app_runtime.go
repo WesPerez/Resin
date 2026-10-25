@@ -66,8 +66,20 @@ func run() error {
 	if err := rejectRetainedMaintenance(envCfg.StateDir); err != nil {
 		return err
 	}
+	// Reject an ambiguous prior activation before bootstrap can alter even
+	// the private database. An explicit local marker is restart permission.
+	if _, err := bridgeFromEnvironment(envCfg.StateDir); err != nil {
+		return err
+	}
 
-	engine, dbCloser, err := state.PersistenceBootstrap(envCfg.StateDir, envCfg.CacheDir)
+	bootstrap := state.PersistenceBootstrap
+	if os.Getenv("RESIN_LIVE_SOURCE") != "" {
+		bootstrap = state.PersistenceBootstrapLive
+	}
+	if _, err := os.Lstat(filepath.Join(envCfg.StateDir, liveMarker)); err == nil {
+		bootstrap = state.PersistenceBootstrapLive
+	}
+	engine, dbCloser, err := bootstrap(envCfg.StateDir, envCfg.CacheDir)
 	if err != nil {
 		return fmt.Errorf("persistence bootstrap: %w", err)
 	}
