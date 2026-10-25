@@ -88,7 +88,7 @@ func (b *liveBridge) status() map[string]any {
 	for _, s := range b.sockets {
 		sockets = append(sockets, s)
 	}
-	return map[string]any{"phase": b.phase, "epoch": b.epoch, "inflight": b.inflight, "probes": b.probes, "sockets": sockets, "source": b.source, "sha": buildinfo.GitCommit}
+	return map[string]any{"phase": b.phase, "durable": b.durable, "epoch": b.epoch, "inflight": b.inflight, "probes": b.probes, "sockets": sockets, "source": b.source, "sha": buildinfo.GitCommit}
 }
 
 func decodeLive(r *http.Request, v any) error {
@@ -162,6 +162,14 @@ func (b *liveBridge) controlHTTP(w http.ResponseWriter, r *http.Request) {
 		if err = decodeLive(r, &req); err == nil {
 			err = b.activate(r.Context(), req.Epoch, req.LeaseDigest)
 		}
+	case "/live/finalize":
+		var req struct {
+			Epoch       uint64 `json:"epoch"`
+			LeaseDigest string `json:"lease_digest"`
+		}
+		if err = decodeLive(r, &req); err == nil {
+			err = b.finalize(req.Epoch, req.LeaseDigest)
+		}
 	default:
 		http.NotFound(w, r)
 		return
@@ -220,6 +228,12 @@ func (b *liveBridge) stage(ctx context.Context, req liveStageRequest) error {
 	if err = ctx.Err(); err != nil {
 		return err
 	}
+	if err = b.app.engine.CheckpointDurable(ctx); err != nil {
+		return err
+	}
+	if err = syncMaintenanceFiles(filepath.Join(b.app.envCfg.StateDir, "state.db"), filepath.Join(b.app.envCfg.CacheDir, "cache.db")); err != nil {
+		return err
+	}
 	record := liveRecord{Phase: "staged", SHA: buildinfo.GitCommit, Epoch: req.Epoch, LeaseDigest: digest, LeaseCount: len(rows), StrongDigest: strong}
 	_, err = installDurableRecord(filepath.Join(b.app.envCfg.StateDir, liveMarker), record)
 	return err
@@ -272,7 +286,41 @@ func (b *liveBridge) activate(ctx context.Context, epoch uint64, digest string) 
 	b.app.startBackgroundServices()
 	record.Phase = "local"
 	_, err = installDurableRecord(path, record)
+	if err == nil {
+		b.mu.Lock()
+		b.durable = true
+		b.mu.Unlock()
+	}
 	return err // an unknown reply is recovered by status, never replay activate
+}
+
+// An idempotent durability repair after confirmed activation; never flips mode
+// or restarts workers. It cannot certify an expired staged/bridge authority.
+func (b *liveBridge) finalize(epoch uint64, digest string) error {
+	if !b.transitionMu.TryLock() {
+		return errors.New("transition already running")
+	}
+	defer b.transitionMu.Unlock()
+	b.mu.Lock()
+	local := b.phase == "local" && b.epoch == epoch
+	b.mu.Unlock()
+	if !local {
+		return errors.New("local authority not confirmed")
+	}
+	path := filepath.Join(b.app.envCfg.StateDir, liveMarker)
+	raw, err := os.ReadFile(path)
+	var record liveRecord
+	if err != nil || strictAuthorityJSON(raw, &record) != nil || record.Epoch != epoch || record.LeaseDigest != digest || record.SHA != buildinfo.GitCommit || (record.Phase != "intent" && record.Phase != "local") {
+		return errors.New("local marker identity differs")
+	}
+	record.Phase = "local"
+	if _, err = installDurableRecord(path, record); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	b.durable = true
+	b.mu.Unlock()
+	return nil
 }
 
 func (b *liveBridge) probeHTTP(w http.ResponseWriter, r *http.Request) {

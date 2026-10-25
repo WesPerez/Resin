@@ -30,6 +30,7 @@ type liveBridge struct {
 	nativeMu         sync.RWMutex
 	source, bind     string
 	phase            string
+	durable          bool
 	wake             chan struct{}
 	deadline         time.Time
 	epoch            uint64
