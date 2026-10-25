@@ -101,6 +101,8 @@ type tunnelFirstByteWatch struct {
 	state     atomic.Uint32
 	mu        sync.Mutex
 	timer     *time.Timer
+	timerDone chan struct{}
+	doneOnce  sync.Once
 }
 
 func (w *tunnelFirstByteWatch) start() {
@@ -112,7 +114,9 @@ func (w *tunnelFirstByteWatch) start() {
 	if w.timer != nil || w.state.Load() != firstByteWaiting {
 		return
 	}
+	w.timerDone = make(chan struct{})
 	w.timer = time.AfterFunc(w.timeout, func() {
+		defer w.doneOnce.Do(func() { close(w.timerDone) })
 		if w.state.CompareAndSwap(firstByteWaiting, firstByteTimedOut) && w.onTimeout != nil {
 			w.onTimeout()
 		}
@@ -140,10 +144,18 @@ func (w *tunnelFirstByteWatch) stop() {
 
 func (w *tunnelFirstByteWatch) stopTimer() {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.timer != nil {
-		w.timer.Stop()
+	if w.timer == nil {
+		w.mu.Unlock()
+		return
 	}
+	if w.timer.Stop() {
+		w.doneOnce.Do(func() { close(w.timerDone) })
+	}
+	done := w.timerDone
+	w.mu.Unlock()
+	// Timer.Stop does not wait for an already running callback. That callback
+	// can recover a lease, so the tunnel must join it before its handler exits.
+	<-done
 }
 
 func (w *tunnelFirstByteWatch) timedOut() bool {
@@ -194,6 +206,7 @@ func prepareConnectTunnel(
 		if grant != nil && ctx.Err() == nil {
 			_, _, _ = deps.router.CommitRecovery(grant, target, routing.RotateLeaseOptions{
 				ExcludeEgressIP: true, PreserveConnections: true, ApplyTargetCooldown: true, FailureCooldown: 10 * time.Minute,
+				FailureClass:  routing.FailureTransport,
 				ExcludedNodes: excluded,
 			})
 		}
@@ -221,7 +234,7 @@ func prepareConnectTunnel(
 
 		nodeHashRaw := routed.Route.NodeHash
 		if deps.health != nil {
-			go deps.health.RecordLatency(nodeHashRaw, domain, nil)
+			recordLatencyAsync(deps.health, nodeHashRaw, domain, nil)
 		}
 
 		rawConn, err := dialTunnelWithTimeout(ctx, deps.connectTimeout, func(dialCtx context.Context) (net.Conn, error) {
@@ -272,6 +285,7 @@ func prepareConnectTunnel(
 			next, _, commitErr := deps.router.CommitRecovery(grant, target, routing.RotateLeaseOptions{
 				PreferredNode: routed.Route.NodeHash, ExpectedTargetIP: routed.Route.EgressIP, VerifiedPreferred: true,
 				PreserveConnections: true, ApplyTargetCooldown: true, FailureCooldown: 10 * time.Minute,
+				FailureClass: routing.FailureTransport,
 			})
 			if commitErr != nil && !errors.Is(commitErr, routing.ErrRecoveryLimited) && !errors.Is(commitErr, routing.ErrRecoveryDisabled) {
 				_ = rawConn.Close()
@@ -302,7 +316,7 @@ func prepareConnectTunnel(
 
 		upstreamConn := newTLSLatencyConn(upstreamBase, func(latency time.Duration) {
 			if deps.health != nil {
-				deps.health.RecordLatency(nodeHashRaw, domain, &latency)
+				recordLatencyAsync(deps.health, nodeHashRaw, domain, &latency)
 			}
 		})
 
@@ -396,13 +410,17 @@ func invalidateTunnelLease(router *routing.Router, route routing.RouteResult, ac
 
 // Recover directly from the completed tunnel's structured failure. Log retention
 // and log enablement cannot affect this path; client cancellation is filtered by
-// shouldInvalidateTunnelLease before it reaches here.
+// shouldInvalidateTunnelLease before it reaches here. In-process events are
+// transport-class: the proxy never interprets an application response here.
 func recoverTunnelLease(router *routing.Router, route routing.RouteResult, account, target string) {
 	if router == nil || route.LeaseGuarded || account == "" || route.PlatformID == "" || route.NodeHash.IsZero() || route.LeaseCreatedAtNs == 0 {
 		return
 	}
 	_, _, err := router.RecoverLease(route.PlatformID, account, route.NodeHash, route.LeaseCreatedAtNs, target,
-		routing.RotateLeaseOptions{ExcludeEgressIP: true, PreserveConnections: true, ApplyTargetCooldown: true, FailureCooldown: 10 * time.Minute})
+		routing.RotateLeaseOptions{
+			ExcludeEgressIP: true, PreserveConnections: true, ApplyTargetCooldown: true,
+			FailureCooldown: 10 * time.Minute, FailureClass: routing.FailureTransport,
+		})
 	if err == nil {
 		log.Printf("proxy sticky lease recovered: platform_id=%s observed_node_hash=%s", route.PlatformID, route.NodeHash.Hex())
 	}
@@ -474,10 +492,12 @@ func pumpPreparedTunnelReader(
 	firstByteWatch := &tunnelFirstByteWatch{
 		timeout: opts.firstByteTimeout,
 		onTimeout: func() {
+			// End both copies first. Recovery may contend on a router lock;
+			// it must not prevent the timeout from closing its connections.
+			closeBoth()
 			if opts.onFirstByteTimeout != nil {
 				opts.onFirstByteTimeout()
 			}
-			closeBoth()
 		},
 	}
 	ingressBytesCh := make(chan copyResult, 1)

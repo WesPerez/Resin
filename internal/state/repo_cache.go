@@ -4,13 +4,16 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/Resinat/Resin/internal/model"
 )
 
 // CacheRepo wraps cache.db and provides batch read/write for weak-persist data.
 type CacheRepo struct {
-	db *sql.DB
+	db                 *sql.DB
+	fenced             bool // exclusive startup lifecycle
+	fencedWriteAttempt atomic.Bool
 }
 
 // newCacheRepo creates a CacheRepo for the given cache.db connection.
@@ -313,6 +316,10 @@ func bulkExecTx(tx *sql.Tx, query string, n int, execFn func(stmt *sql.Stmt, i i
 // bulkExec runs a prepared statement in its own transaction for n rows.
 // Used by individual BulkUpsert*/BulkDelete* methods (tests, bootstrap).
 func (r *CacheRepo) bulkExec(query string, n int, execFn func(stmt *sql.Stmt, i int) error) error {
+	if r.fenced {
+		r.fencedWriteAttempt.Store(true)
+		return ErrWritesSealed
+	}
 	if n == 0 {
 		return nil
 	}
@@ -359,6 +366,10 @@ type FlushOps struct {
 // Upsert order: nodes_static → subscription_nodes → nodes_dynamic → node_latency → leases
 // Delete order: leases → node_latency → nodes_dynamic → subscription_nodes → nodes_static
 func (r *CacheRepo) FlushTx(ops FlushOps) error {
+	if r.fenced {
+		r.fencedWriteAttempt.Store(true)
+		return ErrWritesSealed
+	}
 	tx, err := r.db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin flush tx: %w", err)

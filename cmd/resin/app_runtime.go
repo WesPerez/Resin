@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -42,6 +45,12 @@ type resinApp struct {
 	requestlogSvc   *requestlog.Service
 	endpointManager *endpointRuntimeManager
 	transportPool   *proxy.OutboundTransportPool
+	healthFeedback  *proxy.HealthFeedbackBarrier
+	engine          *state.StateEngine
+	maintenance     *maintenanceController
+	fenced          bool
+	authority       *authorityController
+	liveBridge      *liveBridge
 }
 
 func run() error {
@@ -54,7 +63,23 @@ func run() error {
 		return err
 	}
 
-	engine, dbCloser, err := state.PersistenceBootstrap(envCfg.StateDir, envCfg.CacheDir)
+	if err := rejectRetainedMaintenance(envCfg.StateDir); err != nil {
+		return err
+	}
+	// Reject an ambiguous prior activation before bootstrap can alter even
+	// the private database. An explicit local marker is restart permission.
+	if _, err := bridgeFromEnvironment(envCfg.StateDir); err != nil {
+		return err
+	}
+
+	bootstrap := state.PersistenceBootstrap
+	if os.Getenv("RESIN_LIVE_SOURCE") != "" {
+		bootstrap = state.PersistenceBootstrapLive
+	}
+	if _, err := os.Lstat(filepath.Join(envCfg.StateDir, liveMarker)); err == nil {
+		bootstrap = state.PersistenceBootstrapLive
+	}
+	engine, dbCloser, err := bootstrap(envCfg.StateDir, envCfg.CacheDir)
 	if err != nil {
 		return fmt.Errorf("persistence bootstrap: %w", err)
 	}
@@ -66,17 +91,48 @@ func run() error {
 		return err
 	}
 
+	if app.liveBridge == nil {
+		app.startBackgroundServices()
+	} else if err := app.liveBridge.startControl(); err != nil {
+		return err
+	}
 	serverErrCh := app.startServers()
+	return serveResinApp(app, dbCloser, serverErrCh)
+}
+
+// Shared post-activation lifetime, including the existing error-returning
+// final persistence boundary. Fenced startup does not invent a second drain.
+func serveResinApp(app *resinApp, dbCloser io.Closer, serverErrCh <-chan error) error {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	// Keep signals registered until drain completes; repeated retirement must
 	// not restore SIGTERM's default action while tunnels are still active.
 	defer signal.Stop(quit)
-	runtimeErr := waitForShutdown(serverErrCh, quit)
+	return serveResinAppUsingSignals(app, dbCloser, serverErrCh, quit)
+}
+
+func serveResinAppUsingSignals(app *resinApp, dbCloser io.Closer, serverErrCh <-chan error, quit <-chan os.Signal) error {
+	envCfg := app.envCfg
+	var runtimeErr error
+	select {
+	case <-app.maintenance.requested:
+		log.Println("Maintenance requested; stopping admission and joining sources")
+	case sig := <-quit:
+		log.Printf("Received signal %s, shutting down", sig)
+	case runtimeErr = <-serverErrCh:
+	}
+	if app.authority != nil {
+		if err := app.authority.phase("stopping"); err != nil {
+			app.authority.fail()
+		}
+	}
+	maintenance := app.maintenance.closeAdmission()
 
 	var ctx context.Context
 	var cancel context.CancelFunc
-	if os.Getenv("RESIN_SHUTDOWN_PRESERVE_CONNECTIONS") == "1" {
+	if maintenance {
+		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Minute)
+	} else if os.Getenv("RESIN_SHUTDOWN_PRESERVE_CONNECTIONS") == "1" {
 		drainTimeout := 10 * time.Minute
 		if raw := strings.TrimSpace(os.Getenv("RESIN_DRAIN_TIMEOUT")); raw != "" {
 			if parsed, err := time.ParseDuration(raw); err == nil && parsed >= 0 {
@@ -94,15 +150,54 @@ func run() error {
 		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 	}
 	defer cancel()
-	app.shutdown(ctx)
-
-	if err := dbCloser.Close(); err != nil {
-		log.Printf("Persistence close error: %v", err)
+	stopTimeoutWatch := func() {}
+	if maintenance {
+		stopped, done := make(chan struct{}), make(chan struct{})
+		go app.maintenance.timeoutFailure(ctx, stopped, done)
+		var once sync.Once
+		stopTimeoutWatch = func() { once.Do(func() { close(stopped); <-done }) }
+		defer stopTimeoutWatch()
+	}
+	shutdownErr := app.shutdown(ctx, maintenance)
+	// Failure is not permission to close a DB under a still-owned writer, or
+	// discard dirty work after a failed final transaction. Keep the source
+	// parked behind its restart fence for explicit recovery/force-stop.
+	closeErr := closeShutdownDatabases(ctx, maintenance, runtimeErr, shutdownErr,
+		func() error { return app.maintenanceBarrierError(ctx) }, dbCloser.Close, func() {
+			if app.authority != nil {
+				app.authority.fail()
+			}
+			_ = app.maintenance.phase("failed")
+			log.Println("Shutdown failed; source ownership/dirty state retained, databases remain open")
+			select {} // explicit owner recovery, never successful exit
+		})
+	if maintenance {
+		closeErr = errors.Join(closeErr, app.maintenanceBarrierError(ctx))
+		if errors.Join(runtimeErr, shutdownErr, closeErr) == nil {
+			closeErr = syncMaintenanceFiles(filepath.Join(envCfg.StateDir, "state.db"), filepath.Join(envCfg.CacheDir, "cache.db"))
+			if closeErr == nil {
+				closeErr = app.maintenance.bindClosedDatabases(ctx, filepath.Join(envCfg.StateDir, "state.db"), filepath.Join(envCfg.CacheDir, "cache.db"))
+			}
+		}
+		if errors.Join(runtimeErr, shutdownErr, closeErr) == nil {
+			// Join the timeout writer BEFORE the terminal certificate. Its result
+			// is latched in the controller, never changed after successful return.
+			stopTimeoutWatch()
+			closeErr = app.maintenanceBarrierError(ctx)
+			if closeErr == nil {
+				closeErr = app.finalizeMaintenance(ctx)
+			}
+		} else {
+			closeErr = errors.Join(closeErr, app.maintenance.phase("failed"))
+		}
+		if errors.Join(runtimeErr, shutdownErr, closeErr) != nil {
+			closeErr = errors.Join(closeErr, app.maintenance.phase("failed"))
+		}
 	}
 	if runtimeErr != nil {
-		return fmt.Errorf("runtime server error: %w", runtimeErr)
+		runtimeErr = fmt.Errorf("runtime server error: %w", runtimeErr)
 	}
-	return nil
+	return errors.Join(runtimeErr, shutdownErr, closeErr)
 }
 
 func loadDotenvFile(path string) error {
@@ -116,12 +211,43 @@ func loadDotenvFile(path string) error {
 }
 
 func newResinApp(envCfg *config.EnvConfig, engine *state.StateEngine) (*resinApp, error) {
-	app := &resinApp{
-		envCfg:     envCfg,
-		runtimeCfg: &atomic.Pointer[config.RuntimeConfig]{},
+	return constructResinApp(envCfg, engine, false)
+}
+
+// The fenced path restores this SAME runtime graph, not a substitute router.
+// It never constructs observability files, binds endpoints, warms outbounds or
+// starts background services. Its engine uses immutable read-only databases.
+func constructResinApp(envCfg *config.EnvConfig, engine *state.StateEngine, fenced bool) (*resinApp, error) {
+	configDigest, err := effectiveConfigDigest(envCfg)
+	if err != nil {
+		return nil, err
 	}
-	app.runtimeCfg.Store(loadRuntimeConfig(engine))
-	if err := ensureDefaultAccountHeaderRule(engine); err != nil {
+	app := &resinApp{
+		fenced:      fenced,
+		envCfg:      envCfg,
+		engine:      engine,
+		maintenance: newMaintenanceController(envCfg.StateDir, envCfg.AdminToken, os.Getenv("RESIN_MAINTENANCE_ENABLED") == "1"),
+		runtimeCfg:  &atomic.Pointer[config.RuntimeConfig]{},
+	}
+	if !fenced {
+		app.liveBridge, err = bridgeFromEnvironment(envCfg.StateDir)
+		if err != nil {
+			return nil, err
+		}
+		if app.liveBridge != nil {
+			app.liveBridge.app = app
+		}
+	}
+	app.maintenance.record.ConfigDigest = configDigest
+	cfg, _, err := engine.GetSystemConfig()
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		cfg = config.NewDefaultRuntimeConfig()
+	}
+	app.runtimeCfg.Store(cfg)
+	if err := prepareAccountHeaderRule(engine, fenced); err != nil {
 		return nil, err
 	}
 	app.accountMatcher = buildAccountMatcher(engine)
@@ -135,6 +261,9 @@ func newResinApp(envCfg *config.EnvConfig, engine *state.StateEngine) (*resinApp
 	if err := app.bootstrapFromPersistence(engine); err != nil {
 		return nil, err
 	}
+	if fenced {
+		return app, nil
+	}
 	if err := app.initObservability(); err != nil {
 		return nil, err
 	}
@@ -142,7 +271,6 @@ func newResinApp(envCfg *config.EnvConfig, engine *state.StateEngine) (*resinApp
 		return nil, err
 	}
 
-	app.startBackgroundServices()
 	return app, nil
 }
 
@@ -168,6 +296,7 @@ func (a *resinApp) initTopologyRuntime(engine *state.StateEngine) (*netutil.Retr
 				a.transportPool.Evict(hash)
 			}
 		},
+		a.fenced,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("topology runtime: %w", err)
@@ -267,16 +396,20 @@ func (a *resinApp) wireRetryDownloader(retryDL *netutil.RetryDownloader) {
 
 func (a *resinApp) bootstrapFromPersistence(engine *state.StateEngine) error {
 	// Phase 6: Bootstrap topology data from persistence.
-	if err := bootstrapTopology(engine, a.topoRuntime.subManager, a.topoRuntime.pool, a.envCfg); err != nil {
+	if err := bootstrapTopologyMode(engine, a.topoRuntime.subManager, a.topoRuntime.pool, a.envCfg, a.fenced); err != nil {
 		return err
 	}
 
 	// Phase 6.1: Bootstrap nodes (steps 3-6: static, subscription_nodes, dynamic, latency).
+	outboundMgr := a.topoRuntime.outboundMgr
+	if a.fenced {
+		outboundMgr = nil
+	}
 	if err := bootstrapNodes(
 		engine,
 		a.topoRuntime.pool,
 		a.topoRuntime.subManager,
-		a.topoRuntime.outboundMgr,
+		outboundMgr,
 		a.envCfg,
 		runtimeConfigSnapshot(a.runtimeCfg).LatencyAuthorities,
 	); err != nil {
@@ -293,6 +426,9 @@ func (a *resinApp) bootstrapFromPersistence(engine *state.StateEngine) error {
 	// Phase 9: Restore leases (AFTER rebuild so platform views are populated).
 	leases, err := engine.LoadAllLeases()
 	if err != nil {
+		if a.fenced {
+			return fmt.Errorf("fenced lease restore: %w", err)
+		}
 		log.Printf("Warning: load leases: %v", err)
 	} else if len(leases) > 0 {
 		a.topoRuntime.router.RestoreLeases(leases)
@@ -441,12 +577,13 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 	if a.transportPool == nil {
 		a.transportPool = proxy.NewOutboundTransportPool(outboundTransportCfg)
 	}
+	a.healthFeedback = proxy.NewHealthFeedbackBarrier(a.topoRuntime.pool)
 
 	forwardProxy := proxy.NewForwardProxy(proxy.ForwardProxyConfig{
 		ProxyToken:        a.envCfg.ProxyToken,
 		Router:            a.topoRuntime.router,
 		Pool:              a.topoRuntime.pool,
-		Health:            a.topoRuntime.pool,
+		Health:            a.healthFeedback,
 		Events:            proxyEvents,
 		MetricsSink:       a.metricsManager,
 		OutboundTransport: outboundTransportCfg,
@@ -462,7 +599,7 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		Router:            a.topoRuntime.router,
 		Pool:              a.topoRuntime.pool,
 		PlatformLookup:    a.topoRuntime.pool,
-		Health:            a.topoRuntime.pool,
+		Health:            a.healthFeedback,
 		Matcher:           a.accountMatcher,
 		Events:            proxyEvents,
 		MetricsSink:       a.metricsManager,
@@ -474,7 +611,7 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		ProxyToken:       a.envCfg.ProxyToken,
 		Router:           a.topoRuntime.router,
 		Pool:             a.topoRuntime.pool,
-		Health:           a.topoRuntime.pool,
+		Health:           a.healthFeedback,
 		Events:           proxyEvents,
 		MetricsSink:      a.metricsManager,
 		ProxyBypassRules: a.envCfg.ProxyBypassRules,
@@ -493,6 +630,8 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		socks5Inbound,
 		a.metricsManager,
 	)
+	endpointManager.maintenance = a.maintenance
+	endpointManager.liveBridge = a.liveBridge
 	cpService.EndpointRuntime = endpointManager
 	defaultEndpoint := service.NewDefaultEndpoint(a.envCfg.ResinPort)
 	if err := endpointManager.ApplyEndpoint(defaultEndpoint); err != nil {
@@ -578,14 +717,91 @@ func formatListenURL(listenAddress string, port int) string {
 	return "http://" + formatListenAddress(listenAddress, port)
 }
 
-func (a *resinApp) shutdown(ctx context.Context) {
-	drainOnly := os.Getenv("RESIN_SHUTDOWN_PRESERVE_CONNECTIONS") == "1"
+var errShutdownOwnershipRetained = errors.New("shutdown deadline expired with retained source ownership")
+var errShutdownPersistenceRetained = errors.New("shutdown persistence failed with retained dirty state")
+
+// This is run's actual close decision, injectable to verify that no closer or
+// barrier is called on a retained source. A production retain never returns.
+// Never eagerly evaluate a locked barrier after timeout or failed final flush.
+func closeShutdownDatabases(ctx context.Context, maintenance bool, runtimeErr, shutdownErr error,
+	barrier, closeDB func() error, retain func()) error {
+	err := errors.Join(ctx.Err(), shutdownErr)
+	if maintenance {
+		err = errors.Join(err, runtimeErr)
+	}
+	if ctx.Err() != nil || errors.Is(shutdownErr, errShutdownOwnershipRetained) ||
+		errors.Is(shutdownErr, errShutdownPersistenceRetained) || (maintenance && err != nil) {
+		retain()
+		return errShutdownOwnershipRetained // injected test retain may return
+	}
+	if maintenance {
+		if err := barrier(); err != nil {
+			retain()
+			return errors.Join(err, errShutdownOwnershipRetained)
+		}
+	}
+	return closeDB()
+}
+
+// The deadline bounds the owner's wait, not an unsafe close of live sources.
+// A synchronous Stop/SQL driver may ignore cancellation; its single owned
+// worker continues behind closed admission while run retains DB handles.
+func waitShutdownDeadline(ctx context.Context, stop func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- stop() }()
+	select {
+	case err := <-done:
+		if ctx.Err() != nil {
+			return errors.Join(err, ctx.Err(), errShutdownOwnershipRetained)
+		}
+		return err
+	case <-ctx.Done():
+		return errors.Join(ctx.Err(), errShutdownOwnershipRetained)
+	}
+}
+
+func (a *resinApp) shutdown(ctx context.Context, maintenance bool) error {
+	return waitShutdownDeadline(ctx, func() error { return a.shutdownJoined(ctx, maintenance) })
+}
+
+func (a *resinApp) shutdownJoined(ctx context.Context, maintenance bool) error {
+	var shutdownErrs []error
+	if a.liveBridge != nil {
+		if err := a.liveBridge.stopControl(ctx); err != nil {
+			return errors.Join(err, errShutdownOwnershipRetained)
+		}
+	}
+	if maintenance {
+		if err := a.maintenance.phase("draining"); err != nil {
+			shutdownErrs = append(shutdownErrs, err)
+		}
+	}
+	drainOnly := !maintenance && a.authority == nil && os.Getenv("RESIN_SHUTDOWN_PRESERVE_CONNECTIONS") == "1"
 	if drainOnly {
 		log.Println("Resin drain-only shutdown enabled; preserving tunnels and suppressing final state flush")
+		// Publish what this slot is handing over BEFORE the flush worker is told
+		// to discard, so a crash between the two still leaves a receipt that
+		// describes the same dirty sets the discard is about to skip.
+		if path, err := a.flushWorker.WriteDrainReceipt(a.envCfg.StateDir, true, time.Now()); err != nil {
+			log.Printf("Drain receipt unavailable: %v", err)
+		} else {
+			log.Printf("Drain receipt written: %s", path)
+		}
 		a.flushWorker.Discard()
 	}
-	if err := a.endpointManager.Shutdown(ctx, drainOnly); err != nil {
+	if err := a.endpointManager.Shutdown(ctx, drainOnly || maintenance); err != nil {
 		log.Printf("Server shutdown error: %v", err)
+		shutdownErrs = append(shutdownErrs, fmt.Errorf("endpoint shutdown: %w", err))
+		if maintenance {
+			shutdownErrs = append(shutdownErrs, a.maintenance.phase("failed"))
+		}
+		// Never progress to sink/DB close after an incomplete source drain.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return errors.Join(errors.Join(shutdownErrs...), errShutdownOwnershipRetained)
+		}
+		if joinErr := a.endpointManager.WaitQuiescentContext(ctx); joinErr != nil {
+			return errors.Join(errors.Join(shutdownErrs...), joinErr, errShutdownOwnershipRetained)
+		}
 	}
 	log.Println("Resin server stopped")
 	if a.transportPool != nil {
@@ -604,17 +820,36 @@ func (a *resinApp) shutdown(ctx context.Context) {
 	a.topoRuntime.scheduler.Stop()
 	log.Println("Subscription scheduler stopped")
 
+	a.geoSvc.StopUpdates()
+	log.Println("GeoIP updates stopped")
+
+	// Proxy feedback may enqueue probes. Join it (and the GeoIP downloader)
+	// before stopping the probe sink, then stop persistence last.
+	if a.healthFeedback != nil {
+		if err := a.healthFeedback.StopAndWait(ctx); err != nil {
+			shutdownErrs = append(shutdownErrs, err)
+			if maintenance {
+				shutdownErrs = append(shutdownErrs, a.maintenance.phase("failed"))
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return errors.Join(errors.Join(shutdownErrs...), errShutdownOwnershipRetained)
+			}
+		}
+	}
+	if ctx.Err() != nil {
+		return errors.Join(ctx.Err(), errShutdownOwnershipRetained)
+	}
 	a.topoRuntime.probeMgr.Stop()
 	log.Println("Probe manager stopped")
-
-	a.geoSvc.Stop()
-	log.Println("GeoIP service stopped")
+	a.geoSvc.CloseReader()
+	log.Println("GeoIP reader closed")
 
 	// 2. Stop observability sinks (flush remaining data).
 	a.requestlogSvc.Stop()
 	log.Println("Request log service stopped")
 	if err := a.requestlogRepo.Close(); err != nil {
 		log.Printf("Request log repo close error: %v", err)
+
 	}
 	log.Println("Request log repo closed")
 
@@ -622,6 +857,7 @@ func (a *resinApp) shutdown(ctx context.Context) {
 	log.Println("Metrics manager stopped")
 	if err := a.metricsDB.Close(); err != nil {
 		log.Printf("Metrics DB close error: %v", err)
+
 	}
 	log.Println("Metrics DB closed")
 
@@ -629,10 +865,46 @@ func (a *resinApp) shutdown(ctx context.Context) {
 	if a.topoRuntime.singboxBuilder != nil {
 		if err := a.topoRuntime.singboxBuilder.Close(); err != nil {
 			log.Printf("SingboxBuilder close error: %v", err)
+			shutdownErrs = append(shutdownErrs, err)
 		}
 		log.Println("SingboxBuilder stopped")
 	}
 
-	a.flushWorker.Stop()
+	if ctx.Err() != nil {
+		return errors.Join(ctx.Err(), errShutdownOwnershipRetained)
+	}
+	if maintenance {
+		// Source ownership was joined before these terminal seals. The seals
+		// detect late rejected writes; they do not silently grant handoff.
+		a.engine.SealStrongWrites()
+		a.engine.SealWeakWrites()
+		if err := a.maintenance.phase("sources_stopped"); err != nil {
+			shutdownErrs = append(shutdownErrs, err)
+		}
+	}
+	if drainOnly {
+		a.flushWorker.Stop()
+	} else if err := a.flushWorker.StopAndFlush(); err != nil {
+		shutdownErrs = append(shutdownErrs, errors.Join(errShutdownPersistenceRetained,
+			fmt.Errorf("authoritative state flush: %w", err)))
+	}
+	if maintenance {
+		if err := a.engine.CheckpointDurable(ctx); err != nil {
+			shutdownErrs = append(shutdownErrs, err)
+		}
+		if err := a.verifyMaintenanceLeases(); err != nil {
+			shutdownErrs = append(shutdownErrs, err)
+		}
+		if err := a.bindMaintenanceRuntime(); err != nil {
+			shutdownErrs = append(shutdownErrs, err)
+		}
+		shutdownErrs = append(shutdownErrs, a.maintenanceBarrierError(ctx))
+		if errors.Join(shutdownErrs...) == nil {
+			if err := a.maintenance.phase("persisted"); err != nil {
+				shutdownErrs = append(shutdownErrs, err)
+			}
+		}
+	}
 	log.Println("Server stopped")
+	return errors.Join(shutdownErrs...)
 }

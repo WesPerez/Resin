@@ -761,6 +761,23 @@ func (r *Router) RangeLeases(platformID string, fn func(account string, lease Le
 	return true
 }
 
+// MaintenanceLeases enumerates every routing state, including a state whose
+// platform was removed. Valid only after all owning mutation sources joined;
+// this API is not a live cross-handler read/write fence.
+func (r *Router) MaintenanceLeases() []model.Lease {
+	var leases []model.Lease
+	r.states.Range(func(platformID string, state *PlatformRoutingState) bool {
+		state.Leases.Range(func(account string, lease Lease) bool {
+			leases = append(leases, model.Lease{PlatformID: platformID, Account: account,
+				NodeHash: lease.NodeHash.Hex(), EgressIP: lease.EgressIP.String(),
+				CreatedAtNs: lease.CreatedAtNs, ExpiryNs: lease.ExpiryNs, LastAccessedNs: lease.LastAccessedNs})
+			return true
+		})
+		return true
+	})
+	return leases
+}
+
 // DeleteLease removes a single lease by platform and account.
 // Returns true if a lease was deleted. Emits a LeaseRemove event.
 func (r *Router) DeleteLease(platformID, account string) bool {

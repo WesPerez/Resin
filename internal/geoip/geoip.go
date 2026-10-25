@@ -230,6 +230,13 @@ func (s *Service) isStale(modTime time.Time) bool {
 
 // Stop stops the cron scheduler and closes the reader.
 func (s *Service) Stop() {
+	s.StopUpdates()
+	s.CloseReader()
+}
+
+// StopUpdates joins download/update sources but preserves the lookup reader
+// until their consumers (proxy feedback and probes) have also stopped.
+func (s *Service) StopUpdates() {
 	if s.lifeCancel != nil {
 		s.lifeCancel()
 	}
@@ -241,8 +248,11 @@ func (s *Service) Stop() {
 
 	// Serialize Stop with UpdateNow to prevent post-stop reader reload.
 	s.updateMu.Lock()
-	defer s.updateMu.Unlock()
+	s.updateMu.Unlock()
+}
 
+// CloseReader must follow StopUpdates and the drain of all lookup consumers.
+func (s *Service) CloseReader() {
 	s.mu.Lock()
 	r := s.reader
 	s.reader = nil

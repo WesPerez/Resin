@@ -18,6 +18,10 @@ import (
 //  5. leases: remove entries whose platform_id is missing from state.platforms
 //     OR whose node_hash is missing from nodes_static.
 func RepairConsistency(stateDBPath string, cacheDB *sql.DB) error {
+	return repairConsistency(stateDBPath, cacheDB, false)
+}
+
+func repairConsistency(stateDBPath string, cacheDB *sql.DB, preserveLeases bool) error {
 	// ATTACH state.db so we can cross-query.
 	attachSQL := fmt.Sprintf("ATTACH DATABASE %q AS state_db", stateDBPath)
 	if _, err := cacheDB.Exec(attachSQL); err != nil {
@@ -56,6 +60,9 @@ func RepairConsistency(stateDBPath string, cacheDB *sql.DB) error {
 	}
 
 	for i, s := range stmts {
+		if preserveLeases && i == len(stmts)-1 {
+			continue
+		}
 		if _, err := tx.Exec(s); err != nil {
 			return fmt.Errorf("repair step %d: %w", i+1, err)
 		}
