@@ -191,7 +191,7 @@ func (b *liveBridge) stage(ctx context.Context, req liveStageRequest) error {
 	}
 	defer b.nativeMu.Unlock()
 	b.mu.Lock()
-	allowed := b.phase == "queued" && b.epoch == req.Epoch && b.inflight == 0 && b.probes == 0 && time.Now().Before(b.deadline)
+	allowed := !b.stopping && b.phase == "queued" && b.epoch == req.Epoch && b.inflight == 0 && b.probes == 0 && time.Now().Before(b.deadline)
 	deadline := b.deadline
 	b.mu.Unlock()
 	if !allowed {
@@ -251,7 +251,7 @@ func (b *liveBridge) activate(ctx context.Context, epoch uint64, digest string) 
 		return errors.New("staged identity differs")
 	}
 	b.mu.Lock()
-	ready := b.phase == "queued" && b.epoch == epoch && b.inflight == 0 && b.probes == 0 && time.Now().Before(b.deadline)
+	ready := !b.stopping && b.phase == "queued" && b.epoch == epoch && b.inflight == 0 && b.probes == 0 && time.Now().Before(b.deadline)
 	b.mu.Unlock()
 	if !ready {
 		return errors.New("activation no longer quiescent")
@@ -275,7 +275,7 @@ func (b *liveBridge) activate(ctx context.Context, epoch uint64, digest string) 
 		return err
 	}
 	b.mu.Lock()
-	if ctx.Err() != nil || b.phase != "queued" || b.epoch != epoch || b.inflight != 0 || b.probes != 0 || !time.Now().Before(b.deadline) {
+	if b.stopping || ctx.Err() != nil || b.phase != "queued" || b.epoch != epoch || b.inflight != 0 || b.probes != 0 || !time.Now().Before(b.deadline) {
 		b.resumeLocked()
 		b.mu.Unlock()
 		return errors.New("activation expired; bridge resumed")
@@ -344,7 +344,7 @@ func (b *liveBridge) probeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	b.mu.Lock()
-	if b.phase != "bridge" {
+	if b.stopping || b.phase != "bridge" {
 		b.mu.Unlock()
 		http.Error(w, "native probe unavailable", 409)
 		return
@@ -354,6 +354,36 @@ func (b *liveBridge) probeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() { b.mu.Lock(); b.probes--; b.mu.Unlock() }()
 	r.Header.Del("X-Resin-Live-Probe")
 	b.localHTTP.ServeHTTP(w, r)
+}
+
+// Join the control writers before the ordinary shutdown closes persistence.
+// Existing data tunnels remain owned by the endpoint server's normal drain.
+func (b *liveBridge) stopControl(ctx context.Context) error {
+	b.mu.Lock()
+	b.stopping = true
+	b.resumeLocked()
+	b.mu.Unlock()
+	for _, server := range []*http.Server{b.control, b.probe} {
+		if server != nil {
+			if err := server.Shutdown(ctx); err != nil {
+				return err
+			}
+		}
+	}
+	joined := make(chan struct{})
+	go func() {
+		b.transitionMu.Lock()
+		b.transitionMu.Unlock()
+		b.nativeMu.Lock()
+		b.nativeMu.Unlock()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Explicit local marker is the only restart permission for the imported DB.

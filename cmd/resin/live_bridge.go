@@ -31,6 +31,7 @@ type liveBridge struct {
 	source, bind     string
 	phase            string
 	durable          bool
+	stopping         bool
 	wake             chan struct{}
 	deadline         time.Time
 	epoch            uint64
@@ -95,6 +96,9 @@ func (b *liveBridge) pause(wait time.Duration) (uint64, error) {
 	defer b.mu.Unlock()
 	if b.phase != "bridge" {
 		return 0, errors.New("bridge is not available for pause")
+	}
+	if b.stopping {
+		return 0, errors.New("bridge is stopping")
 	}
 	b.epoch++
 	epoch := b.epoch

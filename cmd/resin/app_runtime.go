@@ -766,6 +766,11 @@ func (a *resinApp) shutdown(ctx context.Context, maintenance bool) error {
 
 func (a *resinApp) shutdownJoined(ctx context.Context, maintenance bool) error {
 	var shutdownErrs []error
+	if a.liveBridge != nil {
+		if err := a.liveBridge.stopControl(ctx); err != nil {
+			return errors.Join(err, errShutdownOwnershipRetained)
+		}
+	}
 	if maintenance {
 		if err := a.maintenance.phase("draining"); err != nil {
 			shutdownErrs = append(shutdownErrs, err)
