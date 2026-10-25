@@ -52,6 +52,12 @@ func (e *StateEngine) CheckpointDurable(ctx context.Context) error {
 	if err := e.WeakWriteBarrierError(); err != nil {
 		return err
 	}
+	return errors.Join(e.CheckpointHandoff(ctx), e.StrongWriteBarrierError(), e.WeakWriteBarrierError())
+}
+
+// CheckpointHandoff is used by an unserved live standby with no background
+// writers. Unlike terminal maintenance it must remain writable after activate.
+func (e *StateEngine) CheckpointHandoff(ctx context.Context) error {
 	var busy, logFrames, checkpointed int
 	if err := e.StateRepo.db.QueryRowContext(ctx, "PRAGMA wal_checkpoint(FULL)").Scan(&busy, &logFrames, &checkpointed); err != nil {
 		return fmt.Errorf("state checkpoint: %w", err)
@@ -74,7 +80,7 @@ func (e *StateEngine) CheckpointDurable(ctx context.Context) error {
 			return errors.New("database integrity confirmation failed")
 		}
 	}
-	return errors.Join(ctx.Err(), e.StrongWriteBarrierError(), e.WeakWriteBarrierError())
+	return ctx.Err()
 }
 
 // admitWeakMark retains mutationMu until the dirty set is updated. Rejected

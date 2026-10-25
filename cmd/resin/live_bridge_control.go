@@ -228,7 +228,7 @@ func (b *liveBridge) stage(ctx context.Context, req liveStageRequest) error {
 	if err = ctx.Err(); err != nil {
 		return err
 	}
-	if err = b.app.engine.CheckpointDurable(ctx); err != nil {
+	if err = b.app.engine.CheckpointHandoff(ctx); err != nil {
 		return err
 	}
 	if err = syncMaintenanceFiles(filepath.Join(b.app.envCfg.StateDir, "state.db"), filepath.Join(b.app.envCfg.CacheDir, "cache.db")); err != nil {
