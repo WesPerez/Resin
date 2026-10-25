@@ -246,6 +246,10 @@ func strongLogicalDigest(ctx context.Context, path string) (string, error) {
 		return "", err
 	}
 	defer db.Close()
+	return logicalDigestDB(ctx, db)
+}
+
+func logicalDigestDB(ctx context.Context, db *sql.DB) (string, error) {
 	schema, err := db.QueryContext(ctx, `SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name`)
 	if err != nil {
 		return "", err

@@ -50,6 +50,7 @@ type resinApp struct {
 	maintenance     *maintenanceController
 	fenced          bool
 	authority       *authorityController
+	liveBridge      *liveBridge
 }
 
 func run() error {
@@ -78,7 +79,11 @@ func run() error {
 		return err
 	}
 
-	app.startBackgroundServices()
+	if app.liveBridge == nil {
+		app.startBackgroundServices()
+	} else if err := app.liveBridge.startControl(); err != nil {
+		return err
+	}
 	serverErrCh := app.startServers()
 	return serveResinApp(app, dbCloser, serverErrCh)
 }
@@ -211,6 +216,15 @@ func constructResinApp(envCfg *config.EnvConfig, engine *state.StateEngine, fenc
 		engine:      engine,
 		maintenance: newMaintenanceController(envCfg.StateDir, envCfg.AdminToken, os.Getenv("RESIN_MAINTENANCE_ENABLED") == "1"),
 		runtimeCfg:  &atomic.Pointer[config.RuntimeConfig]{},
+	}
+	if !fenced {
+		app.liveBridge, err = bridgeFromEnvironment(envCfg.StateDir)
+		if err != nil {
+			return nil, err
+		}
+		if app.liveBridge != nil {
+			app.liveBridge.app = app
+		}
 	}
 	app.maintenance.record.ConfigDigest = configDigest
 	cfg, _, err := engine.GetSystemConfig()
@@ -605,6 +619,7 @@ func (a *resinApp) buildNetworkServers(engine *state.StateEngine) error {
 		a.metricsManager,
 	)
 	endpointManager.maintenance = a.maintenance
+	endpointManager.liveBridge = a.liveBridge
 	cpService.EndpointRuntime = endpointManager
 	defaultEndpoint := service.NewDefaultEndpoint(a.envCfg.ResinPort)
 	if err := endpointManager.ApplyEndpoint(defaultEndpoint); err != nil {

@@ -45,6 +45,7 @@ type endpointRuntimeManager struct {
 	socks5           inboundConnHandler
 	metricsSink      proxy.MetricsEventSink
 	maintenance      *maintenanceController
+	liveBridge       *liveBridge
 	runtimes         map[string]*managedEndpointRuntime
 	statuses         map[string]service.EndpointRuntimeStatus
 	started          bool
@@ -125,6 +126,16 @@ func (m *endpointRuntimeManager) ApplyEndpoint(endpoint model.Endpoint) error {
 		m.tokenAPI,
 	)
 	var socksHandler inboundConnHandler = &endpointSocksGate{current: currentConfig, next: m.socks5}
+	if m.liveBridge != nil {
+		if len(m.runtimes) != 0 {
+			_ = listener.Close()
+			return fmt.Errorf("live bridge supports only the default endpoint")
+		}
+		m.liveBridge.localHTTP = httpHandler
+		m.liveBridge.localSOCKS = socksHandler
+		httpHandler = m.liveBridge
+		socksHandler = m.liveBridge
+	}
 	if m.maintenance != nil {
 		httpHandler = m.maintenance.wrapHTTP(httpHandler)
 		socksHandler = &maintenanceSOCKS{controller: m.maintenance, next: socksHandler}
