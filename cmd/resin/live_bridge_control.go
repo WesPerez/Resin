@@ -178,7 +178,9 @@ func (b *liveBridge) stage(ctx context.Context, req liveStageRequest) error {
 		return errors.New("transition already running")
 	}
 	defer b.transitionMu.Unlock()
-	b.nativeMu.Lock()
+	if !b.nativeMu.TryLock() {
+		return errors.New("native probe is still running")
+	}
 	defer b.nativeMu.Unlock()
 	b.mu.Lock()
 	allowed := b.phase == "queued" && b.epoch == req.Epoch && b.inflight == 0 && b.probes == 0 && time.Now().Before(b.deadline)
@@ -239,6 +241,18 @@ func (b *liveBridge) activate(ctx context.Context, epoch uint64, digest string) 
 	b.mu.Unlock()
 	if !ready {
 		return errors.New("activation no longer quiescent")
+	}
+	rows, err := b.app.engine.LoadAllLeases()
+	if err != nil {
+		return err
+	}
+	actual, err := canonicalLeaseDigest(rows)
+	if err != nil || actual != record.LeaseDigest {
+		return errors.New("staged lease set changed")
+	}
+	strong, err := liveStrongDigest(ctx, filepath.Join(b.app.envCfg.StateDir, "state.db"))
+	if err != nil || strong != record.StrongDigest {
+		return errors.New("staged strong state changed")
 	}
 	// Persist intent outside the mode lock: a stalled fsync must not prevent
 	// the three-second timer from resuming the old authority.

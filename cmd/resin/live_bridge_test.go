@@ -167,6 +167,10 @@ func TestLiveBridgeOldTunnelAndKeepaliveSurviveModeFlip(t *testing.T) {
 	if _, err := b.pause(time.Second); err != nil {
 		t.Fatal(err)
 	}
+	until := time.Now().Add(time.Second)
+	for b.status()["inflight"] != 0 && time.Now().Before(until) {
+		time.Sleep(time.Millisecond)
+	}
 	if b.status()["inflight"] != 0 {
 		t.Fatal("established tunnel counted as handshake")
 	}

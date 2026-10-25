@@ -250,7 +250,12 @@ func strongLogicalDigest(ctx context.Context, path string) (string, error) {
 }
 
 func logicalDigestDB(ctx context.Context, db *sql.DB) (string, error) {
-	schema, err := db.QueryContext(ctx, `SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name`)
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	schema, err := tx.QueryContext(ctx, `SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name`)
 	if err != nil {
 		return "", err
 	}
@@ -278,7 +283,7 @@ func logicalDigestDB(ctx context.Context, db *sql.DB) (string, error) {
 			continue
 		}
 		quoted := `"` + strings.ReplaceAll(t.name, `"`, `""`) + `"`
-		r, err := db.QueryContext(ctx, "SELECT * FROM "+quoted)
+		r, err := tx.QueryContext(ctx, "SELECT * FROM "+quoted)
 		if err != nil {
 			return "", err
 		}

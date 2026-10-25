@@ -11,7 +11,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -197,6 +199,10 @@ func (b *liveBridge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b.localHTTP.ServeHTTP(w, r)
 		return
 	}
+	if r.Method != http.MethodConnect {
+		b.forwardHTTP(w, r, release)
+		return
+	}
 	c, closeConn, err := b.dial(r.Context())
 	if err != nil {
 		http.Error(w, "bridge source unavailable", 502)
@@ -269,6 +275,76 @@ func bridgeBytes(dst io.Writer, src io.Reader, n int) ([]byte, error) {
 	}
 	_, err := dst.Write(p)
 	return p, err
+}
+
+func (b *liveBridge) forwardHTTP(w http.ResponseWriter, r *http.Request, release func()) {
+	var upstream net.Conn
+	var cleanup func()
+	transport := &http.Transport{
+		DisableKeepAlives:     true,
+		ForceAttemptHTTP2:     false,
+		ExpectContinueTimeout: time.Second,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var err error
+			upstream, cleanup, err = b.dial(ctx)
+			return upstream, err
+		},
+	}
+	defer transport.CloseIdleConnections()
+	defer func() {
+		if cleanup != nil {
+			cleanup()
+		}
+	}()
+	out := r.Clone(r.Context())
+	out.RequestURI = ""
+	out.GetBody = nil
+	if out.URL.IsAbs() {
+		transport.Proxy = func(*http.Request) (*url.URL, error) { return &url.URL{Scheme: "http", Host: b.source}, nil }
+	} else {
+		out.URL.Scheme = "http"
+		out.URL.Host = b.source
+	}
+	response, err := transport.RoundTrip(out)
+	if err != nil {
+		http.Error(w, "bridge response failed", 502)
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusSwitchingProtocols {
+		duplex, ok := response.Body.(io.ReadWriteCloser)
+		hijacker, hj := w.(http.Hijacker)
+		if !ok || !hj {
+			http.Error(w, "bridge upgrade unavailable", 502)
+			return
+		}
+		client, buffer, err := hijacker.Hijack()
+		if err != nil {
+			return
+		}
+		defer client.Close()
+		fmt.Fprintf(buffer, "HTTP/1.1 %s\r\n", response.Status)
+		response.Header.Write(buffer)
+		buffer.WriteString("\r\n")
+		if buffer.Flush() != nil {
+			return
+		}
+		b.tunnel(upstream, release)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); io.Copy(duplex, buffer); duplex.Close() }()
+		go func() { defer wg.Done(); io.Copy(client, duplex); client.Close() }()
+		wg.Wait()
+		return
+	}
+	copyBridgeHeaders(w.Header(), response.Header)
+	w.Header().Del("Connection")
+	w.Header().Del("Proxy-Connection")
+	w.Header().Del("Keep-Alive")
+	w.WriteHeader(response.StatusCode)
+	if _, err = io.Copy(bridgeFlushWriter{w}, response.Body); err != nil {
+		panic(http.ErrAbortHandler)
+	}
 }
 
 func bridgeSOCKSAddress(dst io.Writer, src io.Reader, atyp byte) error {
@@ -370,14 +446,17 @@ func (b *liveBridge) ServeConnContext(ctx context.Context, client net.Conn) {
 
 func bridgeFromEnvironment(stateDir string) (*liveBridge, error) {
 	source := os.Getenv("RESIN_LIVE_SOURCE")
-	if source == "" {
-		return nil, nil
-	}
 	local, err := readLiveRestart(stateDir)
 	if err != nil {
 		return nil, err
 	}
 	if local {
+		return nil, nil
+	}
+	if source == "" {
+		if _, err := os.Lstat(filepath.Join(stateDir, liveMarker)); !errors.Is(err, os.ErrNotExist) {
+			return nil, errors.New("uncommitted live marker requires bridge configuration")
+		}
 		return nil, nil
 	}
 	return newLiveBridge(source, os.Getenv("RESIN_LIVE_BIND"))
