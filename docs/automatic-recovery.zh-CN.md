@@ -29,6 +29,27 @@ Resin 在 CONNECT/SOCKS 隧道失败时直接通知路由模块；Sub2API 等调
 接口反馈在受限或关闭时返回 `recovery_limited`，保持原租约。调用方不得把它视为成功轮换，
 也不得无限重试；此前的 `available`、`rotated`、`stale_lease`、`no_alternative` 契约继续保留。
 
+## 已验证候选池
+
+同一 proxy-token 鉴权入口提供只读 `GET /proxy-api/v1/capabilities`，返回
+`recovery_version:1` 和 `preferred_candidates_version:1`，不分配租约。客户端明确确认
+此能力后，可在 acquire/report-failure 提交 `preferred_candidates`，每项为
+`node_hash`、`expected_target_ip`，最多60个唯一节点。缺字段或null保持旧合同；显式空列表
+保留已有租约并禁止替换，失败后不得删字段重发。
+
+已有租约的冷却、熔断、不可见、IP变化和过期恢复均受同一候选池约束；不会在前置
+acquire 中随机替换。当前租约仍健康时只更新访问时间；需要恢复时比较同一节点和代次，
+在共享限流下选第一个仍健康、属于该平台、IP一致且未冷却的不同出口。没有有效候选时
+保留原记录，已建立连接继续保留。只有候选感知 acquire 可以续接过期租约，旧管理员
+rotate和失败report仍拒绝过期代次。首次没有租约时沿用原生初次分配并排除仍在目标冷却中的
+节点/IP；本次已观察过租约后，任何重试都禁止再次初配。清理器在CAS前删除原代次时返回
+stale_lease；若并发请求已恢复到健康新代次，可安全读取该新租约，不重复消耗预算。
+
+此次候选基于生产40f520，仅增加能力和有界恢复，保留schema10、租约显示名及其CAS、
+现有UI、连接与发布合同。候选可用性来自调用方当前站点的匿名证明；它不能证明带凭据
+HTTP成功，也不授权业务POST重发。类型、全量Go/race及显示名浏览器验收均交hosted CI；
+正式发布前必须核对完整来源SHA、镜像digest及蓝绿交接门禁。
+
 ## 外部日志守卫的退役条件
 
 此变更覆盖 Resin 自己可见的隧道错误及客户端的结构化反馈。Sub2API 生产必须先运行带

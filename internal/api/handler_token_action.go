@@ -52,11 +52,22 @@ func NewTokenActionHandler(proxyToken string, cp *service.ControlPlaneService, a
 }
 
 func registerRecoveryActions(mux *http.ServeMux, proxyToken string, cp *service.ControlPlaneService) {
+	authorized := func(r *http.Request) bool {
+		auth := r.Header.Get("Authorization")
+		return proxyToken != "" && strings.HasPrefix(auth, "Bearer ") &&
+			subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(proxyToken)) == 1
+	}
+	mux.HandleFunc("GET /proxy-api/v1/capabilities", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r) {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		WriteJSON(w, http.StatusOK, map[string]int{"recovery_version": 1, "preferred_candidates_version": 1})
+	})
 	for _, action := range []string{"acquire", "report-failure"} {
 		mux.HandleFunc("POST /proxy-api/v1/{platform}/leases/{account}/actions/"+action, func(w http.ResponseWriter, r *http.Request) {
-			auth := r.Header.Get("Authorization")
-			if proxyToken == "" || !strings.HasPrefix(auth, "Bearer ") ||
-				subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(proxyToken)) != 1 {
+			if !authorized(r) {
 				http.NotFound(w, r)
 				return
 			}

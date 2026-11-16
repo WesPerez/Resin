@@ -1,11 +1,48 @@
 package api
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/Resinat/Resin/internal/model"
 )
+
+func TestRecoveryCapabilities_AuthenticatedReadDoesNotCreateLease(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+	platformID := mustCreatePlatform(t, srv, "Recovery")
+	for _, tc := range []struct {
+		name, configured, auth string
+		status                 int
+	}{
+		{"missing", "test-secret", "", 404}, {"wrong", "test-secret", "Bearer wrong", 404},
+		{"admin", "test-secret", "Bearer " + testAdminToken, 404}, {"empty", "", "Bearer test-secret", 404},
+		{"good", "test-secret", "Bearer test-secret", 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := NewTokenActionHandler(tc.configured, cp, 1<<20)
+			req := httptest.NewRequest(http.MethodGet, "/proxy-api/v1/capabilities", nil)
+			req.Header.Set("Authorization", tc.auth)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tc.status {
+				t.Fatalf("status=%d want=%d body=%s", rec.Code, tc.status, rec.Body.String())
+			}
+			if rec.Code == 200 {
+				value := decodeJSONMap(t, rec)
+				if len(value) != 2 || value["recovery_version"] != float64(1) || value["preferred_candidates_version"] != float64(1) || rec.Header().Get("Cache-Control") != "no-store" {
+					t.Fatalf("invalid capability response: %v", value)
+				}
+			}
+			if cp.Router.ReadLease(model.LeaseKey{PlatformID: platformID, Account: "sub2-test"}) != nil {
+				t.Fatal("capability read allocated a lease")
+			}
+		})
+	}
+}
 
 func TestRecoveryActions_AuthenticationAndContract(t *testing.T) {
 	srv, cp, _ := newControlPlaneTestServer(t)
@@ -100,6 +137,52 @@ func TestRecoveryStatus_RequiresAdminAndExposesNoIdentities(t *testing.T) {
 	for _, field := range []string{"account", "token", "node", "platform_id"} {
 		if _, found := value[field]; found {
 			t.Fatalf("unexpected identity field: %s", field)
+		}
+	}
+}
+
+func TestRecoveryActions_PreferredPoolJSONContract(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+	mustCreatePlatform(t, srv, "Recovery")
+	handler := NewTokenActionHandler("test-secret", cp, 1<<20)
+	candidates := make([]map[string]string, 60)
+	for i := range candidates {
+		candidates[i] = map[string]string{"node_hash": fmt.Sprintf("%032x", i+1), "expected_target_ip": fmt.Sprintf("198.51.100.%d", i+1)}
+	}
+	for _, action := range []string{"acquire", "report-failure"} {
+		for _, tc := range []struct {
+			name   string
+			value  any
+			omit   bool
+			status int
+		}{
+			{"legacy", nil, true, 200}, {"null", nil, false, 200}, {"empty", []any{}, false, 200},
+			{"sixty", candidates, false, 200}, {"sixty-one", append(candidates, candidates[0]), false, 400},
+			{"nested-unknown", []map[string]any{{"node_hash": fmt.Sprintf("%032x", 1), "expected_target_ip": "198.51.100.1", "extra": true}}, false, 400},
+			{"not-array", "invalid", false, 400},
+		} {
+			t.Run(action+"/"+tc.name, func(t *testing.T) {
+				value := map[string]any{"target_host": "example.com:443"}
+				if !tc.omit {
+					value["preferred_candidates"] = tc.value
+				}
+				if action == "report-failure" {
+					value["expected_node_hash"] = fmt.Sprintf("%032x", 1)
+					value["expected_created_at_ns"] = "1"
+					value["reason"] = "transport_error"
+				}
+				body, err := json.Marshal(value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req := httptest.NewRequest(http.MethodPost, "/proxy-api/v1/Recovery/leases/account/actions/"+action, strings.NewReader(string(body)))
+				req.Header.Set("Authorization", "Bearer test-secret")
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, req)
+				if rec.Code != tc.status {
+					t.Fatalf("status=%d want=%d body=%s", rec.Code, tc.status, rec.Body.String())
+				}
+			})
 		}
 	}
 }

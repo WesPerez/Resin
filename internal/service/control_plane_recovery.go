@@ -15,7 +15,8 @@ import (
 )
 
 type AcquireRecoveryLeaseRequest struct {
-	TargetHost string `json:"target_host"`
+	TargetHost          string              `json:"target_host"`
+	PreferredCandidates []RecoveryCandidate `json:"preferred_candidates"`
 }
 
 type RecoveryLeaseResponse struct {
@@ -25,10 +26,37 @@ type RecoveryLeaseResponse struct {
 }
 
 type ReportLeaseFailureRequest struct {
-	TargetHost          string `json:"target_host"`
-	ExpectedNodeHash    string `json:"expected_node_hash"`
-	ExpectedCreatedAtNs string `json:"expected_created_at_ns"`
-	Reason              string `json:"reason"`
+	TargetHost          string              `json:"target_host"`
+	ExpectedNodeHash    string              `json:"expected_node_hash"`
+	ExpectedCreatedAtNs string              `json:"expected_created_at_ns"`
+	Reason              string              `json:"reason"`
+	PreferredCandidates []RecoveryCandidate `json:"preferred_candidates"`
+}
+
+type RecoveryCandidate struct {
+	NodeHash         string `json:"node_hash"`
+	ExpectedTargetIP string `json:"expected_target_ip"`
+}
+
+func recoveryCandidates(values []RecoveryCandidate) ([]routing.PreferredCandidate, error) {
+	if values == nil {
+		return nil, nil
+	}
+	if len(values) > 60 {
+		return nil, invalidArg("preferred_candidates: exceeds 60")
+	}
+	result := make([]routing.PreferredCandidate, 0, len(values))
+	seen := make(map[node.Hash]bool)
+	for _, value := range values {
+		hash, err := node.ParseHex(value.NodeHash)
+		ip, ipErr := netip.ParseAddr(value.ExpectedTargetIP)
+		if err != nil || hash.IsZero() || seen[hash] || ipErr != nil || ip.Zone() != "" || !ip.IsGlobalUnicast() {
+			return nil, invalidArg("preferred_candidates: invalid or duplicate candidate")
+		}
+		seen[hash] = true
+		result = append(result, routing.PreferredCandidate{NodeHash: hash, ExpectedTargetIP: ip.Unmap()})
+	}
+	return result, nil
 }
 
 func validateRecoveryIdentity(platformName, account, target string) error {
@@ -57,16 +85,30 @@ func (s *ControlPlaneService) AcquireRecoveryLease(platformName, account string,
 	if err := validateRecoveryIdentity(platformName, account, req.TargetHost); err != nil {
 		return nil, err
 	}
-	return s.acquireRecoveryLease(platformName, account, req, 2)
+	if _, err := recoveryCandidates(req.PreferredCandidates); err != nil {
+		return nil, err
+	}
+	return s.acquireRecoveryLease(platformName, account, req, 2, true)
 }
 
-func (s *ControlPlaneService) acquireRecoveryLease(platformName, account string, req AcquireRecoveryLeaseRequest, retries int) (*RecoveryLeaseResponse, error) {
-	route, err := s.Router.AcquireRecoveryRoute(platformName, account, req.TargetHost)
+func (s *ControlPlaneService) acquireRecoveryLease(platformName, account string, req AcquireRecoveryLeaseRequest, retries int, allowInitial bool) (*RecoveryLeaseResponse, error) {
+	candidates, _ := recoveryCandidates(req.PreferredCandidates) // Validated before acquisition.
+	route, err := s.Router.AcquireRecoveryRouteWithCandidates(platformName, account, req.TargetHost, candidates, allowInitial)
 	if errors.Is(err, routing.ErrPlatformNotFound) {
 		return nil, notFound("platform not found")
 	}
-	if errors.Is(err, routing.ErrNoAvailableNodes) {
-		response := &RecoveryLeaseResponse{RecoveryVersion: 1, Status: "no_alternative"}
+	if errors.Is(err, routing.ErrLeaseChanged) && retries > 0 {
+		return s.acquireRecoveryLease(platformName, account, req, retries-1, false)
+	}
+	if errors.Is(err, routing.ErrNoAvailableNodes) || errors.Is(err, routing.ErrLeaseChanged) ||
+		errors.Is(err, routing.ErrRecoveryLimited) || errors.Is(err, routing.ErrRecoveryDisabled) {
+		status := "no_alternative"
+		if errors.Is(err, routing.ErrLeaseChanged) {
+			status = "stale_lease"
+		} else if errors.Is(err, routing.ErrRecoveryLimited) || errors.Is(err, routing.ErrRecoveryDisabled) {
+			status = "recovery_limited"
+		}
+		response := &RecoveryLeaseResponse{RecoveryVersion: 1, Status: status}
 		if plat, ok := s.Pool.GetPlatformByName(platformName); ok {
 			if current := s.Router.ReadLease(model.LeaseKey{PlatformID: plat.ID, Account: account}); current != nil {
 				value := leaseToResponse(*current, s.resolveLeaseNodeTagFromHex(current.NodeHash))
@@ -80,14 +122,15 @@ func (s *ControlPlaneService) acquireRecoveryLease(platformName, account string,
 	}
 	status := "available"
 	if s.Router.TargetCooling(route.PlatformID, account, req.TargetHost, route.NodeHash, route.EgressIP) {
+		candidates, _ := recoveryCandidates(req.PreferredCandidates) // Validated before any acquisition.
 		_, _, err = s.Router.RecoverLease(route.PlatformID, account, route.NodeHash, route.LeaseCreatedAtNs, req.TargetHost,
-			routing.RotateLeaseOptions{PreserveConnections: true, ApplyTargetCooldown: true})
+			routing.RotateLeaseOptions{PreserveConnections: true, ApplyTargetCooldown: true, PreferredCandidates: candidates})
 		if errors.Is(err, routing.ErrNoAvailableNodes) {
 			status = "no_alternative"
 		} else if errors.Is(err, routing.ErrRecoveryLimited) || errors.Is(err, routing.ErrRecoveryDisabled) {
 			status = "recovery_limited"
 		} else if errors.Is(err, routing.ErrLeaseChanged) && retries > 0 {
-			return s.acquireRecoveryLease(platformName, account, req, retries-1)
+			return s.acquireRecoveryLease(platformName, account, req, retries-1, false)
 		} else if errors.Is(err, routing.ErrLeaseChanged) {
 			status = "stale_lease"
 		} else if err != nil && !errors.Is(err, routing.ErrLeaseChanged) {
@@ -102,7 +145,7 @@ func (s *ControlPlaneService) acquireRecoveryLease(platformName, account string,
 	ip, _ := netip.ParseAddr(lease.EgressIP)
 	if status == "available" && s.Router.TargetCooling(route.PlatformID, account, req.TargetHost, hash, ip) {
 		if retries > 0 {
-			return s.acquireRecoveryLease(platformName, account, req, retries-1)
+			return s.acquireRecoveryLease(platformName, account, req, retries-1, false)
 		}
 		status = "stale_lease"
 	}
@@ -114,6 +157,10 @@ func (s *ControlPlaneService) acquireRecoveryLease(platformName, account string,
 func (s *ControlPlaneService) ReportLeaseFailure(platformName, account string, req ReportLeaseFailureRequest) (*RecoveryLeaseResponse, error) {
 	if err := validateRecoveryIdentity(platformName, account, req.TargetHost); err != nil {
 		return nil, err
+	}
+	candidates, candidateErr := recoveryCandidates(req.PreferredCandidates)
+	if candidateErr != nil {
+		return nil, candidateErr
 	}
 	switch req.Reason {
 	case "empty_stream", "invalid_stream", "transport_error":
@@ -133,7 +180,8 @@ func (s *ControlPlaneService) ReportLeaseFailure(platformName, account string, r
 		return nil, notFound("platform not found")
 	}
 	lease, _, err := s.Router.RecoverLease(plat.ID, account, hash, created, req.TargetHost,
-		routing.RotateLeaseOptions{ExcludeEgressIP: true, PreserveConnections: true, ApplyTargetCooldown: true, FailureCooldown: 10 * time.Minute})
+		routing.RotateLeaseOptions{ExcludeEgressIP: true, PreserveConnections: true, ApplyTargetCooldown: true, FailureCooldown: 10 * time.Minute,
+			PreferredCandidates: candidates})
 	status := "rotated"
 	if errors.Is(err, routing.ErrLeaseChanged) {
 		status = "stale_lease"

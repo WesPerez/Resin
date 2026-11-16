@@ -68,6 +68,11 @@ func (r *Router) RegisterLeaseConnection(route RouteResult, account string, clos
 	}, true
 }
 
+type PreferredCandidate struct {
+	NodeHash         node.Hash
+	ExpectedTargetIP netip.Addr
+}
+
 type RotateLeaseOptions struct {
 	ExcludeEgressIP     bool
 	PreserveConnections bool
@@ -80,18 +85,21 @@ type RotateLeaseOptions struct {
 	// original lease intact instead of silently choosing an unaudited node.
 	PreferredNode    node.Hash
 	ExpectedTargetIP netip.Addr
+	// Non-nil lists constrain automatic replacement to this ordered pool.
+	// An empty list permits observing the current lease, but no replacement.
+	PreferredCandidates []PreferredCandidate
 }
 
 // RotateLease replaces exactly the observed lease. No candidate leaves it intact.
 // HTTP-level failures can preserve established tunnels; new dials use the new lease.
 func (r *Router) RotateLease(platformID, account string, expectedNode node.Hash, expectedCreatedAtNs int64, target string, options RotateLeaseOptions) (*model.Lease, int, error) {
-	return r.rotateLease(platformID, account, expectedNode, expectedCreatedAtNs, target, options, false)
+	return r.rotateLease(platformID, account, expectedNode, expectedCreatedAtNs, target, options, false, false)
 }
 
 // RecoverLease applies shared automatic-recovery limits to an observed generation.
 // Both proxy events and authenticated failure reports use this entry point.
 func (r *Router) RecoverLease(platformID, account string, expectedNode node.Hash, expectedCreatedAtNs int64, target string, options RotateLeaseOptions) (*model.Lease, int, error) {
-	return r.rotateLease(platformID, account, expectedNode, expectedCreatedAtNs, target, options, true)
+	return r.rotateLease(platformID, account, expectedNode, expectedCreatedAtNs, target, options, true, false)
 }
 
 // RecoveryAttempt captures the observed lease for one bounded dial sequence.
@@ -129,10 +137,12 @@ func (r *Router) CommitRecovery(grant *RecoveryAttempt, target string, options R
 		return nil, 0, ErrLeaseChanged
 	}
 	key := grant.key
-	return r.rotateLease(key.platformID, key.account, key.node, key.createdAtNs, target, options, true)
+	return r.rotateLease(key.platformID, key.account, key.node, key.createdAtNs, target, options, true, false)
 }
 
-func (r *Router) rotateLease(platformID, account string, expectedNode node.Hash, expectedCreatedAtNs int64, target string, options RotateLeaseOptions, automatic bool) (*model.Lease, int, error) {
+// Only candidate-aware acquisition can renew an expired observed generation.
+// Administrator/report/dial recovery retain their existing expiry barrier.
+func (r *Router) rotateLease(platformID, account string, expectedNode node.Hash, expectedCreatedAtNs int64, target string, options RotateLeaseOptions, automatic, allowExpired bool) (*model.Lease, int, error) {
 	plat, ok := r.pool.GetPlatform(platformID)
 	if !ok {
 		return nil, 0, ErrPlatformNotFound
@@ -145,7 +155,7 @@ func (r *Router) rotateLease(platformID, account string, expectedNode node.Hash,
 	r.recoveryMu.Lock()
 	_, _ = state.Leases.leases.Compute(account, func(current Lease, loaded bool) (Lease, xsync.ComputeOp) {
 		now := time.Now()
-		if !loaded || current.IsExpired(now) || current.NodeHash != expectedNode || current.CreatedAtNs != expectedCreatedAtNs {
+		if !loaded || current.IsExpired(now) && !allowExpired || current.NodeHash != expectedNode || current.CreatedAtNs != expectedCreatedAtNs {
 			rotateErr = ErrLeaseChanged
 			return current, xsync.CancelOp
 		}
@@ -177,17 +187,32 @@ func (r *Router) rotateLease(platformID, account string, expectedNode node.Hash,
 		}
 		nowNs := max(now.UnixNano(), current.CreatedAtNs+1)
 		var replacement Lease
-		if !options.PreferredNode.IsZero() || options.ExpectedTargetIP.IsValid() {
-			entry, exists := r.pool.GetEntry(options.PreferredNode)
-			if options.PreferredNode.IsZero() || !options.ExpectedTargetIP.IsValid() || !exists || (!options.VerifiedPreferred && !entry.IsHealthy()) ||
-				!plat.View().Contains(options.PreferredNode) || excluded.contains(options.PreferredNode) ||
-				entry.GetEgressIP() != options.ExpectedTargetIP {
+		if options.PreferredCandidates != nil || !options.PreferredNode.IsZero() || options.ExpectedTargetIP.IsValid() {
+			candidates := options.PreferredCandidates
+			if candidates == nil {
+				candidates = []PreferredCandidate{{options.PreferredNode, options.ExpectedTargetIP}}
+			} else if len(candidates) > 60 || !options.PreferredNode.IsZero() || options.ExpectedTargetIP.IsValid() || options.VerifiedPreferred {
 				rotateErr = ErrNoAvailableNodes
 				return current, xsync.CancelOp
 			}
-			replacement = leaseForNode(plat, options.PreferredNode, entry.GetEgressIP(), now, nowNs)
-			if replacement.EgressIP != options.ExpectedTargetIP || entry.GetEgressIP() != options.ExpectedTargetIP ||
-				(!options.VerifiedPreferred && !entry.IsHealthy()) || !plat.View().Contains(options.PreferredNode) {
+			selected := false
+			for _, candidate := range candidates {
+				entry, exists := r.pool.GetEntry(candidate.NodeHash)
+				if candidate.NodeHash.IsZero() || !candidate.ExpectedTargetIP.IsValid() || !exists || (!options.VerifiedPreferred && !entry.IsHealthy()) ||
+					!plat.View().Contains(candidate.NodeHash) || excluded.contains(candidate.NodeHash) || entry.GetEgressIP() != candidate.ExpectedTargetIP {
+					continue
+				}
+				value := leaseForNode(plat, candidate.NodeHash, entry.GetEgressIP(), now, nowNs)
+				if value.EgressIP != candidate.ExpectedTargetIP || entry.GetEgressIP() != candidate.ExpectedTargetIP ||
+					(!options.VerifiedPreferred && !entry.IsHealthy()) || !plat.View().Contains(candidate.NodeHash) ||
+					options.ApplyTargetCooldown && !options.VerifiedPreferred && r.targetCoolingLocked(platformID, account, target, candidate.NodeHash, value.EgressIP, now) ||
+					value.NodeHash == current.NodeHash || options.ExcludeEgressIP && value.EgressIP == current.EgressIP {
+					continue
+				}
+				replacement, selected = value, true
+				break
+			}
+			if !selected {
 				rotateErr = ErrNoAvailableNodes
 				return current, xsync.CancelOp
 			}

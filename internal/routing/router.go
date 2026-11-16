@@ -104,6 +104,80 @@ func (r *Router) AcquireRecoveryRoute(platName, account, target string) (RouteRe
 	return r.routeRequest(platName, account, target, nil, true)
 }
 
+// Existing bindings never reach ordinary random/same-IP replacement when a
+// candidate list was supplied. Observation is atomic with the account lease;
+// recovery then compares that exact generation under the shared policy lock.
+// A missing lease retains the native initial-allocation contract only on the
+// first acquisition. After observing a lease, callers must disable allocation on
+// every retry so concurrent deletion cannot turn recovery into random routing.
+func (r *Router) AcquireRecoveryRouteWithCandidates(platName, account, target string, candidates []PreferredCandidate, allowInitial bool) (RouteResult, error) {
+	if candidates == nil {
+		return r.AcquireRecoveryRoute(platName, account, target)
+	}
+	if account == "" || HasLeaseGuard(account) || len(candidates) > 60 {
+		return RouteResult{}, ErrLeaseGuard
+	}
+	plat, err := r.resolvePlatform(platName)
+	if err != nil {
+		return RouteResult{}, err
+	}
+	state := r.ensurePlatformState(plat.ID)
+	var observed Lease
+	var result RouteResult
+	var routeErr error
+	var events []LeaseEvent
+	needsRecovery := false
+	r.recoveryMu.RLock()
+	_, _ = state.Leases.leases.Compute(account, func(current Lease, loaded bool) (Lease, xsync.ComputeOp) {
+		now := time.Now()
+		if !loaded {
+			if !allowInitial {
+				routeErr = ErrLeaseChanged
+				return current, xsync.CancelOp
+			}
+			excluded := make(nodeExclusionSet)
+			r.addTargetCooldownExclusionsLocked(plat.ID, account, target, now, excluded)
+			lease, op, route, failure := r.decideStickyLease(plat, state, account, netutil.ExtractDomain(target),
+				now, now.UnixNano(), current, false, excluded, &events, true)
+			result, routeErr = route, failure
+			return lease, op
+		}
+		entry, exists := r.pool.GetEntry(current.NodeHash)
+		if !current.IsExpired(now) && exists && entry.IsHealthy() &&
+			!r.targetCoolingLocked(plat.ID, account, target, current.NodeHash, current.EgressIP, now) {
+			if touched, route, ok := r.tryLeaseHit(plat, account, current, now.UnixNano(), nil, &events); ok {
+				result = route
+				return touched, xsync.UpdateOp
+			}
+		}
+		observed, needsRecovery = current, true
+		return current, xsync.CancelOp
+	})
+	r.recoveryMu.RUnlock()
+	for _, event := range events {
+		r.emitLeaseEvent(event)
+	}
+	if routeErr != nil {
+		return RouteResult{}, routeErr
+	}
+	if needsRecovery {
+		lease, _, failure := r.rotateLease(plat.ID, account, observed.NodeHash, observed.CreatedAtNs, target,
+			RotateLeaseOptions{PreferredCandidates: candidates, ExcludeEgressIP: true, PreserveConnections: true,
+				ApplyTargetCooldown: true}, true, true)
+		if failure != nil {
+			return RouteResult{}, failure
+		}
+		hash, _ := node.ParseHex(lease.NodeHash)
+		result = RouteResult{NodeHash: hash, EgressIP: netip.MustParseAddr(lease.EgressIP),
+			LeaseCreatedAtNs: lease.CreatedAtNs}
+	}
+	result = withPlatformContext(plat, result)
+	if r.nodeTagResolver != nil {
+		result.NodeTag = r.nodeTagResolver(result.NodeHash)
+	}
+	return result, nil
+}
+
 // RouteRequestExcluding routes one request while excluding a node that failed
 // earlier in the same connection attempt.
 func (r *Router) RouteRequestExcluding(platName, account, target string, excluded node.Hash) (RouteResult, error) {
