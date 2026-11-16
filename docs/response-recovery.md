@@ -67,6 +67,23 @@ consumes one shared rotation budget; stale/limited responses retain their old
 meaning. Initial creation of a missing lease still follows the normal platform
 allocation contract; this option constrains replacement of existing leases.
 
-Deploy the compatible Resin artifact before enabling clients that send this
-field. These candidates are application hints, not proof that business HTTP
-requests are safe to replay. Application request journals remain authoritative.
+Clients first authenticate a read-only `GET /proxy-api/v1/capabilities` on the
+same proxy endpoint. The response explicitly declares
+`{"recovery_version":1,"preferred_candidates_version":1}`; the existing recovery
+version alone does not imply support for candidate lists. This endpoint requires
+the proxy token, works without management access and does not allocate a lease.
+
+Metapi sends the field only after that declaration. With an older or unknown
+service, existing accounts read their fixed lease through the same registered
+management service, and failure reports do not rotate. Only a new precredential
+workflow that has confirmed a missing lease and saved its acquisition intent may
+request a single legacy initial allocation; lost outcomes require reconciliation.
+An unsupported POST is never retried after stripping the candidate field.
+
+The candidate artifact must also preserve the production schema and native
+maintenance/handoff contract before deployment. The current running source
+`40f5204951cddad4cfb34d9a628c84be46094516` is not an ancestor of this candidate;
+CI success alone does not authorize replacing that production version. The
+capability gate permits a safe Metapi rollout while candidate recovery remains
+disabled on the older Resin. These candidates are application hints, not proof
+that business HTTP requests are safe to replay. Request journals remain authoritative.

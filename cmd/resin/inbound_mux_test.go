@@ -103,6 +103,15 @@ func TestInboundMux_RecoveryNamespaceUsesProxyCapability(t *testing.T) {
 		if !allow && rec.Code != http.StatusForbidden {
 			t.Fatalf("disabled proxy accepted recovery: %d", rec.Code)
 		}
+		req = httptest.NewRequest(http.MethodGet, "/proxy-api/v1/capabilities", nil)
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if allow && rec.Header().Get("X-Route") != "recovery" {
+			t.Fatal("capability read went through admin or reverse proxy")
+		}
+		if !allow && rec.Code != http.StatusForbidden {
+			t.Fatalf("disabled proxy accepted capability read: %d", rec.Code)
+		}
 	}
 }
 

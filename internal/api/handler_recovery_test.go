@@ -7,7 +7,42 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/Resinat/Resin/internal/model"
 )
+
+func TestRecoveryCapabilities_AuthenticatedReadDoesNotCreateLease(t *testing.T) {
+	srv, cp, _ := newControlPlaneTestServer(t)
+	platformID := mustCreatePlatform(t, srv, "Recovery")
+	for _, tc := range []struct {
+		name, configured, auth string
+		status                 int
+	}{
+		{"missing", "test-secret", "", 404}, {"wrong", "test-secret", "Bearer wrong", 404},
+		{"admin", "test-secret", "Bearer " + testAdminToken, 404}, {"empty", "", "Bearer test-secret", 404},
+		{"good", "test-secret", "Bearer test-secret", 200},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := NewTokenActionHandler(tc.configured, cp, 1<<20)
+			req := httptest.NewRequest(http.MethodGet, "/proxy-api/v1/capabilities", nil)
+			req.Header.Set("Authorization", tc.auth)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tc.status {
+				t.Fatalf("status=%d want=%d body=%s", rec.Code, tc.status, rec.Body.String())
+			}
+			if rec.Code == 200 {
+				value := decodeJSONMap(t, rec)
+				if len(value) != 2 || value["recovery_version"] != float64(1) || value["preferred_candidates_version"] != float64(1) || rec.Header().Get("Cache-Control") != "no-store" {
+					t.Fatalf("invalid capability response: %v", value)
+				}
+			}
+			if cp.Router.ReadLease(model.LeaseKey{PlatformID: platformID, Account: "sub2-test"}) != nil {
+				t.Fatal("capability read allocated a lease")
+			}
+		})
+	}
+}
 
 func TestRecoveryActions_AuthenticationAndContract(t *testing.T) {
 	srv, cp, _ := newControlPlaneTestServer(t)
