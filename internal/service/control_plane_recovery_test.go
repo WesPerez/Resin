@@ -34,7 +34,7 @@ func TestRecoveryLease_NoAlternativeThenNewCandidate(t *testing.T) {
 	cp, plat := newLeaseInheritanceTestService()
 	plat.StickyTTLNs = int64(time.Hour)
 	a := recoveryTestNode(t, cp, "a", "198.51.100.1")
-	first, err := cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{"example.com:443"})
+	first, err := cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{TargetHost: "example.com:443"})
 	if err != nil || first.Status != "available" || first.Lease == nil {
 		t.Fatalf("acquire: %+v %v", first, err)
 	}
@@ -56,14 +56,14 @@ func TestRecoveryLease_NoAlternativeThenNewCandidate(t *testing.T) {
 		t.Fatal("cooldown escaped its account or target")
 	}
 	b := recoveryTestNode(t, cp, "b", "198.51.100.2")
-	result, err = cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{"example.com:443"})
+	result, err = cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{TargetHost: "example.com:443"})
 	if err != nil || result.Status != "available" || result.Lease.NodeHash != b.Hex() {
 		t.Fatalf("recovery: %+v %v", result, err)
 	}
 	if status := cp.Router.RecoveryStatus(); status.Rotated != 1 {
 		t.Fatalf("acquire bypassed guarded rotation accounting: %+v", status)
 	}
-	stable, err := cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{"example.com:443"})
+	stable, err := cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{TargetHost: "example.com:443"})
 	if err != nil || stable.Status != "available" || stable.Lease.CreatedAtNs != result.Lease.CreatedAtNs ||
 		cp.Router.RecoveryStatus().Rotated != 1 {
 		t.Fatalf("ordinary acquire changed the lease or rotation budget: %+v %v", stable, err)
@@ -73,12 +73,12 @@ func TestRecoveryLease_NoAlternativeThenNewCandidate(t *testing.T) {
 		t.Fatalf("must not bounce to A: %+v %v", result, err)
 	}
 	recoveryTestNode(t, cp, "same-a-ip", "198.51.100.1")
-	result, err = cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{"example.com:443"})
+	result, err = cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{TargetHost: "example.com:443"})
 	if err != nil || result.Status != "recovery_limited" {
 		t.Fatalf("cooled IP reused: %+v %v", result, err)
 	}
 	c := recoveryTestNode(t, cp, "c", "198.51.100.3")
-	result, err = cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{"example.com:443"})
+	result, err = cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{TargetHost: "example.com:443"})
 	if err != nil || result.Status != "recovery_limited" || result.Lease.NodeHash != b.Hex() {
 		t.Fatalf("acquire bypassed recovery limits: %+v %v", result, err)
 	}
@@ -100,7 +100,7 @@ func TestRecoveryLease_AcquirePreservesInvisibleLease(t *testing.T) {
 	original := model.Lease{PlatformID: plat.ID, Account: "account", NodeHash: node.HashFromRawOptions([]byte("missing")).Hex(),
 		EgressIP: "198.51.100.1", CreatedAtNs: now, ExpiryNs: now + int64(time.Hour), LastAccessedNs: now}
 	seedLease(t, cp, original)
-	result, err := cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{"example.com:443"})
+	result, err := cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{TargetHost: "example.com:443"})
 	if err != nil || result.Status != "no_alternative" || result.Lease == nil {
 		t.Fatalf("acquire: %+v %v", result, err)
 	}
@@ -117,7 +117,7 @@ func TestRecoveryLease_AcquireDoesNotCommitCooledSameIPReplacement(t *testing.T)
 	cp, plat := newLeaseInheritanceTestService()
 	plat.StickyTTLNs = int64(time.Hour)
 	a := recoveryTestNode(t, cp, "a", "198.51.100.1")
-	first, err := cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{"example.com:443"})
+	first, err := cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{TargetHost: "example.com:443"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestRecoveryLease_AcquireDoesNotCommitCooledSameIPReplacement(t *testing.T)
 	entry, _ := cp.Pool.GetEntry(a)
 	entry.Outbound.Store(nil)
 	cp.Pool.NotifyNodeDirty(a)
-	result, err = cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{"example.com:443"})
+	result, err = cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{TargetHost: "example.com:443"})
 	if err != nil || result.Status != "no_alternative" || result.Lease.NodeHash != a.Hex() {
 		t.Fatalf("cooled fallback committed: %+v %v", result, err)
 	}
@@ -144,7 +144,7 @@ func TestRecoveryLease_ConcurrentCASPreservesTunnelsAndRejectsStale(t *testing.T
 	cp, plat := newLeaseInheritanceTestService()
 	plat.StickyTTLNs = int64(time.Hour)
 	a := recoveryTestNode(t, cp, "a", "198.51.100.1")
-	first, err := cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{"example.com:443"})
+	first, err := cp.AcquireRecoveryLease(plat.Name, "account", AcquireRecoveryLeaseRequest{TargetHost: "example.com:443"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,9 @@ func TestRecoveryLease_ConcurrentCASPreservesTunnelsAndRejectsStale(t *testing.T
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result, err := cp.ReportLeaseFailure(plat.Name, "account", recoveryFailure(first.Lease))
+			req := recoveryFailure(first.Lease)
+			req.PreferredCandidates = []RecoveryCandidate{{NodeHash: b.Hex(), ExpectedTargetIP: "198.51.100.2"}}
+			result, err := cp.ReportLeaseFailure(plat.Name, "account", req)
 			if err != nil {
 				t.Errorf("report: %v", err)
 				return
@@ -197,5 +199,77 @@ func TestRecoveryLease_ConcurrentCASPreservesTunnelsAndRejectsStale(t *testing.T
 	}
 	if cp.Router.TargetCooling(plat.ID, "account", stale.TargetHost, a, netip.MustParseAddr("198.51.100.1")) {
 		t.Fatal("stale report created cooldown")
+	}
+}
+
+func TestRecoveryLease_PreferredPoolExhaustionAndCoolingAcquire(t *testing.T) {
+	cp, plat := newLeaseInheritanceTestService()
+	plat.StickyTTLNs = int64(time.Hour)
+	recoveryTestNode(t, cp, "original", "198.51.100.1")
+	first, err := cp.AcquireRecoveryLease(plat.Name, "pool", AcquireRecoveryLeaseRequest{TargetHost: "example.com:443"})
+	if err != nil || first.Lease == nil {
+		t.Fatalf("acquire: %+v %v", first, err)
+	}
+	outside := recoveryTestNode(t, cp, "outside", "198.51.100.2")
+	selected := recoveryTestNode(t, cp, "selected", "198.51.100.3")
+	req := recoveryFailure(first.Lease)
+	// Available nodes outside the supplied pool never become a silent fallback.
+	req.PreferredCandidates = []RecoveryCandidate{{NodeHash: outside.Hex(), ExpectedTargetIP: "198.51.100.99"}}
+	result, err := cp.ReportLeaseFailure(plat.Name, "pool", req)
+	if err != nil || result.Status != "no_alternative" || result.Lease.CreatedAtNs != first.Lease.CreatedAtNs {
+		t.Fatalf("exhaustion changed lease: %+v %v", result, err)
+	}
+	if status := cp.Router.RecoveryStatus(); status.NoAlternative != 1 || status.Rotated != 0 {
+		t.Fatalf("failed candidates counted as separate recovery attempts: %+v", status)
+	}
+	// Explicitly empty is a known exhausted pool, not the legacy random mode.
+	result, err = cp.AcquireRecoveryLease(plat.Name, "pool", AcquireRecoveryLeaseRequest{TargetHost: "example.com:443", PreferredCandidates: []RecoveryCandidate{}})
+	if err != nil || result.Status != "no_alternative" || result.Lease.CreatedAtNs != first.Lease.CreatedAtNs {
+		t.Fatalf("cooling acquire escaped the empty pool: %+v %v", result, err)
+	}
+	req.PreferredCandidates = append(req.PreferredCandidates, RecoveryCandidate{NodeHash: selected.Hex(), ExpectedTargetIP: "198.51.100.3"})
+	result, err = cp.AcquireRecoveryLease(plat.Name, "pool", AcquireRecoveryLeaseRequest{TargetHost: "example.com:443", PreferredCandidates: req.PreferredCandidates})
+	if err != nil || result.Status != "available" || result.Lease.NodeHash != selected.Hex() {
+		t.Fatalf("cooling acquire ignored ordered pool: %+v %v", result, err)
+	}
+	if cp.Router.RecoveryStatus().Rotated != 1 {
+		t.Fatal("pool bypassed shared rotation budget")
+	}
+	req = recoveryFailure(result.Lease)
+	req.PreferredCandidates = []RecoveryCandidate{{NodeHash: outside.Hex(), ExpectedTargetIP: "198.51.100.2"}}
+	result, err = cp.ReportLeaseFailure(plat.Name, "pool", req)
+	if err != nil || result.Status != "recovery_limited" || result.Lease.NodeHash != selected.Hex() {
+		t.Fatalf("preferred pool bypassed shared limit: %+v %v", result, err)
+	}
+}
+
+func TestRecoveryCandidatesValidateBeforeAnyMutation(t *testing.T) {
+	cp, plat := newLeaseInheritanceTestService()
+	hash := recoveryTestNode(t, cp, "original", "198.51.100.1")
+	first, err := cp.AcquireRecoveryLease(plat.Name, "validation", AcquireRecoveryLeaseRequest{TargetHost: "example.com:443"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := RecoveryCandidate{NodeHash: hash.Hex(), ExpectedTargetIP: "198.51.100.1"}
+	for _, values := range [][]RecoveryCandidate{
+		{{NodeHash: "bad", ExpectedTargetIP: "198.51.100.1"}},
+		{{NodeHash: hash.Hex(), ExpectedTargetIP: "127.0.0.1"}},
+		{{NodeHash: hash.Hex(), ExpectedTargetIP: "fe80::1%eth0"}},
+		{valid, valid}, make([]RecoveryCandidate, 61),
+	} {
+		req := recoveryFailure(first.Lease)
+		req.PreferredCandidates = values
+		if _, err := cp.ReportLeaseFailure(plat.Name, "validation", req); err == nil {
+			t.Fatal("accepted invalid list")
+		}
+		if _, err := cp.AcquireRecoveryLease(plat.Name, "validation", AcquireRecoveryLeaseRequest{TargetHost: "example.com:443", PreferredCandidates: values}); err == nil {
+			t.Fatal("acquire accepted invalid list")
+		}
+	}
+	if cp.Router.TargetCooling(plat.ID, "validation", "example.com:443", hash, netip.MustParseAddr("198.51.100.1")) {
+		t.Fatal("invalid input wrote cooldown")
+	}
+	if cp.Router.RecoveryStatus().NoAlternative != 0 {
+		t.Fatal("invalid input entered recovery")
 	}
 }

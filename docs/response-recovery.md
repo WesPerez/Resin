@@ -42,3 +42,31 @@ All same-IP node replacements also advance the generation, including A-B-A.
 Roll out Resin first, verify the capability using an isolated synthetic account,
 then enable the client integration. Older Resin returns no capability; the
 client must retain its existing proxy path and avoid guessing a generation.
+
+
+## Optional bounded preferred pool (2026-11-16)
+
+Both proxy-token `acquire` and `report-failure` accept `preferred_candidates`:
+
+```json
+{"target_host":"example.com:443","preferred_candidates":[{"node_hash":"11111111111111111111111111111111","expected_target_ip":"198.51.100.1"}]}
+```
+
+`report-failure` still requires its original expected node/generation and reason.
+The list has at most 60 unique node hashes and unscoped unicast expected IPs.
+All entries are validated before acquisition, cooling or recovery. Missing/null
+keeps the existing client contract. An explicit `[]` means no replacement is
+allowed; it must never be silently dropped by a client after an HTTP error.
+
+For an existing cooling lease, acquire uses the same list as report-failure.
+Selection checks each entry in order inside one recovery lock/CAS and respects
+platform membership, health, current IP, old exit exclusions and target cooling.
+Exhaustion returns `no_alternative`, retaining the original lease and active
+connections even when an unrelated routable node exists. Successful replacement
+consumes one shared rotation budget; stale/limited responses retain their old
+meaning. Initial creation of a missing lease still follows the normal platform
+allocation contract; this option constrains replacement of existing leases.
+
+Deploy the compatible Resin artifact before enabling clients that send this
+field. These candidates are application hints, not proof that business HTTP
+requests are safe to replay. Application request journals remain authoritative.

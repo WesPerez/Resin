@@ -68,6 +68,11 @@ func (r *Router) RegisterLeaseConnection(route RouteResult, account string, clos
 	}, true
 }
 
+type PreferredCandidate struct {
+	NodeHash         node.Hash
+	ExpectedTargetIP netip.Addr
+}
+
 type RotateLeaseOptions struct {
 	ExcludeEgressIP     bool
 	PreserveConnections bool
@@ -80,6 +85,9 @@ type RotateLeaseOptions struct {
 	// original lease intact instead of silently choosing an unaudited node.
 	PreferredNode    node.Hash
 	ExpectedTargetIP netip.Addr
+	// Non-nil lists constrain automatic replacement to this ordered pool.
+	// An empty list permits observing the current lease, but no replacement.
+	PreferredCandidates []PreferredCandidate
 }
 
 // RotateLease replaces exactly the observed lease. No candidate leaves it intact.
@@ -177,17 +185,31 @@ func (r *Router) rotateLease(platformID, account string, expectedNode node.Hash,
 		}
 		nowNs := max(now.UnixNano(), current.CreatedAtNs+1)
 		var replacement Lease
-		if !options.PreferredNode.IsZero() || options.ExpectedTargetIP.IsValid() {
-			entry, exists := r.pool.GetEntry(options.PreferredNode)
-			if options.PreferredNode.IsZero() || !options.ExpectedTargetIP.IsValid() || !exists || (!options.VerifiedPreferred && !entry.IsHealthy()) ||
-				!plat.View().Contains(options.PreferredNode) || excluded.contains(options.PreferredNode) ||
-				entry.GetEgressIP() != options.ExpectedTargetIP {
+		if options.PreferredCandidates != nil || !options.PreferredNode.IsZero() || options.ExpectedTargetIP.IsValid() {
+			candidates := options.PreferredCandidates
+			if candidates == nil {
+				candidates = []PreferredCandidate{{options.PreferredNode, options.ExpectedTargetIP}}
+			} else if len(candidates) > 60 || !options.PreferredNode.IsZero() || options.ExpectedTargetIP.IsValid() || options.VerifiedPreferred {
 				rotateErr = ErrNoAvailableNodes
 				return current, xsync.CancelOp
 			}
-			replacement = leaseForNode(plat, options.PreferredNode, entry.GetEgressIP(), now, nowNs)
-			if replacement.EgressIP != options.ExpectedTargetIP || entry.GetEgressIP() != options.ExpectedTargetIP ||
-				(!options.VerifiedPreferred && !entry.IsHealthy()) || !plat.View().Contains(options.PreferredNode) {
+			selected := false
+			for _, candidate := range candidates {
+				entry, exists := r.pool.GetEntry(candidate.NodeHash)
+				if candidate.NodeHash.IsZero() || !candidate.ExpectedTargetIP.IsValid() || !exists || (!options.VerifiedPreferred && !entry.IsHealthy()) ||
+					!plat.View().Contains(candidate.NodeHash) || excluded.contains(candidate.NodeHash) || entry.GetEgressIP() != candidate.ExpectedTargetIP {
+					continue
+				}
+				value := leaseForNode(plat, candidate.NodeHash, entry.GetEgressIP(), now, nowNs)
+				if value.EgressIP != candidate.ExpectedTargetIP || entry.GetEgressIP() != candidate.ExpectedTargetIP ||
+					(!options.VerifiedPreferred && !entry.IsHealthy()) || !plat.View().Contains(candidate.NodeHash) ||
+					value.NodeHash == current.NodeHash || options.ExcludeEgressIP && value.EgressIP == current.EgressIP {
+					continue
+				}
+				replacement, selected = value, true
+				break
+			}
+			if !selected {
 				rotateErr = ErrNoAvailableNodes
 				return current, xsync.CancelOp
 			}
