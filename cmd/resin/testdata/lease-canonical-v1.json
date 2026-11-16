@@ -1,0 +1,25 @@
+{
+  "version": "resin-lease-seven/v1",
+  "vectors": [
+    {
+      "leases": [],
+      "canonical": "[]",
+      "sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "leases": [
+        {
+          "platform_id": "fixture<&>\u2028\u2029\ud83d\ude00",
+          "account": "account\b\f\n\r\t\u0000\u0001\\\"",
+          "node_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "egress_ip": "203.0.113.9",
+          "created_at_ns": 1700000000000000001,
+          "expiry_ns": 1800000000000000002,
+          "last_accessed_ns": 1700000000000000003
+        }
+      ],
+      "canonical": "[{\"platform_id\":\"fixture\\u003c\\u0026\\u003e\\u2028\\u2029\ud83d\ude00\",\"account\":\"account\\b\\f\\n\\r\\t\\u0000\\u0001\\\\\\\"\",\"node_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"egress_ip\":\"203.0.113.9\",\"created_at_ns\":1700000000000000001,\"expiry_ns\":1800000000000000002,\"last_accessed_ns\":1700000000000000003}]",
+      "sha256": "92bb355de7ee36871d9cf57962336c16d1ea3390822990b56b8eff2de34d7922"
+    }
+  ]
+}

@@ -101,6 +101,8 @@ type tunnelFirstByteWatch struct {
 	state     atomic.Uint32
 	mu        sync.Mutex
 	timer     *time.Timer
+	timerDone chan struct{}
+	doneOnce  sync.Once
 }
 
 func (w *tunnelFirstByteWatch) start() {
@@ -112,7 +114,9 @@ func (w *tunnelFirstByteWatch) start() {
 	if w.timer != nil || w.state.Load() != firstByteWaiting {
 		return
 	}
+	w.timerDone = make(chan struct{})
 	w.timer = time.AfterFunc(w.timeout, func() {
+		defer w.doneOnce.Do(func() { close(w.timerDone) })
 		if w.state.CompareAndSwap(firstByteWaiting, firstByteTimedOut) && w.onTimeout != nil {
 			w.onTimeout()
 		}
@@ -140,10 +144,18 @@ func (w *tunnelFirstByteWatch) stop() {
 
 func (w *tunnelFirstByteWatch) stopTimer() {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.timer != nil {
-		w.timer.Stop()
+	if w.timer == nil {
+		w.mu.Unlock()
+		return
 	}
+	if w.timer.Stop() {
+		w.doneOnce.Do(func() { close(w.timerDone) })
+	}
+	done := w.timerDone
+	w.mu.Unlock()
+	// Timer.Stop does not wait for an already running callback. That callback
+	// can recover a lease, so the tunnel must join it before its handler exits.
+	<-done
 }
 
 func (w *tunnelFirstByteWatch) timedOut() bool {
@@ -221,7 +233,7 @@ func prepareConnectTunnel(
 
 		nodeHashRaw := routed.Route.NodeHash
 		if deps.health != nil {
-			go deps.health.RecordLatency(nodeHashRaw, domain, nil)
+			recordLatencyAsync(deps.health, nodeHashRaw, domain, nil)
 		}
 
 		rawConn, err := dialTunnelWithTimeout(ctx, deps.connectTimeout, func(dialCtx context.Context) (net.Conn, error) {
@@ -302,7 +314,7 @@ func prepareConnectTunnel(
 
 		upstreamConn := newTLSLatencyConn(upstreamBase, func(latency time.Duration) {
 			if deps.health != nil {
-				deps.health.RecordLatency(nodeHashRaw, domain, &latency)
+				recordLatencyAsync(deps.health, nodeHashRaw, domain, &latency)
 			}
 		})
 
@@ -474,10 +486,12 @@ func pumpPreparedTunnelReader(
 	firstByteWatch := &tunnelFirstByteWatch{
 		timeout: opts.firstByteTimeout,
 		onTimeout: func() {
+			// End both copies first. Recovery may contend on a router lock;
+			// it must not prevent the timeout from closing its connections.
+			closeBoth()
 			if opts.onFirstByteTimeout != nil {
 				opts.onFirstByteTimeout()
 			}
-			closeBoth()
 		},
 	}
 	ingressBytesCh := make(chan copyResult, 1)

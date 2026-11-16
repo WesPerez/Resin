@@ -43,7 +43,34 @@ jobs:
           npm ci
           npm run build
 
-      - name: Setup Go
+      - name: Verify lease display names in built WebUI
+        run: |
+          python3 -m pip install playwright==1.55.0
+          python3 -m playwright install --with-deps chromium
+          npm --prefix webui run preview -- --host 127.0.0.1 --port 4173 > "$RUNNER_TEMP/lease-ui-preview.log" 2>&1 &
+          preview_pid=$!
+          trap 'kill "$preview_pid" 2>/dev/null || true' EXIT
+          ready=0
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4173/ui/ >/dev/null; then ready=1; break; fi
+            sleep 1
+          done
+          if [ "$ready" != 1 ]; then
+            echo 'preview server never became ready'
+            tail -50 "$RUNNER_TEMP/lease-ui-preview.log" || true
+            exit 1
+          fi
+          python3 webui/tests/lease_display_names.py
+
+      - name: Preserve lease UI screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lease-ui-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/lease-ui-evidence/
+          retention-days: 3
+
+      - name: Setup Go for validation
         uses: actions/setup-go@v5
         with:
           go-version: 1.25.x
@@ -67,11 +94,23 @@ jobs:
       - name: Run Go tests
         run: go test ./...
 
-      - name: Run proxy, routing and probe race tests
-        run: go test -race ./internal/proxy ./internal/routing ./internal/netutil ./internal/probe
+      - name: Run proxy, routing, persistence and shutdown race tests
+        run: go test -race ./internal/topology ./internal/proxy ./internal/routing ./internal/netutil ./internal/probe ./internal/state ./internal/service ./internal/api ./internal/geoip ./cmd/resin
 
       - name: Check entrypoint syntax
         run: sh -n docker/entrypoint.sh
+
+      - name: Export synthetic stopped DB pair for packaged preflight
+        env:
+          RESIN_PREFLIGHT_FIXTURE_DIR: ${{ runner.temp }}/resin-preflight-fixture
+        run: go test ./cmd/resin -run '^TestPreflightHostedContainerFixture$' -count=1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: preflight-fixture-${{ github.sha }}
+          path: ${{ runner.temp }}/resin-preflight-fixture/
+          if-no-files-found: error
+          retention-days: 3
 
   publish:
     name: Build and publish GHCR image
@@ -135,6 +174,16 @@ jobs:
           cache-to: type=gha,mode=max,scope=resin-${{ env.SOURCE_REF_NAME }}
           provenance: mode=max
           sbom: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: preflight-fixture-${{ github.sha }}
+          path: ${{ runner.temp }}/resin-preflight-fixture
+
+      - name: Verify exact packaged preflight in bounded isolated container
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: python3 -B scripts/preflight_container_check.py "ghcr.io/wesperez/resin@$IMAGE_DIGEST" "$RUNNER_TEMP/resin-preflight-fixture"
 
       - name: Record published image
         env:

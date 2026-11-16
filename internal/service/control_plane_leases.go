@@ -19,28 +19,32 @@ import (
 
 // LeaseResponse is the API response for a lease.
 type LeaseResponse struct {
-	PlatformID        string `json:"platform_id"`
-	Account           string `json:"account"`
-	NodeHash          string `json:"node_hash"`
-	NodeTag           string `json:"node_tag"`
-	EgressIP          string `json:"egress_ip"`
-	Expiry            string `json:"expiry"`
-	LastAccessed      string `json:"last_accessed"`
-	CreatedAtNs       string `json:"created_at_ns"`
-	LeaseGuardVersion int    `json:"lease_guard_version"`
+	PlatformID             string `json:"platform_id"`
+	Account                string `json:"account"`
+	DisplayName            string `json:"display_name,omitempty"`
+	DisplayNameUnavailable bool   `json:"display_name_unavailable,omitempty"`
+	NodeHash               string `json:"node_hash"`
+	NodeTag                string `json:"node_tag"`
+	EgressIP               string `json:"egress_ip"`
+	Expiry                 string `json:"expiry"`
+	LastAccessed           string `json:"last_accessed"`
+	CreatedAtNs            string `json:"created_at_ns"`
+	LeaseGuardVersion      int    `json:"lease_guard_version"`
+	DisplayNameCASVersion  int    `json:"display_name_cas_version"`
 }
 
 func leaseToResponse(lease model.Lease, nodeTag string) LeaseResponse {
 	return LeaseResponse{
-		PlatformID:        lease.PlatformID,
-		Account:           lease.Account,
-		NodeHash:          lease.NodeHash,
-		NodeTag:           nodeTag,
-		EgressIP:          lease.EgressIP,
-		Expiry:            time.Unix(0, lease.ExpiryNs).UTC().Format(time.RFC3339Nano),
-		LastAccessed:      time.Unix(0, lease.LastAccessedNs).UTC().Format(time.RFC3339Nano),
-		CreatedAtNs:       strconv.FormatInt(lease.CreatedAtNs, 10),
-		LeaseGuardVersion: routing.LeaseGuardVersion,
+		PlatformID:            lease.PlatformID,
+		Account:               lease.Account,
+		NodeHash:              lease.NodeHash,
+		NodeTag:               nodeTag,
+		EgressIP:              lease.EgressIP,
+		Expiry:                time.Unix(0, lease.ExpiryNs).UTC().Format(time.RFC3339Nano),
+		LastAccessed:          time.Unix(0, lease.LastAccessedNs).UTC().Format(time.RFC3339Nano),
+		CreatedAtNs:           strconv.FormatInt(lease.CreatedAtNs, 10),
+		LeaseGuardVersion:     routing.LeaseGuardVersion,
+		DisplayNameCASVersion: 1,
 	}
 }
 
@@ -65,6 +69,7 @@ func (s *ControlPlaneService) ListLeases(platformID string) ([]LeaseResponse, er
 		return nil, notFound("platform not found")
 	}
 	var result []LeaseResponse
+	names, err := s.leaseDisplayNames(platformID)
 	s.Router.RangeLeases(platformID, func(account string, lease routing.Lease) bool {
 		result = append(result, leaseToResponse(model.Lease{
 			PlatformID:     platformID,
@@ -79,6 +84,10 @@ func (s *ControlPlaneService) ListLeases(platformID string) ([]LeaseResponse, er
 	})
 	if result == nil {
 		result = []LeaseResponse{}
+	}
+	for i := range result {
+		result[i].DisplayName = names[result[i].Account]
+		result[i].DisplayNameUnavailable = err != nil
 	}
 	return result, nil
 }
@@ -166,6 +175,9 @@ func (s *ControlPlaneService) GetLease(platformID, account string) (*LeaseRespon
 		return nil, notFound("lease not found")
 	}
 	resp := leaseToResponse(*ml, s.resolveLeaseNodeTagFromHex(ml.NodeHash))
+	names, err := s.leaseDisplayNames(platformID)
+	resp.DisplayName = names[account]
+	resp.DisplayNameUnavailable = err != nil
 	return &resp, nil
 }
 

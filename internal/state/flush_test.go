@@ -2,12 +2,61 @@ package state
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Resinat/Resin/internal/model"
 )
+
+func TestFlushWorker_DrainReceiptRecordsSkippedSets(t *testing.T) {
+	engine, _, _ := newTestEngine(t)
+	readers := CacheReaders{
+		ReadNodeStatic:       func(string) *model.NodeStatic { return nil },
+		ReadNodeDynamic:      func(string) *model.NodeDynamic { return nil },
+		ReadNodeLatency:      func(NodeLatencyDirtyKey) *model.NodeLatency { return nil },
+		ReadLease:            func(LeaseDirtyKey) *model.Lease { return nil },
+		ReadSubscriptionNode: func(SubscriptionNodeDirtyKey) *model.SubscriptionNode { return nil },
+	}
+	w := NewCacheFlushWorker(engine, readers, func() int { return 1000 },
+		func() time.Duration { return time.Hour }, time.Hour)
+
+	engine.MarkNodeStatic("n1")
+	engine.MarkNodeStatic("n2")
+	engine.MarkLease("acct", "node")
+
+	directory := t.TempDir()
+	path, err := w.WriteDrainReceipt(directory, true, time.Unix(1700000000, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != filepath.Join(directory, "drain-receipt.json") {
+		t.Fatalf("unexpected receipt path %q", path)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt DrainReceipt
+	if err := json.Unmarshal(raw, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if !receipt.Discard || receipt.Version != 1 {
+		t.Fatalf("receipt identity wrong: %+v", receipt)
+	}
+	if receipt.DirtyTotal != 3 || receipt.DirtyCounts["nodes_static"] != 2 || receipt.DirtyCounts["leases"] != 1 {
+		t.Fatalf("receipt did not describe the skipped sets: %+v", receipt)
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("temporary file must not survive publication: %v", err)
+	}
+	// The receipt is evidence only: it must not consume the dirty sets.
+	if engine.DirtyCount() != 3 {
+		t.Fatalf("writing a receipt must not flush: got %d dirty", engine.DirtyCount())
+	}
+}
 
 func TestFlushWorker_ThresholdTriggered(t *testing.T) {
 	engine, _, _ := newTestEngine(t)

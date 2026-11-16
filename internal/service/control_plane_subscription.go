@@ -405,7 +405,9 @@ func (s *ControlPlaneService) UpdateSubscription(id string, patchJSON json.RawMe
 		s.Scheduler.SetSubscriptionEnabled(sub, newEnabled)
 	}
 	if urlChanged || contentChanged {
-		go s.Scheduler.UpdateSubscription(sub)
+		if err := s.Scheduler.UpdateSubscriptionAsync(sub); err != nil {
+			return nil, internal("subscription refresh admission", err)
+		}
 	}
 
 	r := s.subToResponse(sub)

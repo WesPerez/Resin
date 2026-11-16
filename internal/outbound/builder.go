@@ -29,6 +29,9 @@ type SingboxBuilderConfig struct {
 	// DNSUpstreams configures Resin's node DNS chain.
 	// Values are DNS upstream URI strings and the slice must not be empty.
 	DNSUpstreams []string
+	// DeferStart leaves even the DNS service graph unconstructed. Only the
+	// authority owner may call Start before admitting any outbound work.
+	DeferStart bool
 }
 
 // ---------------------------------------------------------------------------
@@ -39,6 +42,7 @@ type SingboxBuilderConfig struct {
 // It holds a fully-wired context with DNS services so that domain-based
 // outbound servers can be resolved.
 type SingboxBuilder struct {
+	deferred            *SingboxBuilderConfig
 	registry            *sbOutbound.Registry
 	ctx                 context.Context
 	logFactory          log.Factory
@@ -50,6 +54,10 @@ type SingboxBuilder struct {
 // sing-box service graph (registries + DNS). The caller must call Close()
 // when done.
 func NewSingboxBuilderWithConfig(cfg SingboxBuilderConfig) (*SingboxBuilder, error) {
+	if cfg.DeferStart {
+		cfg.DNSUpstreams = append([]string(nil), cfg.DNSUpstreams...)
+		return &SingboxBuilder{deferred: &cfg}, nil
+	}
 	ctx := context.Background()
 	ctx = include.Context(ctx) // inject protocol registries
 
@@ -125,10 +133,31 @@ func NewSingboxBuilderWithConfig(cfg SingboxBuilderConfig) (*SingboxBuilder, err
 	}, nil
 }
 
+// Start is an exclusive startup operation, not a concurrency-safe lazy start.
+// Build must never activate a fenced builder implicitly.
+func (b *SingboxBuilder) Start() error {
+	if b.deferred == nil {
+		return errors.New("singbox builder: already started")
+	}
+	cfg := *b.deferred
+	cfg.DeferStart = false
+	started, err := NewSingboxBuilderWithConfig(cfg)
+	if err != nil {
+		return err
+	}
+	*b = *started
+	return nil
+}
+
+func (b *SingboxBuilder) Started() bool { return b.deferred == nil && b.ctx != nil }
+
 // Build parses rawOptions (a complete sing-box outbound JSON object with
 // type/tag fields) into a real adapter.Outbound and runs it through the
 // lifecycle stages.
 func (b *SingboxBuilder) Build(rawOptions json.RawMessage) (adapter.Outbound, error) {
+	if !b.Started() {
+		return nil, errors.New("singbox builder: authority has not started outbounds")
+	}
 	// 1. Parse via official option.Outbound path (strips type/tag, creates
 	//    typed options via OutboundOptionsRegistry + badjson.UnmarshallExcluded).
 	var outboundConfig option.Outbound

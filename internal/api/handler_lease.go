@@ -92,6 +92,22 @@ func HandleListLeases(cp *service.ControlPlaneService) http.HandlerFunc {
 			leases = filtered
 		}
 
+		// Preserve the existing account filter's wire-identity contract. Display
+		// search is additive and never changes the meaning of routing keys.
+		if search := strings.TrimSpace(r.URL.Query().Get("search")); search != "" {
+			search = strings.ToLower(search)
+			filtered := make([]service.LeaseResponse, 0, len(leases))
+			for _, lease := range leases {
+				if lease.DisplayNameUnavailable {
+					writeServiceError(w, &service.ServiceError{Code: "INTERNAL", Message: "display name search temporarily unavailable; account filtering remains available"})
+					return
+				}
+				if strings.Contains(strings.ToLower(lease.Account), search) || strings.Contains(strings.ToLower(lease.DisplayName), search) {
+					filtered = append(filtered, lease)
+				}
+			}
+			leases = filtered
+		}
 		sorting, ok := parseSortingOrWriteInvalid(w, r, []string{"account", "expiry", "last_accessed"}, "expiry", "asc")
 		if !ok {
 			return
@@ -121,6 +137,31 @@ func HandleGetLease(cp *service.ControlPlaneService) http.HandlerFunc {
 			return
 		}
 		lease, err := cp.GetLease(platformID, account)
+		if err != nil {
+			writeServiceError(w, err)
+			return
+		}
+		WriteJSON(w, http.StatusOK, lease)
+	}
+}
+
+func HandleSetLeaseDisplayName(cp *service.ControlPlaneService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		platformID, ok := requireUUIDPathParam(w, r, "id", "platform_id")
+		if !ok {
+			return
+		}
+		account, err := validateAccountPath(r)
+		if err != nil {
+			writeServiceError(w, err)
+			return
+		}
+		var req service.SetLeaseDisplayNameRequest
+		if err := DecodeBody(r, &req); err != nil {
+			writeDecodeBodyError(w, err)
+			return
+		}
+		lease, err := cp.SetLeaseDisplayNameContext(r.Context(), platformID, account, req)
 		if err != nil {
 			writeServiceError(w, err)
 			return
