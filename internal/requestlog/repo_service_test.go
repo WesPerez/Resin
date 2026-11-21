@@ -523,6 +523,40 @@ func TestRepo_SchemaMaintenanceDoesNotExtendRetention(t *testing.T) {
 	}
 }
 
+func TestRepo_LegacyMigrationSeedsBeforeSchemaWrites(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	path := filepath.Join(repo.logDir, fmt.Sprintf("request_logs-%d.db", time.Now().Add(-5*24*time.Hour).UnixMilli()))
+	createRetentionShard(t, path, time.Now())
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("DROP TABLE request_log_retention"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	last := time.Now().Add(-2 * 24 * time.Hour).Truncate(time.Millisecond)
+	if err := os.Chtimes(path, last, last); err != nil {
+		t.Fatal(err)
+	}
+	repo.migrateRetainedDBs()
+	got, err := repo.retentionTime(path, time.Now())
+	if err != nil || !got.Equal(last) {
+		t.Fatalf("legacy last write lost: %v %v", got, err)
+	}
+	repo.migrateRetainedDBs()
+	again, err := repo.retentionTime(path, time.Now())
+	if err != nil || !again.Equal(last) {
+		t.Fatalf("second migration extended retention: %v %v", again, err)
+	}
+}
+
 func TestService_IdleTickRotatesAgedActive(t *testing.T) {
 	logDir := t.TempDir()
 	path := filepath.Join(logDir, fmt.Sprintf("request_logs-%d.db", time.Now().Add(-4*24*time.Hour).UnixMilli()))
