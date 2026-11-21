@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,10 +20,12 @@ import (
 )
 
 const logSummarySelectColumns = "id, ts_ns, proxy_type, client_ip, platform_id, platform_name, account, target_host, target_url, node_hash, node_tag, egress_ip, duration_ns, first_byte_duration_ns, net_ok, http_method, http_status, resin_error, upstream_stage, upstream_err_kind, upstream_errno, upstream_err_msg, ingress_bytes, egress_bytes, payload_present, req_headers_len, req_body_len, resp_headers_len, resp_body_len, req_headers_truncated, req_body_truncated, resp_headers_truncated, resp_body_truncated"
+const requestLogShardAge = 3 * 24 * time.Hour
 
 // Repo manages rolling SQLite databases for request logs.
 // Each DB is named request_logs-<unix_ms>.db and lives in logDir.
 type Repo struct {
+	dataMu      sync.RWMutex
 	logDir      string
 	maxBytes    int64
 	retainCount int
@@ -30,6 +33,10 @@ type Repo struct {
 	// Active DB handle and path.
 	activeDB   *sql.DB
 	activePath string
+	// A failed close cannot be made successful by calling sql.DB.Close again.
+	closeFailure   error
+	protectedMu    sync.Mutex
+	protectedPaths map[string]error
 
 	// readBarrier runs before read queries to improve freshness.
 	readBarrierMu sync.RWMutex
@@ -57,6 +64,8 @@ func NewRepo(logDir string, maxBytes int64, retainCount int) *Repo {
 // If a previous DB exists in the directory it is reused as active;
 // a new one is created only when no existing DB is found.
 func (r *Repo) Open() error {
+	r.dataMu.Lock()
+	defer r.dataMu.Unlock()
 	if err := os.MkdirAll(r.logDir, 0o755); err != nil {
 		return fmt.Errorf("requestlog repo mkdir %s: %w", r.logDir, err)
 	}
@@ -84,11 +93,18 @@ func (r *Repo) Open() error {
 
 // Close closes the active DB.
 func (r *Repo) Close() error {
+	r.dataMu.Lock()
+	defer r.dataMu.Unlock()
 	if r.activeDB != nil {
-		err := r.activeDB.Close()
+		if r.closeFailure != nil {
+			return r.closeFailure
+		}
+		if err := r.activeDB.Close(); err != nil {
+			r.closeFailure = err
+			return err
+		}
 		r.activeDB = nil
 		r.activePath = ""
-		return err
 	}
 	return nil
 }
@@ -96,6 +112,11 @@ func (r *Repo) Close() error {
 // InsertBatch inserts a batch of log entries + optional payloads in a single
 // transaction. Returns the number of rows successfully inserted.
 func (r *Repo) InsertBatch(entries []proxy.RequestLogEntry) (int, error) {
+	r.dataMu.Lock()
+	defer r.dataMu.Unlock()
+	if r.closeFailure != nil {
+		return 0, r.closeFailure
+	}
 	if r.activeDB == nil {
 		if err := r.recoverActiveDB(); err != nil {
 			return 0, err
@@ -178,6 +199,13 @@ func (r *Repo) InsertBatch(entries []proxy.RequestLogEntry) (int, error) {
 		inserted++
 	}
 
+	updated, err := tx.Exec(`UPDATE request_log_retention SET last_write_ms = MAX(last_write_ms, ?) WHERE id = 1`, time.Now().UnixMilli())
+	if err != nil {
+		return 0, fmt.Errorf("requestlog record retention time: %w", err)
+	}
+	if n, err := updated.RowsAffected(); err != nil || n != 1 {
+		return 0, fmt.Errorf("requestlog retention metadata row missing")
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("requestlog repo commit: %w", err)
 	}
@@ -276,6 +304,8 @@ type ListCursor struct {
 // ordered by ts_ns DESC, same ts_ns by id ASC.
 func (r *Repo) List(f ListFilter) ([]LogSummary, bool, *ListCursor, error) {
 	r.runReadBarrier()
+	r.dataMu.RLock()
+	defer r.dataMu.RUnlock()
 
 	files, err := r.listDBFiles()
 	if err != nil {
@@ -299,7 +329,7 @@ func (r *Repo) List(f ListFilter) ([]LogSummary, bool, *ListCursor, error) {
 			continue
 		}
 		rows, err := r.queryLogs(db, f, fetchLimit)
-		if closeErr := db.Close(); closeErr != nil {
+		if closeErr := r.closeReader(db, files[i]); closeErr != nil {
 			log.Printf("[requestlog] warning: list close db failed path=%q: %v", files[i], closeErr)
 		}
 		if err != nil {
@@ -336,6 +366,8 @@ func (r *Repo) List(f ListFilter) ([]LogSummary, bool, *ListCursor, error) {
 // GetByID looks up a single log entry across all retained DBs.
 func (r *Repo) GetByID(id string) (*LogSummary, error) {
 	r.runReadBarrier()
+	r.dataMu.RLock()
+	defer r.dataMu.RUnlock()
 
 	files, err := r.listDBFiles()
 	if err != nil {
@@ -360,6 +392,8 @@ func (r *Repo) GetByID(id string) (*LogSummary, error) {
 // GetPayloads retrieves payload data for a given log ID across all retained DBs.
 func (r *Repo) GetPayloads(logID string) (*PayloadRow, error) {
 	r.runReadBarrier()
+	r.dataMu.RLock()
+	defer r.dataMu.RUnlock()
 
 	files, err := r.listDBFiles()
 	if err != nil {
@@ -396,7 +430,7 @@ func (r *Repo) queryAcrossRetainedDBs(
 			continue
 		}
 		row, err := query(db)
-		if closeErr := db.Close(); closeErr != nil {
+		if closeErr := r.closeReader(db, path); closeErr != nil {
 			log.Printf("[requestlog] warning: %s close db failed path=%q %s=%q: %v", op, path, keyName, keyValue, closeErr)
 		}
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -426,16 +460,24 @@ func (r *Repo) runReadBarrier() {
 // --- internal helpers ---
 
 func (r *Repo) openDB(path string) error {
+	last, _, err := shardWriteTime(path)
+	if err != nil {
+		return err
+	}
 	db, err := state.OpenDB(path)
 	if err != nil {
 		return err
 	}
 	if err := state.InitDB(db, CreateDDL); err != nil {
-		db.Close()
+		r.closeReader(db, path)
+		return err
+	}
+	if err := seedRetentionTime(db, last); err != nil {
+		r.closeReader(db, path)
 		return err
 	}
 	if err := ensureRequestLogSchema(db); err != nil {
-		db.Close()
+		r.closeReader(db, path)
 		return err
 	}
 	r.activeDB = db
@@ -453,27 +495,53 @@ func (r *Repo) migrateRetainedDBs() {
 		if path == r.activePath {
 			continue
 		}
+		// Seed the legacy last-write time before schema maintenance changes mtime.
+		last, _, err := shardWriteTime(path)
+		if err != nil {
+			log.Printf("[requestlog] warning: inspect retained shard failed: %v", err)
+			continue
+		}
 		db, err := state.OpenDB(path)
 		if err != nil {
 			log.Printf("[requestlog] warning: open db for migration failed path=%q: %v", path, err)
 			continue
 		}
+		if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS request_log_retention (id INTEGER PRIMARY KEY CHECK (id = 1), last_write_ms INTEGER NOT NULL)`); err != nil {
+			r.protectPath(path, err)
+			log.Printf("[requestlog] warning: create retention metadata failed: %v", err)
+		} else if err := seedRetentionTime(db, last); err != nil {
+			r.protectPath(path, err)
+			log.Printf("[requestlog] warning: seed retention metadata failed: %v", err)
+		}
 		if err := ensureRequestLogSchema(db); err != nil {
 			log.Printf("[requestlog] warning: migrate db failed path=%q: %v", path, err)
 		}
 		if err := db.Close(); err != nil {
+			r.protectPath(path, err)
 			log.Printf("[requestlog] warning: close migrated db failed path=%q: %v", path, err)
 		}
 	}
 }
 
 func (r *Repo) rotateDB() error {
+	if r.closeFailure != nil {
+		return r.closeFailure
+	}
+	stamp, err := r.newShardStamp()
+	if err != nil {
+		return err
+	}
 	if r.activeDB != nil {
-		r.activeDB.Close()
+		if err := r.activeDB.Close(); err != nil {
+			r.closeFailure = fmt.Errorf("requestlog close before rotation: %w", err)
+			return r.closeFailure
+		}
 		r.activeDB = nil
 	}
-	name := fmt.Sprintf("request_logs-%d.db", time.Now().UnixMilli())
-	path := filepath.Join(r.logDir, name)
+	path, err := r.reserveShard(stamp)
+	if err != nil {
+		return err
+	}
 	if err := r.openDB(path); err != nil {
 		return fmt.Errorf("requestlog rotate: %w", err)
 	}
@@ -500,16 +568,257 @@ func (r *Repo) cleanup() error {
 	if err != nil {
 		return err
 	}
-	// Keep retainCount most recent files (the active one is always latest).
-	if len(files) <= r.retainCount {
-		return nil
+	now := time.Now()
+	for i, path := range files {
+		if path == r.activePath || r.closeFailure != nil || r.pathProtected(path) {
+			continue
+		}
+		created, err := shardCreated(path)
+		if err != nil || created.After(now) {
+			continue
+		}
+		lastFS, beforeRead, err := shardWriteTime(path)
+		if err != nil {
+			return err
+		}
+		last, err := r.retentionTime(path, lastFS)
+		if err != nil {
+			return err
+		}
+		// SQLite may create its read coordination sidecars even for mode=ro.
+		// Take the deletion snapshot after our connection has closed, while the
+		// writer lock is still held. An existing primary or WAL may not change.
+		_, infos, err := shardWriteTime(path)
+		if err != nil {
+			return err
+		}
+		for _, file := range []string{path, path + "-wal"} {
+			before, after := beforeRead[file], infos[file]
+			if before != nil && (after == nil || !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime())) {
+				return fmt.Errorf("requestlog shard changed during retention read")
+			}
+		}
+		// Unknown/future filesystem times never authorize retirement, including
+		// under the count cap. Readers hold dataMu until all handles are closed.
+		if !last.IsZero() && !last.After(now) && (i < len(files)-r.retainCount || now.Sub(last) >= requestLogShardAge) {
+			_, current, err := shardWriteTime(path)
+			if err != nil || len(infos) != len(current) {
+				return fmt.Errorf("requestlog shard changed before retirement")
+			}
+			for file, before := range infos {
+				after := current[file]
+				if after == nil || !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+					return fmt.Errorf("requestlog shard changed before retirement")
+				}
+			}
+			// Retire the primary file first. On failure the complete shard remains;
+			// sidecar failures after retirement are reported, never left as a
+			// retained primary database with its committed WAL removed.
+			if err := os.Remove(path); err != nil {
+				return fmt.Errorf("requestlog retire %s: %w", filepath.Base(path), err)
+			}
+			for _, sidecar := range []string{path + "-wal", path + "-shm"} {
+				if infos[sidecar] == nil {
+					continue
+				}
+				if err := os.Remove(sidecar); err != nil {
+					return fmt.Errorf("requestlog retired shard sidecar %s: %w", filepath.Base(sidecar), err)
+				}
+			}
+		}
 	}
-	toRemove := files[:len(files)-r.retainCount]
-	for _, f := range toRemove {
-		os.Remove(f)
-		// Also clean up WAL/SHM files.
-		os.Remove(f + "-wal")
-		os.Remove(f + "-shm")
+	return nil
+}
+
+// Maintain runs only on the service's writer loop, including idle ticks. A
+// shard rotates after three days; closed shards retain three days after their
+// last write. Late-completing requests therefore start retention when flushed,
+// not at request start. Active databases and their sidecars are never unlinked.
+func (r *Repo) Maintain() error {
+	r.dataMu.Lock()
+	defer r.dataMu.Unlock()
+	if r.closeFailure != nil {
+		return r.closeFailure
+	}
+	if r.activeDB != nil {
+		created, err := shardCreated(r.activePath)
+		if err != nil {
+			return err
+		}
+		if created.After(time.Now()) {
+			return fmt.Errorf("requestlog active shard timestamp is in the future")
+		}
+		if time.Since(created) >= requestLogShardAge {
+			return r.rotateDB()
+		}
+	} else if r.activePath != "" {
+		// A rotation may have closed the old shard but failed to open the new
+		// one. Idle maintenance must recover too, not wait forever for a write.
+		return r.recoverActiveDB()
+	}
+	return r.cleanup()
+}
+
+func shardWriteTime(path string) (time.Time, map[string]os.FileInfo, error) {
+	last := time.Time{}
+	infos := make(map[string]os.FileInfo)
+	for _, file := range []string{path, path + "-wal", path + "-shm"} {
+		info, err := os.Lstat(file)
+		if os.IsNotExist(err) && file != path {
+			continue
+		}
+		if err != nil {
+			return last, nil, err
+		}
+		if !info.Mode().IsRegular() {
+			return last, nil, fmt.Errorf("requestlog shard is not a regular file")
+		}
+		if info.ModTime().UnixMilli() <= 0 || info.ModTime().After(time.Now()) {
+			return last, nil, fmt.Errorf("requestlog shard timestamp invalid or in the future")
+		}
+		infos[file] = info
+		if info.ModTime().After(last) {
+			last = info.ModTime()
+		}
+	}
+	return last, infos, nil
+}
+
+func shardCreated(path string) (time.Time, error) {
+	name := filepath.Base(path)
+	if !strings.HasPrefix(name, "request_logs-") || !strings.HasSuffix(name, ".db") {
+		return time.Time{}, fmt.Errorf("requestlog shard name invalid")
+	}
+	stamp := strings.TrimSuffix(strings.TrimPrefix(name, "request_logs-"), ".db")
+	for _, c := range stamp {
+		if c < '0' || c > '9' {
+			return time.Time{}, fmt.Errorf("requestlog shard timestamp invalid")
+		}
+	}
+	ms, err := strconv.ParseInt(stamp, 10, 64)
+	if err != nil || ms <= 0 {
+		return time.Time{}, fmt.Errorf("requestlog shard timestamp invalid")
+	}
+	return time.UnixMilli(ms), nil
+}
+
+// Reserve a genuinely new file. A same-millisecond rotation or clock rollback
+// must never reopen an old shard; sidecar collisions are protected as well.
+func (r *Repo) reserveShard(stamp int64) (string, error) {
+	for attempt := 0; attempt < 1000; attempt++ {
+		path := filepath.Join(r.logDir, fmt.Sprintf("request_logs-%d.db", stamp+int64(attempt)))
+		collision := false
+		for _, sidecar := range []string{path + "-wal", path + "-shm"} {
+			if _, err := os.Lstat(sidecar); !os.IsNotExist(err) {
+				if err != nil {
+					return "", err
+				}
+				collision = true
+			}
+		}
+		if collision {
+			continue
+		}
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if os.IsExist(err) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		if err := file.Close(); err != nil {
+			return "", err
+		}
+		return path, nil
+	}
+	return "", fmt.Errorf("requestlog new shard timestamp collisions")
+}
+
+func (r *Repo) newShardStamp() (int64, error) {
+	now := time.Now().UnixMilli()
+	stamp := now
+	files, err := r.listDBFiles()
+	if err != nil {
+		return 0, err
+	}
+	for _, path := range files {
+		created, err := shardCreated(path)
+		if err != nil {
+			return 0, err
+		}
+		if created.UnixMilli() > now+1000 {
+			return 0, fmt.Errorf("requestlog clock precedes an existing shard")
+		}
+		if created.UnixMilli() >= stamp {
+			stamp = created.UnixMilli() + 1
+		}
+	}
+	return stamp, nil
+}
+
+func seedRetentionTime(db *sql.DB, last time.Time) error {
+	_, err := db.Exec(`INSERT OR IGNORE INTO request_log_retention (id, last_write_ms) VALUES (1, ?)`, last.UnixMilli())
+	if err != nil {
+		return err
+	}
+	var ms int64
+	if err := db.QueryRow(`SELECT last_write_ms FROM request_log_retention WHERE id = 1`).Scan(&ms); err != nil {
+		return err
+	}
+	if ms <= 0 || ms > time.Now().UnixMilli() {
+		return fmt.Errorf("requestlog retention timestamp invalid or in the future")
+	}
+	return nil
+}
+
+// One metadata row, never a scan of request history. Legacy shards use the
+// pre-maintenance filesystem time until migrateRetainedDBs seeds that row.
+func (r *Repo) retentionTime(path string, fallback time.Time) (last time.Time, resultErr error) {
+	db, err := r.openReadOnly(path)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer func() {
+		if err := r.closeReader(db, path); err != nil {
+			last, resultErr = time.Time{}, err
+		}
+	}()
+	var present int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'request_log_retention'`).Scan(&present); err != nil {
+		return time.Time{}, err
+	}
+	if present == 0 {
+		return fallback, nil
+	}
+	var ms int64
+	if err := db.QueryRow(`SELECT last_write_ms FROM request_log_retention WHERE id = 1`).Scan(&ms); err != nil {
+		return time.Time{}, err
+	}
+	if ms <= 0 {
+		return time.Time{}, fmt.Errorf("requestlog retention timestamp invalid")
+	}
+	return time.UnixMilli(ms), nil
+}
+
+func (r *Repo) protectPath(path string, err error) {
+	r.protectedMu.Lock()
+	defer r.protectedMu.Unlock()
+	if r.protectedPaths == nil {
+		r.protectedPaths = make(map[string]error)
+	}
+	r.protectedPaths[path] = err
+}
+
+func (r *Repo) pathProtected(path string) bool {
+	r.protectedMu.Lock()
+	defer r.protectedMu.Unlock()
+	return r.protectedPaths[path] != nil
+}
+
+func (r *Repo) closeReader(db *sql.DB, path string) error {
+	if err := db.Close(); err != nil {
+		r.protectPath(path, err)
+		return err
 	}
 	return nil
 }

@@ -415,9 +415,7 @@ func TestRepo_CleanupRetainsConfiguredFileCount(t *testing.T) {
 	logDir := t.TempDir()
 	for i := 1; i <= 5; i++ {
 		path := filepath.Join(logDir, fmt.Sprintf("request_logs-%013d.db", i))
-		if err := os.WriteFile(path, nil, 0o644); err != nil {
-			t.Fatalf("create shard %d: %v", i, err)
-		}
+		createRetentionShard(t, path, time.Now())
 	}
 
 	repo := NewRepo(logDir, 1<<20, 2)
@@ -433,6 +431,140 @@ func TestRepo_CleanupRetainsConfiguredFileCount(t *testing.T) {
 	}
 	if got := filepath.Base(files[0]); got != "request_logs-0000000000004.db" {
 		t.Fatalf("oldest retained file: got %q", got)
+	}
+}
+
+func createRetentionShard(t *testing.T, path string, last time.Time) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(CreateDDL); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedRetentionTime(db, last); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRepo_MaintenanceRetiresOnlyExpiredClosedShards(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	now := time.Now()
+	old := filepath.Join(repo.logDir, fmt.Sprintf("request_logs-%d.db", now.Add(-6*24*time.Hour).UnixMilli()))
+	recent := filepath.Join(repo.logDir, fmt.Sprintf("request_logs-%d.db", now.Add(-5*24*time.Hour).UnixMilli()))
+	createRetentionShard(t, old, now.Add(-4*24*time.Hour))
+	createRetentionShard(t, recent, now.Add(-time.Hour))
+	if err := repo.Maintain(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("expired shard not retired: %v", err)
+	}
+	for _, path := range []string{repo.activePath, recent} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("protected shard removed: %v", err)
+		}
+	}
+}
+
+func TestRepo_MaintenancePreservesLateCompletionAcrossRestart(t *testing.T) {
+	logDir := t.TempDir()
+	old := filepath.Join(logDir, fmt.Sprintf("request_logs-%d.db", time.Now().Add(-4*24*time.Hour).UnixMilli()))
+	createRetentionShard(t, old, time.Now().Add(-2*24*time.Hour))
+	repo := NewRepo(logDir, 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.InsertBatch([]proxy.RequestLogEntry{{ID: "late", StartedAtNs: time.Now().Add(-10 * 24 * time.Hour).UnixNano()}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Maintain(); err != nil {
+		t.Fatal(err)
+	}
+	if repo.activePath == old {
+		t.Fatal("old active shard did not rotate")
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened := NewRepo(logDir, 1<<20, 5)
+	if err := reopened.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	if err := reopened.Maintain(); err != nil {
+		t.Fatal(err)
+	}
+	row, err := reopened.GetByID("late")
+	if err != nil || row == nil {
+		t.Fatalf("late completion lost: %v", err)
+	}
+}
+
+func TestRepo_SchemaMaintenanceDoesNotExtendRetention(t *testing.T) {
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	path := filepath.Join(repo.logDir, fmt.Sprintf("request_logs-%d.db", time.Now().Add(-5*24*time.Hour).UnixMilli()))
+	last := time.Now().Add(-2 * 24 * time.Hour).Truncate(time.Millisecond)
+	createRetentionShard(t, path, last)
+	repo.migrateRetainedDBs()
+	got, err := repo.retentionTime(path, time.Now())
+	if err != nil || !got.Equal(last) {
+		t.Fatalf("maintenance extended retention: %v %v", got, err)
+	}
+}
+
+func TestService_IdleTickRotatesAgedActive(t *testing.T) {
+	logDir := t.TempDir()
+	path := filepath.Join(logDir, fmt.Sprintf("request_logs-%d.db", time.Now().Add(-4*24*time.Hour).UnixMilli()))
+	createRetentionShard(t, path, time.Now())
+	repo := NewRepo(logDir, 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	svc := NewService(ServiceConfig{Repo: repo, FlushInterval: 10 * time.Millisecond})
+	svc.Start()
+	t.Cleanup(svc.Stop)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		repo.dataMu.RLock()
+		rotated := repo.activePath != path
+		repo.dataMu.RUnlock()
+		if rotated {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("idle maintenance did not rotate aged active")
+}
+
+func TestRepo_ClockRegressionProtectsExistingActive(t *testing.T) {
+	logDir := t.TempDir()
+	path := filepath.Join(logDir, fmt.Sprintf("request_logs-%d.db", time.Now().Add(time.Hour).UnixMilli()))
+	createRetentionShard(t, path, time.Now())
+	repo := NewRepo(logDir, 1<<20, 5)
+	if err := repo.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	if err := repo.rotateDB(); err == nil {
+		t.Fatal("clock regression should defer rotation")
+	}
+	if repo.activePath != path || repo.activeDB == nil {
+		t.Fatal("rotation replaced protected active")
+	}
+	if _, err := repo.InsertBatch([]proxy.RequestLogEntry{{ID: "clock", StartedAtNs: time.Now().UnixNano()}}); err != nil {
+		t.Fatal(err)
 	}
 }
 

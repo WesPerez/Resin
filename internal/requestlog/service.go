@@ -118,6 +118,11 @@ func (s *Service) flushLoop() {
 				s.flush(batch)
 				batch = batch[:0]
 			}
+			if s.repo != nil {
+				if err := s.repo.Maintain(); err != nil {
+					log.Printf("[requestlog] maintenance failed: %v", err)
+				}
+			}
 
 		case done := <-s.flushReq:
 			batch = s.flushOnBarrier(batch, done)
