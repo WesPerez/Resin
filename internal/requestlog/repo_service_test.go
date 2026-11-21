@@ -775,16 +775,33 @@ func TestRepo_ListCursorPagination(t *testing.T) {
 }
 
 func TestRepo_MaybeRotateCountsWalAndShmSize(t *testing.T) {
-	repo := NewRepo(t.TempDir(), 1024, 5)
+	repo := NewRepo(t.TempDir(), 1<<20, 5)
 	if err := repo.Open(); err != nil {
 		t.Fatalf("repo.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = repo.Close() })
 
-	// Make base DB tiny but WAL large enough to cross threshold.
-	if err := os.WriteFile(repo.activePath+"-wal", make([]byte, 1500), 0o644); err != nil {
-		t.Fatalf("write wal: %v", err)
+	// Produce a real committed WAL; arbitrary bytes would corrupt the shard
+	// and cannot authorize safe retirement after rotation.
+	if _, err := repo.activeDB.Exec("PRAGMA wal_autocheckpoint=0"); err != nil {
+		t.Fatal(err)
 	}
+	if _, err := repo.activeDB.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.InsertBatch([]proxy.RequestLogEntry{{ID: "wal-size", StartedAtNs: time.Now().UnixNano(),
+		RespBody: make([]byte, 64*1024), RespBodyLen: 64 * 1024}}); err != nil {
+		t.Fatal(err)
+	}
+	base, err := os.Stat(repo.activePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	total, err := sqliteFilesSize(repo.activePath)
+	if err != nil || total <= base.Size() {
+		t.Fatalf("expected nonempty WAL/SHM: total=%d base=%d err=%v", total, base.Size(), err)
+	}
+	repo.maxBytes = base.Size() + 1
 
 	before := repo.activePath
 	if err := repo.maybeRotate(); err != nil {
@@ -792,6 +809,10 @@ func TestRepo_MaybeRotateCountsWalAndShmSize(t *testing.T) {
 	}
 	if repo.activePath == before {
 		t.Fatal("expected rotation when wal size exceeds threshold")
+	}
+	row, err := repo.GetByID("wal-size")
+	if err != nil || row == nil {
+		t.Fatalf("committed WAL row was lost after rotation: %v", err)
 	}
 }
 
