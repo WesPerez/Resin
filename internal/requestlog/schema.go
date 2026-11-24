@@ -54,6 +54,11 @@ CREATE TABLE IF NOT EXISTS request_log_payloads (
 	resp_headers  BLOB,
 	resp_body     BLOB
 );
+
+CREATE TABLE IF NOT EXISTS request_log_retention (
+	id INTEGER PRIMARY KEY CHECK (id = 1),
+	last_write_ms INTEGER NOT NULL
+);
 `
 
 const requestLogIndexesDDL = `
