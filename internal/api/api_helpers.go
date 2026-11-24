@@ -92,11 +92,23 @@ func ParseSorting(r *http.Request, allowed []string, defaultField, defaultOrder 
 
 // DecodeBody decodes the JSON request body into v, rejecting unknown fields.
 func DecodeBody(r *http.Request, v interface{}) error {
+	return decodeBody(r, v, true)
+}
+
+// Recovery preference metadata is additive. Keep one JSON value and the same
+// body limit, without forcing downstream clients to share our exact schema.
+func DecodePreferenceBody(r *http.Request, v interface{}) error {
+	return decodeBody(r, v, false)
+}
+
+func decodeBody(r *http.Request, v interface{}, strict bool) error {
 	if r.Body == nil {
 		return fmt.Errorf("request body is required")
 	}
 	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
+	if strict {
+		dec.DisallowUnknownFields()
+	}
 	if err := dec.Decode(v); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {

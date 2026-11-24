@@ -317,7 +317,7 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		nodeHashRaw = route.NodeHash
 		lifecycle.setRouteResult(route)
 		if p.health != nil {
-			go recordLatencyForVersion(p.health, nodeHashRaw, route.NodeVersion, domain, nil)
+			recordLatencyForVersion(p.health, nodeHashRaw, route.NodeVersion, domain, nil)
 		}
 		transport, routeErr = p.outboundHTTPTransport(routed)
 		if routeErr != nil {
@@ -361,8 +361,9 @@ func (p *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			lifecycle.setUpstreamError("reverse_roundtrip", err)
 			lifecycle.setNetOK(false)
 			lifecycle.setHTTPStatus(proxyErr.HTTPCode)
-			if hasRoute {
+			if hasRoute && !isUpstreamCertificateError(err) {
 				recordPassiveFailureAsync(p.health, route, err, lifecycle.relayInfo())
+				recoverTunnelLease(p.router, route, account, parsed.Host)
 			}
 			writeProxyError(rw, proxyErr)
 		},

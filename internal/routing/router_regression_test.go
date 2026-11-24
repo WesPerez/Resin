@@ -316,3 +316,74 @@ func TestRouteRequest_SelectedNodeRemovedAfterPick_EmitsLeaseRemove(t *testing.T
 		t.Fatal("expected LeaseRemove event when old lease is dropped")
 	}
 }
+
+func TestRouteRequestExcluding_ReplacesStickyLeaseWithDifferentNode(t *testing.T) {
+	pool := newRouterTestPool()
+	plat := platform.NewPlatform("plat-exclude", "Plat-Exclude", nil, nil)
+	plat.StickyTTLNs = int64(time.Hour)
+	pool.addPlatform(plat)
+
+	failedHash, failedEntry := newRoutableEntry(t, `{"id":"failed"}`, "198.51.100.10")
+	replacementHash, replacementEntry := newRoutableEntry(t, `{"id":"replacement"}`, "198.51.100.11")
+	pool.addEntry(failedHash, failedEntry)
+	pool.addEntry(replacementHash, replacementEntry)
+	pool.rebuildPlatformView(plat)
+
+	router := newTestRouter(pool, nil)
+	state := router.ensurePlatformState(plat.ID)
+	state.Leases.CreateLease("acct-exclude", Lease{
+		NodeHash:       failedHash,
+		EgressIP:       failedEntry.GetEgressIP(),
+		CreatedAtNs:    time.Now().UnixNano(),
+		ExpiryNs:       time.Now().Add(time.Hour).UnixNano(),
+		LastAccessedNs: time.Now().UnixNano(),
+	})
+
+	result, err := router.RouteRequestExcluding(plat.Name, "acct-exclude", "example.com:443", failedHash)
+	if err != nil {
+		t.Fatalf("route excluding failed node: %v", err)
+	}
+	if result.NodeHash != replacementHash {
+		t.Fatalf("selected node: got %s, want %s", result.NodeHash.Hex(), replacementHash.Hex())
+	}
+	lease, ok := state.Leases.GetLease("acct-exclude")
+	if !ok || lease.NodeHash != replacementHash {
+		t.Fatalf("replacement lease: got %+v ok=%v", lease, ok)
+	}
+}
+
+func TestDeleteLeaseIfNode_DoesNotDeleteConcurrentReplacement(t *testing.T) {
+	pool := newRouterTestPool()
+	plat := platform.NewPlatform("plat-cas", "Plat-CAS", nil, nil)
+	pool.addPlatform(plat)
+	router := newTestRouter(pool, nil)
+	state := router.ensurePlatformState(plat.ID)
+
+	oldHash := node.HashFromRawOptions([]byte(`{"id":"old"}`))
+	newHash := node.HashFromRawOptions([]byte(`{"id":"new"}`))
+	oldIP := netip.MustParseAddr("198.51.100.20")
+	newIP := netip.MustParseAddr("198.51.100.21")
+	state.Leases.CreateLease("acct-cas", Lease{NodeHash: oldHash, EgressIP: oldIP})
+	state.Leases.CreateLease("acct-cas", Lease{NodeHash: newHash, EgressIP: newIP})
+
+	if router.DeleteLeaseIfNode(plat.ID, "acct-cas", oldHash) {
+		t.Fatal("stale failure deleted a concurrently replaced lease")
+	}
+	lease, ok := state.Leases.GetLease("acct-cas")
+	if !ok || lease.NodeHash != newHash {
+		t.Fatalf("current lease: got %+v ok=%v", lease, ok)
+	}
+	if got := state.IPLoadStats.Get(newIP); got != 1 {
+		t.Fatalf("replacement IP load: got %d, want 1", got)
+	}
+
+	if !router.DeleteLeaseIfNode(plat.ID, "acct-cas", newHash) {
+		t.Fatal("expected matching lease deletion")
+	}
+	if _, ok := state.Leases.GetLease("acct-cas"); ok {
+		t.Fatal("matching lease should be removed")
+	}
+	if got := state.IPLoadStats.Get(newIP); got != 0 {
+		t.Fatalf("replacement IP load after delete: got %d, want 0", got)
+	}
+}

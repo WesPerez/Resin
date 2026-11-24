@@ -23,6 +23,8 @@ const (
 	defaultTransportMaxIdleConns        = 1024
 	defaultTransportMaxIdleConnsPerHost = 64
 	defaultTransportIdleConnTimeout     = 90 * time.Second
+	defaultTransportDialTimeout         = 30 * time.Second
+	defaultTransportTLSHandshakeTimeout = 10 * time.Second
 )
 
 func normalizeOutboundTransportConfig(cfg OutboundTransportConfig) OutboundTransportConfig {
@@ -131,6 +133,10 @@ func (p *OutboundTransportPool) CloseAll() {
 func (p *OutboundTransportPool) newReusableOutboundTransport(ob adapter.Outbound, sink MetricsEventSink) *http.Transport {
 	return &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// A pooled transport detaches dial/TLS setup from request cancellation.
+			// Bound setup itself without imposing a lifetime on established streams.
+			ctx, cancel := context.WithTimeout(ctx, defaultTransportDialTimeout)
+			defer cancel()
 			conn, err := ob.DialContext(netutil.WithoutHTTPTrace(ctx), network, M.ParseSocksaddr(addr))
 			if err != nil {
 				return nil, err
@@ -143,6 +149,7 @@ func (p *OutboundTransportPool) newReusableOutboundTransport(ob adapter.Outbound
 		},
 		DisableKeepAlives:   false,
 		ForceAttemptHTTP2:   true,
+		TLSHandshakeTimeout: defaultTransportTLSHandshakeTimeout,
 		MaxIdleConns:        p.config.MaxIdleConns,
 		MaxIdleConnsPerHost: p.config.MaxIdleConnsPerHost,
 		IdleConnTimeout:     p.config.IdleConnTimeout,
@@ -151,7 +158,7 @@ func (p *OutboundTransportPool) newReusableOutboundTransport(ob adapter.Outbound
 
 func newDirectHTTPTransport(cfg OutboundTransportConfig, sink MetricsEventSink) *http.Transport {
 	cfg = normalizeOutboundTransportConfig(cfg)
-	dialer := &net.Dialer{}
+	dialer := &net.Dialer{Timeout: defaultTransportDialTimeout}
 	return &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			conn, err := dialer.DialContext(ctx, network, addr)
@@ -166,6 +173,7 @@ func newDirectHTTPTransport(cfg OutboundTransportConfig, sink MetricsEventSink) 
 		},
 		DisableKeepAlives:   false,
 		ForceAttemptHTTP2:   true,
+		TLSHandshakeTimeout: defaultTransportTLSHandshakeTimeout,
 		MaxIdleConns:        cfg.MaxIdleConns,
 		MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost,
 		IdleConnTimeout:     cfg.IdleConnTimeout,

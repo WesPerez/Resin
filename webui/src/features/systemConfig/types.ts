@@ -9,6 +9,7 @@ export type RuntimeConfig = {
   max_latency_test_interval: string;
   max_authority_latency_test_interval: string;
   max_egress_test_interval: string;
+  lease_recovery_enabled: boolean;
   latency_test_url: string;
   latency_authorities: string[];
   p2c_latency_window: string;
@@ -63,3 +64,15 @@ export type EnvConfig = {
 };
 
 export type RuntimeConfigPatch = Partial<RuntimeConfig>;
+
+export type RecoveryStatus = {
+  since: string;
+  enabled: boolean;
+  rotated: number;
+  limited: number;
+  no_alternative: number;
+  stale: number;
+  last_status?: string;
+  last_at?: string;
+  cooling_platforms: number;
+};

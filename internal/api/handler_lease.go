@@ -92,6 +92,22 @@ func HandleListLeases(cp *service.ControlPlaneService) http.HandlerFunc {
 			leases = filtered
 		}
 
+		// Preserve the existing account filter's wire-identity contract. Display
+		// search is additive and never changes the meaning of routing keys.
+		if search := strings.TrimSpace(r.URL.Query().Get("search")); search != "" {
+			search = strings.ToLower(search)
+			filtered := make([]service.LeaseResponse, 0, len(leases))
+			for _, lease := range leases {
+				if lease.DisplayNameUnavailable {
+					writeServiceError(w, &service.ServiceError{Code: "INTERNAL", Message: "display name search temporarily unavailable; account filtering remains available"})
+					return
+				}
+				if strings.Contains(strings.ToLower(lease.Account), search) || strings.Contains(strings.ToLower(lease.DisplayName), search) {
+					filtered = append(filtered, lease)
+				}
+			}
+			leases = filtered
+		}
 		sorting, ok := parseSortingOrWriteInvalid(w, r, []string{"account", "expiry", "last_accessed"}, "expiry", "asc")
 		if !ok {
 			return
@@ -129,6 +145,31 @@ func HandleGetLease(cp *service.ControlPlaneService) http.HandlerFunc {
 	}
 }
 
+func HandleSetLeaseDisplayName(cp *service.ControlPlaneService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		platformID, ok := requireUUIDPathParam(w, r, "id", "platform_id")
+		if !ok {
+			return
+		}
+		account, err := validateAccountPath(r)
+		if err != nil {
+			writeServiceError(w, err)
+			return
+		}
+		var req service.SetLeaseDisplayNameRequest
+		if err := DecodeBody(r, &req); err != nil {
+			writeDecodeBodyError(w, err)
+			return
+		}
+		lease, err := cp.SetLeaseDisplayNameContext(r.Context(), platformID, account, req)
+		if err != nil {
+			writeServiceError(w, err)
+			return
+		}
+		WriteJSON(w, http.StatusOK, lease)
+	}
+}
+
 // HandleDeleteLease returns a handler for DELETE /api/v1/platforms/{id}/leases/{account}.
 func HandleDeleteLease(cp *service.ControlPlaneService) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -146,6 +187,38 @@ func HandleDeleteLease(cp *service.ControlPlaneService) http.HandlerFunc {
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func HandleRotateLease(cp *service.ControlPlaneService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		platformID, ok := requireUUIDPathParam(w, r, "id", "platform_id")
+		if !ok {
+			return
+		}
+		account, err := validateAccountPath(r)
+		if err != nil {
+			writeServiceError(w, err)
+			return
+		}
+		var req service.RotateLeaseRequest
+		if err := DecodePreferenceBody(r, &req); err != nil {
+			writeDecodeBodyError(w, err)
+			return
+		}
+		result, err := cp.RotateLease(platformID, account, req)
+		if err != nil {
+			writeServiceError(w, err)
+			return
+		}
+		status := http.StatusOK
+		switch result.Status {
+		case "stale_lease":
+			status = http.StatusConflict
+		case "no_alternative":
+			status = http.StatusUnprocessableEntity
+		}
+		WriteJSON(w, status, result)
 	}
 }
 

@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/Resinat/Resin/internal/scanloop"
+	"github.com/puzpuzpuz/xsync/v4"
 )
 
 // LeaseCleaner periodically sweeps for expired leases.
@@ -104,6 +104,8 @@ func (c *LeaseCleaner) sweep() {
 }
 
 func (c *LeaseCleaner) sweepPlatformState(platID string, state *PlatformRoutingState, nowNs int64) {
+	c.router.recoveryMu.RLock()
+	var events []LeaseEvent
 	// Iterate over all leases for this platform
 	state.Leases.Range(func(account string, lease Lease) bool {
 		// Check against stop signal
@@ -123,16 +125,14 @@ func (c *LeaseCleaner) sweepPlatformState(platID string, state *PlatformRoutingS
 				if current.ExpiryNs < nowNs {
 					state.Leases.stats.Dec(current.EgressIP)
 
-					if c.router.onLeaseEvent != nil {
-						c.router.onLeaseEvent(LeaseEvent{
-							Type:        LeaseExpire,
-							PlatformID:  platID,
-							Account:     account,
-							NodeHash:    current.NodeHash,
-							EgressIP:    current.EgressIP,
-							CreatedAtNs: current.CreatedAtNs,
-						})
-					}
+					events = append(events, LeaseEvent{
+						Type:        LeaseExpire,
+						PlatformID:  platID,
+						Account:     account,
+						NodeHash:    current.NodeHash,
+						EgressIP:    current.EgressIP,
+						CreatedAtNs: current.CreatedAtNs,
+					})
 
 					return current, xsync.DeleteOp
 				}
@@ -141,4 +141,8 @@ func (c *LeaseCleaner) sweepPlatformState(platID string, state *PlatformRoutingS
 		}
 		return true
 	})
+	c.router.recoveryMu.RUnlock()
+	for _, event := range events {
+		c.router.emitLeaseEvent(event)
+	}
 }

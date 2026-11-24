@@ -6,8 +6,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Resinat/Resin/internal/netutil"
@@ -18,16 +20,20 @@ import (
 )
 
 type tunnelDeps struct {
-	router      *routing.Router
-	pool        outbound.PoolAccessor
-	health      HealthRecorder
-	metricsSink MetricsEventSink
-	bypass      *TargetBypassMatcher
+	router           *routing.Router
+	pool             outbound.PoolAccessor
+	health           HealthRecorder
+	metricsSink      MetricsEventSink
+	bypass           *TargetBypassMatcher
+	connectTimeout   time.Duration
+	connectRetries   int
+	firstByteTimeout time.Duration
 }
 
 type preparedTunnel struct {
-	upstreamConn net.Conn
-	recordResult func(bool, error)
+	upstreamConn   net.Conn
+	recordResult   func(bool, error)
+	recoveryClosed atomic.Bool
 }
 
 type tunnelPrepareResult struct {
@@ -41,17 +47,124 @@ type tunnelPrepareResult struct {
 }
 
 type tunnelRelayResult struct {
-	ingressBytes  int64
-	egressBytes   int64
-	netOK         bool
-	proxyErr      *ProxyError
-	upstreamStage string
-	upstreamErr   error
+	ingressBytes       int64
+	egressBytes        int64
+	netOK              bool
+	proxyErr           *ProxyError
+	upstreamStage      string
+	upstreamErr        error
+	upstreamReadFailed bool
+	clientClosedFirst  bool
+}
+
+// A canceled exchange or an orderly target close without a response provides
+// no node-health evidence. Preserve existing successful SOCKS5 accounting.
+func (r tunnelRelayResult) passiveHealth() (success, known bool) {
+	return r.netOK, r.netOK || (!r.clientClosedFirst && !r.targetClosedWithoutResponse())
+}
+
+func (r tunnelRelayResult) targetClosedWithoutResponse() bool {
+	return !r.netOK && !r.upstreamReadFailed && r.ingressBytes == 0 &&
+		(r.upstreamStage == "connect_zero_traffic" || r.upstreamStage == "connect_no_ingress_traffic") &&
+		(r.upstreamErr == nil || errors.Is(r.upstreamErr, io.EOF))
+}
+
+type tunnelCopyObserver struct {
+	reader  io.Reader
+	readErr error
+	onEnd   func(error)
+}
+
+func (o *tunnelCopyObserver) Read(p []byte) (int, error) {
+	n, err := o.reader.Read(p)
+	if err != nil && o.onEnd != nil {
+		o.onEnd(err)
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		o.readErr = err
+	}
+	return n, err
 }
 
 type tunnelPumpOptions struct {
 	requireBidirectionalTraffic bool
 	onFirstIngressByte          func()
+	firstByteTimeout            time.Duration
+	onFirstByteTimeout          func()
+}
+
+const (
+	firstByteWaiting uint32 = iota
+	firstByteReceived
+	firstByteTimedOut
+	firstByteStopped
+)
+
+type tunnelFirstByteWatch struct {
+	timeout   time.Duration
+	onTimeout func()
+	state     atomic.Uint32
+	mu        sync.Mutex
+	timer     *time.Timer
+	timerDone chan struct{}
+	doneOnce  sync.Once
+}
+
+func (w *tunnelFirstByteWatch) start() {
+	if w == nil || w.timeout <= 0 || w.state.Load() != firstByteWaiting {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.timer != nil || w.state.Load() != firstByteWaiting {
+		return
+	}
+	w.timerDone = make(chan struct{})
+	w.timer = time.AfterFunc(w.timeout, func() {
+		defer w.doneOnce.Do(func() { close(w.timerDone) })
+		if w.state.CompareAndSwap(firstByteWaiting, firstByteTimedOut) && w.onTimeout != nil {
+			w.onTimeout()
+		}
+	})
+}
+
+func (w *tunnelFirstByteWatch) receive() bool {
+	if w == nil {
+		return true
+	}
+	if !w.state.CompareAndSwap(firstByteWaiting, firstByteReceived) {
+		return w.state.Load() == firstByteReceived
+	}
+	w.stopTimer()
+	return true
+}
+
+func (w *tunnelFirstByteWatch) stop() {
+	if w == nil {
+		return
+	}
+	w.state.CompareAndSwap(firstByteWaiting, firstByteStopped)
+	w.stopTimer()
+}
+
+func (w *tunnelFirstByteWatch) stopTimer() {
+	w.mu.Lock()
+	if w.timer == nil {
+		w.mu.Unlock()
+		return
+	}
+	if w.timer.Stop() {
+		w.doneOnce.Do(func() { close(w.timerDone) })
+	}
+	done := w.timerDone
+	w.mu.Unlock()
+	// Timer.Stop does not wait for an already running callback. That callback
+	// can recover a lease, so the tunnel must join it before its handler exits.
+	<-done
+}
+
+func (w *tunnelFirstByteWatch) timedOut() bool {
+	return w != nil && w.state.Load() == firstByteTimedOut
 }
 
 type firstByteReader struct {
@@ -75,77 +188,159 @@ func prepareConnectTunnel(
 	account string,
 	target string,
 ) tunnelPrepareResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if deps.bypass != nil && deps.bypass.ShouldBypass(target) {
 		return prepareDirectConnectTunnel(ctx, deps, target)
 	}
 
-	routed, routeErr := resolveRoutedOutbound(deps.router, deps.pool, platformName, account, target)
-	if routeErr != nil {
-		return tunnelPrepareResult{proxyErr: routeErr}
-	}
-
+	account = routing.CanonicalAccount(account)
 	domain := netutil.ExtractDomain(target)
-	nodeHashRaw := routed.Route.NodeHash
-	if deps.health != nil {
-		go recordLatencyForVersion(deps.health, nodeHashRaw, routed.Route.NodeVersion, domain, nil)
+	retries := deps.connectRetries
+	if retries < 0 {
+		retries = 0
 	}
+	if retries > 2 {
+		retries = 2
+	}
+	excluded := make([]node.Hash, 0, retries)
+	attempts := retries + 1
+	var lastFailure tunnelPrepareResult
+	var grant *routing.RecoveryAttempt
+	finishFailedRecovery := func() {
+		if grant != nil && ctx.Err() == nil {
+			_, _, _ = deps.router.CommitRecovery(grant, target, routing.RotateLeaseOptions{
+				ExcludeEgressIP: true, PreserveConnections: true, ApplyTargetCooldown: true, FailureCooldown: 10 * time.Minute,
+				FailureClass: routing.FailureTransport,
+				// Every attempted dial failed. Record the observed cooldown, but
+				// an explicit empty pool forbids an unverified fourth-node commit.
+				PreferredCandidates: []routing.PreferredCandidate{},
+			})
+		}
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		resolve := resolveRoutedOutboundExcluding
+		if attempt > 0 {
+			resolve = resolveRoutedOutboundPeek
+		}
+		routed, routeErr := resolve(
+			deps.router,
+			deps.pool,
+			platformName,
+			account,
+			target,
+			excluded,
+		)
+		if routeErr != nil {
+			if lastFailure.proxyErr != nil {
+				finishFailedRecovery()
+				return lastFailure
+			}
+			return tunnelPrepareResult{proxyErr: routeErr}
+		}
 
-	rawConn, err := routed.Outbound.DialContext(ctx, "tcp", M.ParseSocksaddr(target))
-	if err != nil {
-		proxyErr := classifyConnectError(err)
-		if proxyErr == nil {
-			return tunnelPrepareResult{
-				route:    routed.Route,
-				canceled: true,
+		nodeHashRaw := routed.Route.NodeHash
+		if deps.health != nil {
+			recordLatencyForVersion(deps.health, nodeHashRaw, routed.Route.NodeVersion, domain, nil)
+		}
+
+		rawConn, err := dialTunnelWithTimeout(ctx, deps.connectTimeout, func(dialCtx context.Context) (net.Conn, error) {
+			return routed.Outbound.DialContext(dialCtx, "tcp", M.ParseSocksaddr(target))
+		})
+		if err != nil {
+			proxyErr := classifyConnectError(err)
+			if proxyErr == nil {
+				return tunnelPrepareResult{
+					route:    routed.Route,
+					canceled: true,
+				}
+			}
+			if deps.health != nil {
+				recordPassiveFailureAsync(deps.health, routed.Route, err, node.RelayInfo{})
+			}
+			lastFailure = tunnelPrepareResult{
+				route:         routed.Route,
+				proxyErr:      proxyErr,
+				upstreamStage: "connect_dial",
+				upstreamErr:   err,
+			}
+			if attempt == 0 && account != "" && routed.Route.LeaseCreatedAtNs != 0 {
+				var beginErr error
+				grant, beginErr = deps.router.BeginRecovery(routed.Route.PlatformID, account, routed.Route.NodeHash, routed.Route.LeaseCreatedAtNs)
+				if beginErr != nil {
+					// A concurrent rotation or policy limit leaves retries read-only.
+					grant = nil
+				}
+			}
+			excluded = append(excluded, routed.Route.NodeHash)
+			if attempt+1 < attempts {
+				log.Printf(
+					"proxy connect retry: platform_id=%s failed_node_hash=%s next_attempt=%d/%d",
+					routed.Route.PlatformID,
+					routed.Route.NodeHash.Hex(),
+					attempt+2,
+					attempts,
+				)
+			}
+			continue
+		}
+
+		if grant != nil {
+			next, _, commitErr := deps.router.CommitRecovery(grant, target, routing.RotateLeaseOptions{
+				PreferredNode: routed.Route.NodeHash, ExpectedTargetIP: routed.Route.EgressIP, VerifiedPreferred: true,
+				PreserveConnections: true, ApplyTargetCooldown: true, FailureCooldown: 10 * time.Minute,
+				FailureClass: routing.FailureTransport,
+			})
+			if commitErr != nil && !errors.Is(commitErr, routing.ErrRecoveryLimited) && !errors.Is(commitErr, routing.ErrRecoveryDisabled) {
+				_ = rawConn.Close()
+				return tunnelPrepareResult{route: routed.Route, proxyErr: mapRouteError(commitErr), upstreamStage: "connect_recovery", upstreamErr: commitErr}
+			}
+			if next != nil {
+				routed.Route.LeaseCreatedAtNs = next.CreatedAtNs
+				routed.Route.LeaseCreated = true
 			}
 		}
-		if deps.health != nil {
-			recordPassiveFailureAsync(deps.health, routed.Route, err, node.RelayInfo{})
-		}
-		return tunnelPrepareResult{
-			route:         routed.Route,
-			proxyErr:      proxyErr,
-			upstreamStage: "connect_dial",
-			upstreamErr:   err,
-		}
-	}
 
-	relayInfo := node.RelayInfoFromConn(rawConn)
-	recordResult := func(ok bool, err error) {
-		if deps.health != nil {
+		relayInfo := node.RelayInfoFromConn(rawConn)
+		recordResult := func(ok bool, err error) {
 			if ok {
 				recordPassiveResultAsync(deps.health, routed.Route, true, relayInfo)
 			} else {
 				recordPassiveFailureAsync(deps.health, routed.Route, relayInfo.WrapError(err), relayInfo)
 			}
 		}
-	}
 
-	var upstreamBase net.Conn = rawConn
-	if deps.metricsSink != nil {
-		deps.metricsSink.OnConnectionLifecycle(ConnectionOutbound, ConnectionOpen)
-		upstreamBase = newCountingConn(rawConn, deps.metricsSink)
-	}
-
-	upstreamConn := newTLSLatencyConn(upstreamBase, func(latency time.Duration) {
-		if deps.health != nil {
-			recordLatencyForVersion(deps.health, nodeHashRaw, routed.Route.NodeVersion, domain, &latency)
+		var upstreamBase net.Conn = rawConn
+		if deps.metricsSink != nil {
+			deps.metricsSink.OnConnectionLifecycle(ConnectionOutbound, ConnectionOpen)
+			upstreamBase = newCountingConn(rawConn, deps.metricsSink)
 		}
-	})
 
-	return tunnelPrepareResult{
-		route: routed.Route,
-		relay: relayInfo,
-		session: &preparedTunnel{
-			upstreamConn: upstreamConn,
-			recordResult: recordResult,
-		},
+		upstreamConn := newTLSLatencyConn(upstreamBase, func(latency time.Duration) {
+			if deps.health != nil {
+				recordLatencyForVersion(deps.health, nodeHashRaw, routed.Route.NodeVersion, domain, &latency)
+			}
+		})
+
+		return tunnelPrepareResult{
+			route: routed.Route,
+			relay: relayInfo,
+			session: &preparedTunnel{
+				upstreamConn: upstreamConn,
+				recordResult: recordResult,
+			},
+		}
 	}
+	finishFailedRecovery()
+	return lastFailure
 }
 
 func prepareDirectConnectTunnel(ctx context.Context, deps tunnelDeps, target string) tunnelPrepareResult {
 	var dialer net.Dialer
-	rawConn, err := dialer.DialContext(ctx, "tcp", target)
+	rawConn, err := dialTunnelWithTimeout(ctx, deps.connectTimeout, func(dialCtx context.Context) (net.Conn, error) {
+		return dialer.DialContext(dialCtx, "tcp", target)
+	})
 	if err != nil {
 		proxyErr := classifyConnectError(err)
 		if proxyErr == nil {
@@ -169,6 +364,78 @@ func prepareDirectConnectTunnel(ctx context.Context, deps tunnelDeps, target str
 			recordResult: func(bool, error) {},
 		},
 	}
+}
+
+func dialTunnelWithTimeout(
+	ctx context.Context,
+	timeout time.Duration,
+	dial func(context.Context) (net.Conn, error),
+) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timeout <= 0 {
+		return dial(ctx)
+	}
+
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := dial(dialCtx)
+	if err == nil && dialCtx.Err() != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return nil, dialCtx.Err()
+	}
+	return conn, err
+}
+
+func invalidateTunnelLease(router *routing.Router, route routing.RouteResult, account string) bool {
+	account = routing.CanonicalAccount(account)
+	if router == nil || account == "" || route.PlatformID == "" || route.NodeHash.IsZero() || route.LeaseCreatedAtNs == 0 {
+		return false
+	}
+	deleted := router.DeleteLeaseIfGeneration(route.PlatformID, account, route.NodeHash, route.LeaseCreatedAtNs)
+	if deleted {
+		log.Printf(
+			"proxy sticky lease invalidated: platform_id=%s node_hash=%s",
+			route.PlatformID,
+			route.NodeHash.Hex(),
+		)
+	}
+	return deleted
+}
+
+// Recover directly from the completed tunnel's structured failure. Log retention
+// and log enablement cannot affect this path; client cancellation is filtered by
+// shouldInvalidateTunnelLease before it reaches here. In-process events are
+// transport-class: the proxy never interprets an application response here.
+func recoverTunnelLease(router *routing.Router, route routing.RouteResult, account, target string) {
+	account = routing.CanonicalAccount(account)
+	if router == nil || account == "" || route.PlatformID == "" || route.NodeHash.IsZero() || route.LeaseCreatedAtNs == 0 {
+		return
+	}
+	_, _, err := router.RecoverLease(route.PlatformID, account, route.NodeHash, route.LeaseCreatedAtNs, target,
+		routing.RotateLeaseOptions{
+			ExcludeEgressIP: true, PreserveConnections: true, ApplyTargetCooldown: true,
+			FailureCooldown: 10 * time.Minute, FailureClass: routing.FailureTransport,
+		})
+	if err == nil {
+		log.Printf("proxy sticky lease recovered: platform_id=%s observed_node_hash=%s", route.PlatformID, route.NodeHash.Hex())
+	}
+}
+
+func registerPreparedTunnel(router *routing.Router, route routing.RouteResult, account string, client net.Conn, session *preparedTunnel) (func(), bool) {
+	closeForRecovery := func() {
+		session.recoveryClosed.Store(true)
+		_ = client.Close()
+		_ = session.upstreamConn.Close()
+	}
+	unregister, ok := router.RegisterLeaseConnection(route, account, closeForRecovery)
+	if !ok {
+		closeForRecovery()
+	}
+	return unregister, ok
 }
 
 func pumpPreparedTunnel(
@@ -205,40 +472,81 @@ func pumpPreparedTunnelReader(
 	}
 
 	type copyResult struct {
-		n   int64
-		err error
+		n       int64
+		err     error
+		readErr error
 	}
 	var closeBothOnce sync.Once
+	// Observe source termination before either copy closes its peer. A browser
+	// can cancel unused CONNECTs in a batch; the resulting empty upstream EOF
+	// is not evidence that the shared proxy node failed.
+	const clientEnded, upstreamEnded = 1, 2
+	var firstEnd atomic.Int32
 	closeBoth := func() {
 		closeBothOnce.Do(func() {
 			_ = clientConn.Close()
 			_ = session.upstreamConn.Close()
 		})
 	}
+	firstByteWatch := &tunnelFirstByteWatch{
+		timeout: opts.firstByteTimeout,
+		onTimeout: func() {
+			// End both copies first. Recovery may contend on a router lock;
+			// it must not prevent the timeout from closing its connections.
+			closeBoth()
+			if opts.onFirstByteTimeout != nil {
+				opts.onFirstByteTimeout()
+			}
+		},
+	}
 	ingressBytesCh := make(chan copyResult, 1)
 	egressBytesCh := make(chan copyResult, 1)
 	go func() {
-		n, copyErr := io.Copy(session.upstreamConn, clientToUpstream)
+		observedClient := &tunnelCopyObserver{reader: clientToUpstream, onEnd: func(err error) {
+			if isBenignTunnelCopyError(err) || isClientReadResetError(err) {
+				firstEnd.CompareAndSwap(0, clientEnded)
+			}
+		}}
+		var clientReader io.Reader = observedClient
+		if opts.firstByteTimeout > 0 {
+			clientReader = &firstByteReader{reader: observedClient, onFirstByte: firstByteWatch.start}
+		}
+		n, copyErr := io.Copy(session.upstreamConn, clientReader)
+		if copyErr != nil && observedClient.readErr == nil {
+			// A destination write failure belongs to the upstream, not the client.
+			firstEnd.CompareAndSwap(0, upstreamEnded)
+		}
 		if !isBenignTunnelCopyError(copyErr) || !closeWriteConn(session.upstreamConn) {
 			closeBoth()
 		}
 		egressBytesCh <- copyResult{n: n, err: copyErr}
 	}()
 	go func() {
-		var upstreamReader io.Reader = session.upstreamConn
-		if opts.onFirstIngressByte != nil {
+		observedUpstream := &tunnelCopyObserver{reader: session.upstreamConn, onEnd: func(error) {
+			firstEnd.CompareAndSwap(0, upstreamEnded)
+		}}
+		var upstreamReader io.Reader = observedUpstream
+		if opts.onFirstIngressByte != nil || opts.firstByteTimeout > 0 {
 			// 隧道首字耗时以目标站点返回的第一批字节为准，而不是 CONNECT/SOCKS 握手完成。
-			upstreamReader = &firstByteReader{reader: session.upstreamConn, onFirstByte: opts.onFirstIngressByte}
+			upstreamReader = &firstByteReader{reader: observedUpstream, onFirstByte: func() {
+				if firstByteWatch.receive() && opts.onFirstIngressByte != nil {
+					opts.onFirstIngressByte()
+				}
+			}}
 		}
 		n, copyErr := io.Copy(clientConn, upstreamReader)
 		if !isBenignTunnelCopyError(copyErr) || !closeWriteConn(clientConn) {
 			closeBoth()
 		}
-		ingressBytesCh <- copyResult{n: n, err: copyErr}
+		// io.Copy reports destination write errors through copyErr too. Retain
+		// the source read error separately so a client-side write failure cannot
+		// be mistaken for an upstream transport failure.
+		ingressBytesCh <- copyResult{n: n, err: copyErr, readErr: observedUpstream.readErr}
 	}()
 
 	ingressResult := <-ingressBytesCh
 	egressResult := <-egressBytesCh
+	firstByteWatch.stop()
 	closeBoth()
 
 	ingressErrBenign := isBenignTunnelCopyError(ingressResult.err)
@@ -251,11 +559,20 @@ func pumpPreparedTunnelReader(
 	}
 
 	result := tunnelRelayResult{
-		ingressBytes: ingressResult.n,
-		egressBytes:  egressResult.n,
-		netOK:        true,
+		ingressBytes:       ingressResult.n,
+		egressBytes:        egressResult.n,
+		netOK:              true,
+		upstreamReadFailed: ingressResult.readErr != nil,
+		clientClosedFirst: firstEnd.Load() == clientEnded && ingressResult.n == 0 && !firstByteWatch.timedOut() &&
+			isBenignTunnelCopyError(ingressResult.readErr) &&
+			(egressErrBenign || isClientReadResetError(egressResult.err)),
 	}
 	switch {
+	case firstByteWatch.timedOut():
+		result.netOK = false
+		result.proxyErr = ErrUpstreamTimeout
+		result.upstreamStage = "connect_first_byte_timeout"
+		result.upstreamErr = context.DeadlineExceeded
 	case !ingressErrBenign:
 		result.netOK = false
 		result.proxyErr = tunnelCopyError(ingressResult.err)
@@ -263,7 +580,7 @@ func pumpPreparedTunnelReader(
 		result.upstreamErr = ingressResult.err
 	case !egressErrBenign:
 		result.netOK = false
-		result.proxyErr = tunnelCopyError(egressResult.err)
+		result.proxyErr = ErrUpstreamRequestFailed
 		result.upstreamStage = "connect_client_to_upstream_copy"
 		result.upstreamErr = egressResult.err
 	case opts.requireBidirectionalTraffic && (ingressResult.n == 0 || egressResult.n == 0):
@@ -274,11 +591,38 @@ func pumpPreparedTunnelReader(
 			result.upstreamStage = "connect_zero_traffic"
 		case ingressResult.n == 0:
 			result.upstreamStage = "connect_no_ingress_traffic"
+			result.upstreamErr = io.EOF
 		default:
 			result.upstreamStage = "connect_no_egress_traffic"
 		}
+	case opts.firstByteTimeout > 0 && egressResult.n > 0 && ingressResult.n == 0:
+		result.netOK = false
+		result.proxyErr = ErrUpstreamRequestFailed
+		result.upstreamStage = "connect_no_ingress_traffic"
+		result.upstreamErr = io.EOF
 	}
 	return result
+}
+
+func shouldInvalidateTunnelLease(result tunnelRelayResult) bool {
+	if result.netOK || result.clientClosedFirst || result.targetClosedWithoutResponse() {
+		return false
+	}
+	if result.upstreamReadFailed {
+		return true
+	}
+	if result.upstreamStage == "connect_upstream_to_client_copy" {
+		return false
+	}
+	if result.ingressBytes > 0 {
+		return false
+	}
+	switch result.upstreamStage {
+	case "connect_first_byte_timeout", "connect_upstream_to_client_copy", "connect_no_ingress_traffic":
+		return true
+	default:
+		return false
+	}
 }
 
 func closeWriteConn(conn net.Conn) bool {

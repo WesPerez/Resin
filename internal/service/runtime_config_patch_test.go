@@ -168,6 +168,55 @@ func TestPatchRuntimeConfig_InvalidPatchDoesNotPartiallyApply(t *testing.T) {
 	}
 }
 
+func TestPatchRuntimeConfig_LegacyRecoveryDefaultsAndExplicitDisabledSurviveRestart(t *testing.T) {
+	h := newPatchHarness(t)
+	encoded, err := json.Marshal(config.NewDefaultRuntimeConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"lease_recovery_enabled", "lease_recovery_accounts_per_minute", "lease_recovery_cooldown_seconds"} {
+		delete(legacy, key)
+	}
+	legacy["request_log_enabled"] = json.RawMessage("false")
+	encoded, err = json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := state.OpenDB(filepath.Join(h.stateDir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("INSERT INTO system_config (id, config_json, version, updated_at_ns) VALUES (1, ?, 4, ?)", string(encoded), time.Now().UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, version, err := h.engine.GetSystemConfig()
+	if err != nil || loaded == nil {
+		t.Fatalf("legacy load: %v", err)
+	}
+	if version != 4 || !loaded.LeaseRecoveryEnabled || loaded.LeaseRecoveryAccountsPerMinute != 20 || loaded.LeaseRecoveryCooldownSeconds != 300 || loaded.RequestLogEnabled {
+		t.Fatalf("legacy settings were lost or defaults missing: %+v", loaded)
+	}
+	h.runtimeCfg.Store(loaded)
+	if _, err := h.cp.PatchRuntimeConfig([]byte(`{"request_log_enabled":true}`)); err != nil {
+		t.Fatalf("unrelated patch after upgrade failed: %v", err)
+	}
+	if _, err := h.cp.PatchRuntimeConfig([]byte(`{"lease_recovery_enabled":false,"lease_recovery_accounts_per_minute":12,"lease_recovery_cooldown_seconds":600}`)); err != nil {
+		t.Fatalf("recovery patch failed: %v", err)
+	}
+	loaded, version, err = h.engine.GetSystemConfig()
+	if err != nil || loaded == nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if version != 6 || loaded.LeaseRecoveryEnabled || loaded.LeaseRecoveryAccountsPerMinute != 12 || loaded.LeaseRecoveryCooldownSeconds != 600 || !loaded.RequestLogEnabled {
+		t.Fatalf("explicit recovery settings were not preserved: %+v", loaded)
+	}
+}
+
 func TestPatchRuntimeConfig_PersistFailureDoesNotSwapAtomicPointer(t *testing.T) {
 	h := newPatchHarness(t)
 

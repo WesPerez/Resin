@@ -102,3 +102,12 @@ func TestParseForwardCredentialV1WhenAuthDisabled(t *testing.T) {
 		})
 	}
 }
+
+func TestLegacyRouteMetadataSharesBaseIdentity(t *testing.T) {
+	for _, identity := range []string{"Platform.alice~r1~node~version~1020000~ip", "Platform:alice~r1~expired", "Platform.alice~r1~"} {
+		platform, account := parseV1PlatformAccountIdentity(identity)
+		if platform != "Platform" || account != "alice" {
+			t.Fatalf("identity=%q got %q/%q", identity, platform, account)
+		}
+	}
+}

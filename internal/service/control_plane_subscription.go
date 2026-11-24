@@ -29,6 +29,8 @@ type SubscriptionResponse struct {
 	Content                 string `json:"content"`
 	UpdateInterval          string `json:"update_interval"`
 	NodeCount               int    `json:"node_count"`
+	ManagedNodeCount        int    `json:"managed_node_count"`
+	EvictedNodeCount        int    `json:"evicted_node_count"`
 	HealthyNodeCount        int    `json:"healthy_node_count"`
 	Ephemeral               bool   `json:"ephemeral"`
 	IncrementalAliveNodes   bool   `json:"incremental_alive_nodes"`
@@ -45,6 +47,8 @@ type SubscriptionResponse struct {
 func (s *ControlPlaneService) subToResponse(sub *subscription.Subscription) SubscriptionResponse {
 	chainProxy, chainRelay := sub.ChainConfig()
 	nodeCount := 0
+	managedNodeCount := 0
+	evictedNodeCount := 0
 	healthyNodeCount := 0
 	var isHealthyAndEnabled func(*node.NodeEntry) bool
 	if sub.Enabled() && s != nil && s.Pool != nil {
@@ -52,7 +56,9 @@ func (s *ControlPlaneService) subToResponse(sub *subscription.Subscription) Subs
 	}
 	if managed := sub.ManagedNodes(); managed != nil {
 		managed.RangeNodes(func(h node.Hash, n subscription.ManagedNode) bool {
+			managedNodeCount++
 			if n.Evicted {
+				evictedNodeCount++
 				return true
 			}
 			nodeCount++
@@ -74,6 +80,8 @@ func (s *ControlPlaneService) subToResponse(sub *subscription.Subscription) Subs
 		Content:                 sub.Content(),
 		UpdateInterval:          time.Duration(sub.UpdateIntervalNs()).String(),
 		NodeCount:               nodeCount,
+		ManagedNodeCount:        managedNodeCount,
+		EvictedNodeCount:        evictedNodeCount,
 		HealthyNodeCount:        healthyNodeCount,
 		Ephemeral:               sub.Ephemeral(),
 		IncrementalAliveNodes:   sub.IncrementalAliveNodes(),
@@ -307,7 +315,9 @@ func (s *ControlPlaneService) UpdateSubscription(id string, patchJSON json.RawMe
 	if s.Scheduler != nil {
 		s.Scheduler.RecheckNodes(effects.reenabled)
 		if effects.refresh {
-			go s.Scheduler.UpdateSubscription(sub)
+			if err := s.Scheduler.UpdateSubscriptionAsync(sub); err != nil {
+				return nil, internal("subscription refresh admission", err)
+			}
 		}
 	}
 	if result != nil {

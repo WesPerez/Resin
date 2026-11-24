@@ -1,0 +1,262 @@
+package routing
+
+import (
+	"errors"
+	"net/netip"
+	"sync/atomic"
+	"time"
+
+	"github.com/Resinat/Resin/internal/model"
+	"github.com/Resinat/Resin/internal/netutil"
+	"github.com/Resinat/Resin/internal/node"
+	"github.com/puzpuzpuz/xsync/v4"
+)
+
+var ErrLeaseChanged = errors.New("lease absent, expired, or changed")
+
+type leaseConnectionKey struct {
+	platformID  string
+	account     string
+	node        node.Hash
+	createdAtNs int64
+}
+
+type leaseConnection struct {
+	close func()
+}
+
+// RegisterLeaseConnection tracks the generation used by this socket. Existing
+// sockets can finish when the pool changes; later closes target their own key.
+func (r *Router) RegisterLeaseConnection(route RouteResult, account string, closeConnection func()) (func(), bool) {
+	account = CanonicalAccount(account)
+	if r == nil || account == "" || route.PlatformID == "" || route.LeaseCreatedAtNs == 0 || closeConnection == nil {
+		return func() {}, true
+	}
+	key := leaseConnectionKey{route.PlatformID, account, route.NodeHash, route.LeaseCreatedAtNs}
+	r.recoveryMu.Lock()
+	defer r.recoveryMu.Unlock()
+	if r.leaseConnections == nil {
+		r.leaseConnections = make(map[leaseConnectionKey]map[*leaseConnection]struct{})
+	}
+	if r.leaseConnections[key] == nil {
+		r.leaseConnections[key] = make(map[*leaseConnection]struct{})
+	}
+	connection := &leaseConnection{close: closeConnection}
+	r.leaseConnections[key][connection] = struct{}{}
+	return func() {
+		r.recoveryMu.Lock()
+		defer r.recoveryMu.Unlock()
+		delete(r.leaseConnections[key], connection)
+		if len(r.leaseConnections[key]) == 0 {
+			delete(r.leaseConnections, key)
+		}
+	}, true
+}
+
+type PreferredCandidate struct {
+	NodeHash         node.Hash
+	ExpectedTargetIP netip.Addr
+}
+
+type RotateLeaseOptions struct {
+	ExcludeEgressIP     bool
+	PreserveConnections bool
+	ApplyTargetCooldown bool
+	FailureCooldown     time.Duration
+	// FailureClass selects the class-specific cooldown upper bound. The zero
+	// value (FailureUnclassified) keeps the requested cooldown unchanged.
+	FailureClass FailureClass
+	// Set only by the in-process dialer after a candidate has connected.
+	VerifiedPreferred bool
+	ExcludedNodes     []node.Hash
+	// A supplied candidate is strict: stale or unavailable candidates leave the
+	// original lease intact instead of silently choosing an unaudited node.
+	PreferredNode    node.Hash
+	ExpectedTargetIP netip.Addr
+	// Non-nil lists constrain automatic replacement to this ordered pool.
+	// An empty list permits observing the current lease, but no replacement.
+	PreferredCandidates []PreferredCandidate
+	CandidateHints      bool // external lists prefer nodes; exhausted hints fall back
+}
+
+// RotateLease replaces exactly the observed lease. No candidate leaves it intact.
+// HTTP-level failures can preserve established tunnels; new dials use the new lease.
+func (r *Router) RotateLease(platformID, account string, expectedNode node.Hash, expectedCreatedAtNs int64, target string, options RotateLeaseOptions) (*model.Lease, int, error) {
+	return r.rotateLease(platformID, account, expectedNode, expectedCreatedAtNs, target, options, false, false)
+}
+
+// RecoverLease applies the automatic-recovery switch to an observed generation.
+// Both proxy events and authenticated failure reports use this entry point.
+func (r *Router) RecoverLease(platformID, account string, expectedNode node.Hash, expectedCreatedAtNs int64, target string, options RotateLeaseOptions) (*model.Lease, int, error) {
+	return r.rotateLease(platformID, account, expectedNode, expectedCreatedAtNs, target, options, true, false)
+}
+
+// RecoveryAttempt captures the observed lease for one bounded dial sequence.
+// It stays with the connection and has no router-side registry. The final
+// commit rechecks CAS; each dial sequence can commit at most once.
+type RecoveryAttempt struct {
+	owner *Router
+	key   leaseConnectionKey
+	used  atomic.Bool
+}
+
+func (r *Router) BeginRecovery(platformID, account string, expectedNode node.Hash, expectedCreatedAtNs int64) (*RecoveryAttempt, error) {
+	account = CanonicalAccount(account)
+	r.recoveryMu.Lock()
+	defer r.recoveryMu.Unlock()
+	now := time.Now()
+	current := r.ReadLease(model.LeaseKey{PlatformID: platformID, Account: account})
+	var err error
+	if account == "" || expectedNode.IsZero() || current == nil || current.ExpiryNs <= now.UnixNano() ||
+		current.NodeHash != expectedNode.Hex() || current.CreatedAtNs != expectedCreatedAtNs {
+		err = ErrLeaseChanged
+	} else {
+		err = r.checkRecoveryLocked(platformID, account, now)
+	}
+	if err != nil {
+		r.recordRecoveryResultLocked(err, now)
+		return nil, err
+	}
+	return &RecoveryAttempt{owner: r, key: leaseConnectionKey{platformID, account, expectedNode, expectedCreatedAtNs}}, nil
+}
+
+// CommitRecovery consumes the attempt once, including on selection/CAS failure.
+// It rechecks live policy so cancellation/failed dials never consume a rotation.
+func (r *Router) CommitRecovery(grant *RecoveryAttempt, target string, options RotateLeaseOptions) (*model.Lease, int, error) {
+	if grant == nil || grant.owner != r || !grant.used.CompareAndSwap(false, true) {
+		return nil, 0, ErrLeaseChanged
+	}
+	key := grant.key
+	return r.rotateLease(key.platformID, key.account, key.node, key.createdAtNs, target, options, true, false)
+}
+
+// Only candidate-aware acquisition can renew an expired observed generation.
+// Administrator/report/dial recovery retain their existing expiry barrier.
+func (r *Router) rotateLease(platformID, account string, expectedNode node.Hash, expectedCreatedAtNs int64, target string, options RotateLeaseOptions, automatic, allowExpired bool) (*model.Lease, int, error) {
+	account = CanonicalAccount(account)
+	plat, ok := r.pool.GetPlatform(platformID)
+	if !ok {
+		return nil, 0, ErrPlatformNotFound
+	}
+	state := r.ensurePlatformState(platformID)
+	key := leaseConnectionKey{platformID, account, expectedNode, expectedCreatedAtNs}
+	var next *model.Lease
+	var event *LeaseEvent
+	var rotateErr error
+	r.recoveryMu.Lock()
+	_, _ = state.Leases.leases.Compute(account, func(current Lease, loaded bool) (Lease, xsync.ComputeOp) {
+		now := time.Now()
+		if !loaded || current.IsExpired(now) && !allowExpired || current.NodeHash != expectedNode || current.CreatedAtNs != expectedCreatedAtNs {
+			rotateErr = ErrLeaseChanged
+			return current, xsync.CancelOp
+		}
+		var guardErr error
+		if automatic {
+			guardErr = r.checkRecoveryLocked(platformID, account, now)
+		}
+		if cooldown := targetCooldownForClass(options.FailureClass, options.FailureCooldown); cooldown > 0 && !errors.Is(guardErr, ErrRecoveryDisabled) {
+			r.recordTargetCooldownLocked(platformID, account, target, current, now, cooldown)
+		}
+		if guardErr != nil {
+			rotateErr = guardErr
+			return current, xsync.CancelOp
+		}
+		excluded := nodeExclusionSet{expectedNode: struct{}{}}
+		for _, hash := range options.ExcludedNodes {
+			excluded[hash] = struct{}{}
+		}
+
+		if options.ExcludeEgressIP {
+			plat.View().Range(func(hash node.Hash) bool {
+				if entry, exists := r.pool.GetEntry(hash); exists && entry.GetEgressIP() == current.EgressIP {
+					excluded[hash] = struct{}{}
+				}
+				return true
+			})
+		}
+		nowNs := max(now.UnixNano(), current.CreatedAtNs+1)
+		var replacement Lease
+		if options.PreferredCandidates != nil || !options.PreferredNode.IsZero() || options.ExpectedTargetIP.IsValid() {
+			candidates := options.PreferredCandidates
+			if candidates == nil {
+				candidates = []PreferredCandidate{{options.PreferredNode, options.ExpectedTargetIP}}
+			} else if len(candidates) > 60 || !options.PreferredNode.IsZero() || options.ExpectedTargetIP.IsValid() || options.VerifiedPreferred {
+				rotateErr = ErrNoAvailableNodes
+				return current, xsync.CancelOp
+			}
+			selected := false
+			for _, candidate := range candidates {
+				entry, exists := r.pool.GetEntry(candidate.NodeHash)
+				if candidate.NodeHash.IsZero() || !exists || (!options.VerifiedPreferred && !entry.IsHealthy()) ||
+					!plat.View().Contains(candidate.NodeHash) || excluded.contains(candidate.NodeHash) ||
+					(!options.CandidateHints && (!candidate.ExpectedTargetIP.IsValid() || entry.GetEgressIP() != candidate.ExpectedTargetIP)) {
+					continue
+				}
+				value := leaseForNode(plat, candidate.NodeHash, entry.GetEgressIP(), now, nowNs)
+				if (!options.CandidateHints && (value.EgressIP != candidate.ExpectedTargetIP || entry.GetEgressIP() != candidate.ExpectedTargetIP)) ||
+					(!options.VerifiedPreferred && !entry.IsHealthy()) || !plat.View().Contains(candidate.NodeHash) ||
+					options.ApplyTargetCooldown && !options.VerifiedPreferred && r.targetCoolingLocked(platformID, account, target, candidate.NodeHash, value.EgressIP, now) ||
+					value.NodeHash == current.NodeHash || options.ExcludeEgressIP && value.EgressIP == current.EgressIP {
+					continue
+				}
+				replacement, selected = value, true
+				break
+			}
+			if !selected {
+				if !options.CandidateHints {
+					rotateErr = ErrNoAvailableNodes
+					return current, xsync.CancelOp
+				}
+				var err error
+				replacement, _, err = r.createLease(plat, state, netutil.ExtractDomain(target), now, nowNs, excluded)
+				if err != nil {
+					rotateErr = err
+					return current, xsync.CancelOp
+				}
+			}
+		} else {
+			var err error
+			replacement, _, err = r.createLease(plat, state, netutil.ExtractDomain(target), now, nowNs, excluded)
+			if err != nil {
+				rotateErr = err
+				return current, xsync.CancelOp
+			}
+		}
+		// Recheck the selected IP because an egress probe can update it concurrently.
+		if replacement.NodeHash == current.NodeHash || (options.ExcludeEgressIP && replacement.EgressIP == current.EgressIP) {
+			rotateErr = ErrNoAvailableNodes
+			return current, xsync.CancelOp
+		}
+		state.IPLoadStats.Dec(current.EgressIP)
+		state.IPLoadStats.Inc(replacement.EgressIP)
+		if automatic {
+			r.recordRecoveryLocked(platformID, account, now)
+		}
+		next = &model.Lease{
+			PlatformID: platformID, Account: account, NodeHash: replacement.NodeHash.Hex(),
+			EgressIP: replacement.EgressIP.String(), CreatedAtNs: replacement.CreatedAtNs,
+			ExpiryNs: replacement.ExpiryNs, LastAccessedNs: replacement.LastAccessedNs,
+		}
+		event = &LeaseEvent{Type: LeaseReplace, PlatformID: platformID, Account: account,
+			NodeHash: replacement.NodeHash, EgressIP: replacement.EgressIP, CreatedAtNs: replacement.CreatedAtNs}
+		return replacement, xsync.UpdateOp
+	})
+	if automatic {
+		r.recordRecoveryResultLocked(rotateErr, time.Now())
+	}
+	var connections []*leaseConnection
+	if rotateErr == nil && !options.PreserveConnections {
+		for connection := range r.leaseConnections[key] {
+			connections = append(connections, connection)
+		}
+		delete(r.leaseConnections, key)
+	}
+	r.recoveryMu.Unlock()
+	for _, connection := range connections {
+		connection.close()
+	}
+	if event != nil {
+		r.emitLeaseEvent(*event)
+	}
+	return next, len(connections), rotateErr
+}

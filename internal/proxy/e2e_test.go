@@ -28,6 +28,7 @@ import (
 type proxyE2EEnv struct {
 	pool   *topology.GlobalNodePool
 	router *routing.Router
+	sub    *subscription.Subscription
 }
 
 func newProxyE2EEnv(t *testing.T) *proxyE2EEnv {
@@ -87,7 +88,32 @@ func newProxyE2EEnv(t *testing.T) *proxyE2EEnv {
 	return &proxyE2EEnv{
 		pool:   pool,
 		router: router,
+		sub:    sub,
 	}
+}
+
+func addProxyE2ENode(
+	t *testing.T,
+	env *proxyE2EEnv,
+	raw json.RawMessage,
+	ip string,
+	dialFunc func(ctx context.Context, network string, dest M.Socksaddr) (net.Conn, error),
+) node.Hash {
+	t.Helper()
+	hash := node.HashFromRawOptions(raw)
+	env.sub.ManagedNodes().StoreNode(hash, subscription.ManagedNode{Tags: []string{"tag"}})
+	env.pool.AddNodeFromSub(hash, raw, env.sub.ID)
+	entry, ok := env.pool.GetEntry(hash)
+	if !ok {
+		t.Fatal("added node not found in pool")
+	}
+	var wrapped adapter.Outbound = &mockOutbound{dialFunc: dialFunc}
+	entry.Outbound.Store(&wrapped)
+	entry.SetEgressIP(netip.MustParseAddr(ip))
+	entry.LatencyTable.Update("example.com", 20*time.Millisecond, 10*time.Minute)
+	env.pool.RecordResult(hash, true)
+	env.pool.NotifyNodeDirty(hash)
+	return hash
 }
 
 func setProxyE2EOutboundDialFunc(
@@ -1001,7 +1027,7 @@ func TestForwardProxy_CONNECTResponseFlushFailureDoesNotPenalizeNode(t *testing.
 	}
 }
 
-func TestForwardProxy_CONNECTZeroTrafficMarkedFailed(t *testing.T) {
+func TestForwardProxy_CONNECTClientClosesUnusedTunnelDoesNotPenalizeNode(t *testing.T) {
 	env := newProxyE2EEnv(t)
 	emitter := newMockEventEmitter()
 	health := &mockHealthRecorder{}
@@ -1091,17 +1117,10 @@ func TestForwardProxy_CONNECTZeroTrafficMarkedFailed(t *testing.T) {
 		t.Fatal("expected CONNECT log event")
 	}
 
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if health.resultCalls.Load() > 0 {
-			if health.lastSuccess.Load() != 0 {
-				t.Fatalf("RecordResult lastSuccess: got %d, want 0", health.lastSuccess.Load())
-			}
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+	if got := health.resultCalls.Load(); got != 0 {
+		t.Fatalf("client-closed unused tunnel must not change node health, got %d calls", got)
 	}
-	t.Fatal("expected RecordResult call for CONNECT zero-traffic failure")
 }
 
 func TestForwardProxy_CONNECTHalfTrafficNotMarkedZeroTraffic(t *testing.T) {

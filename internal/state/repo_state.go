@@ -64,7 +64,10 @@ func (r *StateRepo) GetSystemConfig() (*config.RuntimeConfig, int, error) {
 		}
 		return nil, 0, fmt.Errorf("scan system_config: %w", err)
 	}
-	cfg := &config.RuntimeConfig{}
+	// Existing rows predate newly added options. Overlay persisted fields on
+	// defaults so absent keys acquire their default without replacing an
+	// explicitly saved false or zero value.
+	cfg := config.NewDefaultRuntimeConfig()
 	if err := json.Unmarshal([]byte(configJSON), cfg); err != nil {
 		return nil, 0, fmt.Errorf("unmarshal system_config: %w", err)
 	}

@@ -38,6 +38,9 @@ func newTestServer() *Server {
 		ProxyTransportMaxIdleConns:                      1024,
 		ProxyTransportMaxIdleConnsPerHost:               64,
 		ProxyTransportIdleConnTimeout:                   90 * time.Second,
+		ProxyConnectTimeout:                             10 * time.Second,
+		ProxyConnectRetries:                             1,
+		ProxyTunnelFirstByteTimeout:                     12 * time.Second,
 		ProxyBypassRules:                                []string{"localhost", "127.*"},
 		RequestLogQueueSize:                             8192,
 		RequestLogQueueFlushBatchSize:                   4096,
@@ -323,6 +326,19 @@ func TestSystemEnvConfig_OK(t *testing.T) {
 	}
 	if body["probe_timeout"] != "15s" {
 		t.Errorf("probe_timeout: got %q, want %q", body["probe_timeout"], "15s")
+	}
+	if body["proxy_connect_timeout"] != "10s" {
+		t.Errorf("proxy_connect_timeout: got %q, want %q", body["proxy_connect_timeout"], "10s")
+	}
+	if body["proxy_connect_retries"] != float64(1) {
+		t.Errorf("proxy_connect_retries: got %v, want 1", body["proxy_connect_retries"])
+	}
+	if body["proxy_tunnel_first_byte_timeout"] != "12s" {
+		t.Errorf(
+			"proxy_tunnel_first_byte_timeout: got %q, want %q",
+			body["proxy_tunnel_first_byte_timeout"],
+			"12s",
+		)
 	}
 	if body["admin_token_set"] != true {
 		t.Errorf("admin_token_set: got %v, want true", body["admin_token_set"])

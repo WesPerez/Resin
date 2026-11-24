@@ -29,7 +29,8 @@ const (
 	stateVersionAddEndpointEnabled               = 8
 	stateVersionPlatformRegexFilterRules         = 9
 	stateVersionSubscriptionChainProxy           = 10
-	stateLatestVersion                           = stateVersionSubscriptionChainProxy
+	stateVersionLeaseDisplayNames                = 11
+	stateLatestVersion                           = stateVersionLeaseDisplayNames
 	stateLegacyBaselineVersion                   = stateVersionAddFixedAccountHeader
 
 	stateBaseSchemaMigration = stateMigrationsPath + "/000001_state_base.up.sql"
@@ -94,7 +95,7 @@ func prepareLegacyStateBaseline(db *sql.DB, driver migratedb.Driver) error {
 		return err
 	}
 	if hasVersion {
-		return nil
+		return repairForkStateVersion10(db, driver)
 	}
 
 	hasPlatforms, err := hasTable(db, "platforms")

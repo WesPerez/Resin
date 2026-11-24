@@ -1481,6 +1481,10 @@ func (m *mockHealthRecorder) ApplyFeedback(hash node.Hash, _ uint64, f node.Feed
 	return true
 }
 
+func (m *mockHealthRecorder) RecordPassiveResult(_ string, hash node.Hash, success bool) {
+	m.RecordResult(hash, success)
+}
+
 func (m *mockPassiveHealthRecorder) ApplyFeedback(hash node.Hash, _ uint64, f node.Feedback) bool {
 	if f.Result != nil {
 		m.RecordPassiveResult(f.PlatformID, hash, *f.Result)

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"net/http"
 	"strings"
 
@@ -45,6 +46,53 @@ func NewTokenActionHandler(proxyToken string, cp *service.ControlPlaneService, a
 
 		WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	}))
+	registerRecoveryActions(mux, proxyToken, cp)
 
 	return RequestBodyLimitMiddleware(apiMaxBodyBytes, mux)
+}
+
+func registerRecoveryActions(mux *http.ServeMux, proxyToken string, cp *service.ControlPlaneService) {
+	authorized := func(r *http.Request) bool {
+		auth := r.Header.Get("Authorization")
+		return proxyToken != "" && strings.HasPrefix(auth, "Bearer ") &&
+			subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(proxyToken)) == 1
+	}
+	mux.HandleFunc("GET /proxy-api/v1/capabilities", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r) {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		WriteJSON(w, http.StatusOK, map[string]int{"recovery_version": 1, "preferred_candidates_version": 1, "flexible_routing_version": 1})
+	})
+	for _, action := range []string{"acquire", "report-failure"} {
+		mux.HandleFunc("POST /proxy-api/v1/{platform}/leases/{account}/actions/"+action, func(w http.ResponseWriter, r *http.Request) {
+			if !authorized(r) {
+				http.NotFound(w, r)
+				return
+			}
+			var result *service.RecoveryLeaseResponse
+			var err error
+			if action == "acquire" {
+				var req service.AcquireRecoveryLeaseRequest
+				if err = DecodePreferenceBody(r, &req); err != nil {
+					writeDecodeBodyError(w, err)
+					return
+				}
+				result, err = cp.AcquireRecoveryLease(PathParam(r, "platform"), PathParam(r, "account"), req)
+			} else {
+				var req service.ReportLeaseFailureRequest
+				if err = DecodePreferenceBody(r, &req); err != nil {
+					writeDecodeBodyError(w, err)
+					return
+				}
+				result, err = cp.ReportLeaseFailure(PathParam(r, "platform"), PathParam(r, "account"), req)
+			}
+			if err != nil {
+				writeServiceError(w, err)
+				return
+			}
+			WriteJSON(w, http.StatusOK, result)
+		})
+	}
 }

@@ -11,7 +11,7 @@ import { ToastContainer } from "../../components/ui/Toast";
 import { useToast } from "../../hooks/useToast";
 import i18next, { useI18n } from "../../i18n";
 import { formatApiErrorMessage } from "../../lib/error-message";
-import { getEnvConfig, patchSystemConfig, getSystemConfig, getDefaultSystemConfig } from "./api";
+import { getEnvConfig, patchSystemConfig, getSystemConfig, getDefaultSystemConfig, getRecoveryStatus } from "./api";
 import type { RuntimeConfig, RuntimeConfigPatch } from "./types";
 
 type RuntimeConfigForm = {
@@ -25,6 +25,7 @@ type RuntimeConfigForm = {
   max_latency_test_interval: string;
   max_authority_latency_test_interval: string;
   max_egress_test_interval: string;
+  lease_recovery_enabled: boolean;
   latency_test_url: string;
   latency_authorities_raw: string;
   p2c_latency_window: string;
@@ -44,6 +45,7 @@ const EDITABLE_FIELDS: Array<keyof RuntimeConfig> = [
   "max_latency_test_interval",
   "max_authority_latency_test_interval",
   "max_egress_test_interval",
+  "lease_recovery_enabled",
   "latency_test_url",
   "latency_authorities",
   "p2c_latency_window",
@@ -52,7 +54,7 @@ const EDITABLE_FIELDS: Array<keyof RuntimeConfig> = [
   "cache_flush_dirty_threshold",
 ];
 
-const FIELD_LABELS: Record<keyof RuntimeConfig, string> = {
+const FIELD_LABELS: Partial<Record<keyof RuntimeConfig, string>> = {
   request_log_enabled: "启用请求日志",
   reverse_proxy_log_detail_enabled: "记录详细反代日志",
   reverse_proxy_log_req_headers_max_bytes: "请求头最大字节数",
@@ -63,6 +65,7 @@ const FIELD_LABELS: Record<keyof RuntimeConfig, string> = {
   max_latency_test_interval: "节点延迟最大测试间隔",
   max_authority_latency_test_interval: "权威域名最大测试间隔",
   max_egress_test_interval: "出口 IP 更新检查间隔",
+  lease_recovery_enabled: "自动恢复失败的出口",
   latency_test_url: "延迟测试目标 URL",
   latency_authorities: "延迟测试权威域名列表",
   p2c_latency_window: "P2C 延迟衰减窗口",
@@ -88,6 +91,15 @@ const EMPTY_ACCOUNT_BEHAVIOR_LABELS: Record<string, string> = {
   ACCOUNT_HEADER_RULE: "按照全局请求头规则提取 Account",
 };
 
+const RECOVERY_STATUS_LABELS: Record<string, string> = {
+  rotated: "已恢复出口",
+  recovery_limited: "自动恢复已关闭",
+  disabled: "自动恢复已关闭",
+  no_alternative: "暂无可用替代出口，保持原连接",
+  stale_lease: "旧请求已失效，保持当前出口",
+  failed: "恢复失败，请查看请求日志",
+};
+
 function configToForm(config: RuntimeConfig): RuntimeConfigForm {
   return {
     request_log_enabled: config.request_log_enabled,
@@ -100,6 +112,7 @@ function configToForm(config: RuntimeConfig): RuntimeConfigForm {
     max_latency_test_interval: config.max_latency_test_interval,
     max_authority_latency_test_interval: config.max_authority_latency_test_interval,
     max_egress_test_interval: config.max_egress_test_interval,
+    lease_recovery_enabled: config.lease_recovery_enabled,
     latency_test_url: config.latency_test_url,
     latency_authorities_raw: config.latency_authorities.join("\n"),
     p2c_latency_window: config.p2c_latency_window,
@@ -174,6 +187,7 @@ function parseForm(form: RuntimeConfigForm): RuntimeConfig {
       form.max_authority_latency_test_interval,
     ),
     max_egress_test_interval: parseDurationField("出口 IP 更新检查间隔", form.max_egress_test_interval),
+    lease_recovery_enabled: form.lease_recovery_enabled,
     latency_test_url: latencyURL,
     latency_authorities: parseAuthorities(form.latency_authorities_raw),
     p2c_latency_window: parseDurationField("P2C 延迟衰减窗口", form.p2c_latency_window),
@@ -253,6 +267,12 @@ export function SystemConfigPage() {
     queryKey: ["system-config-env"],
     queryFn: getEnvConfig,
     staleTime: Infinity, // Env config does not change at runtime
+  });
+
+  const recoveryQuery = useQuery({
+    queryKey: ["system-recovery"],
+    queryFn: getRecoveryStatus,
+    refetchInterval: 15_000,
   });
 
   const baseline = configQuery.data ?? null;
@@ -475,6 +495,33 @@ export function SystemConfigPage() {
                       onChange={(event) => setFormField("max_consecutive_failures", event.target.value)}
                     />
                   </div>
+                </div>
+              </section>
+
+              <section className="syscfg-section">
+                <h4>{t("出口自动恢复")}</h4>
+                <p className="muted">{t("在请求失败时直接恢复出口，已有连接继续完成；无可用替代时保留当前出口。")}</p>
+                <div className="form-grid">
+                  <div className="field-group">
+                    <label className="field-label" htmlFor="sys-recovery-enabled">{t("自动恢复失败的出口")}</label>
+                    <Switch id="sys-recovery-enabled" checked={form.lease_recovery_enabled}
+                      onChange={(event) => setFormField("lease_recovery_enabled", event.target.checked)} />
+                  </div>
+
+
+                </div>
+                <p className="muted">{t("客户端取消不会触发恢复；失败观察和候选列表不阻止正常选路。")}</p>
+                <div role="status" aria-live="polite">
+                  {recoveryQuery.isError ? <p>{t("恢复状态暂不可用")}</p> : recoveryQuery.data ? <>
+                    <p>{t("本次启动以来：恢复 {{rotated}} 次，无替代 {{unavailable}} 次。", {
+                      rotated: recoveryQuery.data.rotated,
+                      unavailable: recoveryQuery.data.no_alternative,
+                    })}</p>
+                    {recoveryQuery.data.last_status && <p>{t(RECOVERY_STATUS_LABELS[recoveryQuery.data.last_status] ?? "恢复状态暂不可用")}</p>}
+                    <p className="muted">{recoveryQuery.data.last_at
+                      ? t("最近处理时间：{{time}}", { time: new Date(recoveryQuery.data.last_at).toLocaleString() })
+                      : t("本次启动后尚无恢复事件")}</p>
+                  </> : <p>{t("正在读取恢复状态")}</p>}
                 </div>
               </section>
 
@@ -967,7 +1014,7 @@ export function SystemConfigPage() {
                 <div className="syscfg-change-list">
                   {changedKeys.map((field) => (
                     <Badge key={field} variant="neutral">
-                      {t(FIELD_LABELS[field])}
+                      {t(FIELD_LABELS[field] ?? field)}
                     </Badge>
                   ))}
                 </div>

@@ -43,6 +43,53 @@ func randomRoute(
 	pick := func() (node.Hash, bool) {
 		return view.RandomPick(rng)
 	}
+	return pickRandomRoute(size, pick, plat, stats, pool, targetDomain, authorities, p2cWindow)
+}
+
+// randomRouteExcluding selects from the routable view while skipping the
+// request-local failed nodes. The normal hot path remains allocation-free.
+func randomRouteExcluding(
+	plat *platform.Platform,
+	stats *IPLoadStats,
+	pool PoolAccessor,
+	targetDomain string,
+	authorities []string,
+	p2cWindow time.Duration,
+	excluded nodeExclusionSet,
+) (node.Hash, error) {
+	if len(excluded) == 0 {
+		return randomRoute(plat, stats, pool, targetDomain, authorities, p2cWindow)
+	}
+
+	candidates := make([]node.Hash, 0, plat.View().Size())
+	plat.View().Range(func(h node.Hash) bool {
+		if !excluded.contains(h) {
+			candidates = append(candidates, h)
+		}
+		return true
+	})
+	if len(candidates) == 0 {
+		return node.Zero, ErrNoAvailableNodes
+	}
+
+	rng := randomRouteRNGPool.Get().(*rand.Rand)
+	defer randomRouteRNGPool.Put(rng)
+	pick := func() (node.Hash, bool) {
+		return candidates[rng.IntN(len(candidates))], true
+	}
+	return pickRandomRoute(len(candidates), pick, plat, stats, pool, targetDomain, authorities, p2cWindow)
+}
+
+func pickRandomRoute(
+	size int,
+	pick func() (node.Hash, bool),
+	plat *platform.Platform,
+	stats *IPLoadStats,
+	pool PoolAccessor,
+	targetDomain string,
+	authorities []string,
+	p2cWindow time.Duration,
+) (node.Hash, error) {
 
 	// Pick 1st candidate.
 	h1, ok1 := pick()
