@@ -24,7 +24,7 @@ ARG VERSION
 ARG GIT_COMMIT
 ARG BUILD_TIME=unknown
 
-RUN CGO_ENABLED=0 go build -trimpath -tags "with_quic with_wireguard with_grpc with_utls" \
+RUN CGO_ENABLED=0 go build -trimpath -tags "with_quic with_wireguard with_grpc with_utls with_embedded_tor with_naive_outbound" \
   -ldflags="-s -w \
   -X github.com/Resinat/Resin/internal/buildinfo.Version=${VERSION} \
   -X github.com/Resinat/Resin/internal/buildinfo.GitCommit=${GIT_COMMIT} \

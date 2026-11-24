@@ -1,0 +1,61 @@
+name: Subscription Converter
+
+on:
+  push:
+    branches: [mine]
+    paths:
+      - 'cmd/subscription-converter/**'
+      - 'internal/subscription/**'
+      - 'internal/node/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/subscription-converter.yml'
+  pull_request:
+    branches: [mine]
+    paths:
+      - 'cmd/subscription-converter/**'
+      - 'internal/subscription/**'
+      - 'internal/node/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/subscription-converter.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CI_FALLBACK_CONTRACT: '1'
+
+jobs:
+  converter:
+    name: Test and build subscription converter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check formatting and run converter tests
+        shell: bash
+        run: |
+          test -z "$(gofmt -l cmd/subscription-converter/*.go)"
+          go test ./cmd/subscription-converter
+      - name: Build Linux amd64 converter
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          mkdir -p dist
+          go build -trimpath -o dist/subscription-converter ./cmd/subscription-converter
+          printf '%s\n' "$GITHUB_SHA" > dist/revision.txt
+          cd dist
+          sha256sum subscription-converter revision.txt > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: subscription-converter-linux-amd64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7

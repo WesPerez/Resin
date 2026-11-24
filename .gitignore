@@ -5,6 +5,7 @@ sing-box-reference
 .devcontainer
 start-instance.sh
 PublishToRegistry.sh
+webui/dist/
 
 # Claude Code / OMC tooling and local runtime data
 .claude/
