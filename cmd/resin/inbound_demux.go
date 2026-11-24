@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"sync"
@@ -29,27 +30,52 @@ type inboundDemuxServer struct {
 	httpListener *connChannelListener
 	socksHandler inboundConnHandler
 
-	mu           sync.Mutex
-	outer        net.Listener
-	shuttingDown bool
-	activeConns  map[net.Conn]struct{}
-	sniffConns   map[net.Conn]struct{}
-	workerWG     sync.WaitGroup
-	baseCtx      context.Context
-	cancelBase   context.CancelFunc
+	mu                      sync.Mutex
+	outer                   net.Listener
+	shuttingDown            bool
+	activeConns             map[net.Conn]struct{}
+	activeChanged           chan struct{}
+	sniffConns              map[net.Conn]struct{}
+	workerWG                sync.WaitGroup
+	handlerWG               sync.WaitGroup
+	httpServeWG             sync.WaitGroup
+	httpServeErr            error
+	httpShutdownErrReported bool
+	baseCtx                 context.Context
+	cancelBase              context.CancelFunc
 }
 
 func newInboundDemuxServer(httpServer *http.Server, socksHandler inboundConnHandler) *inboundDemuxServer {
 	if httpServer == nil {
 		httpServer = &http.Server{Handler: http.NotFoundHandler()}
 	}
-	return &inboundDemuxServer{
-		httpServer:   httpServer,
-		httpListener: newConnChannelListener(),
-		socksHandler: socksHandler,
-		activeConns:  make(map[net.Conn]struct{}),
-		sniffConns:   make(map[net.Conn]struct{}),
+	s := &inboundDemuxServer{
+		httpServer:    httpServer,
+		httpListener:  newConnChannelListener(),
+		socksHandler:  socksHandler,
+		activeConns:   make(map[net.Conn]struct{}),
+		activeChanged: make(chan struct{}),
+		sniffConns:    make(map[net.Conn]struct{}),
 	}
+	handler := httpServer.Handler
+	if handler == nil {
+		handler = http.DefaultServeMux
+	}
+	httpServer.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		if s.shuttingDown {
+			s.mu.Unlock()
+			http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+			return
+		}
+		s.handlerWG.Add(1)
+		s.mu.Unlock()
+		defer s.handlerWG.Done()
+		// Pass the original writer through, preserving Hijacker/Flusher. The
+		// handler lifetime extends beyond a hijacked connection's close hook.
+		handler.ServeHTTP(w, r)
+	})
+	return s
 }
 
 func (s *inboundDemuxServer) Serve(ln net.Listener) error {
@@ -58,13 +84,27 @@ func (s *inboundDemuxServer) Serve(ln net.Listener) error {
 	}
 
 	s.mu.Lock()
+	if s.shuttingDown {
+		s.mu.Unlock()
+		_ = ln.Close()
+		return http.ErrServerClosed
+	}
 	s.outer = ln
-	s.shuttingDown = false
 	s.baseCtx, s.cancelBase = context.WithCancel(context.Background())
+	s.httpServeWG.Add(1)
 	s.mu.Unlock()
 
 	go func() {
-		_ = s.httpServer.Serve(s.httpListener)
+		defer s.httpServeWG.Done()
+		if err := s.httpServer.Serve(s.httpListener); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			s.mu.Lock()
+			s.httpServeErr = err
+			outer := s.outer
+			s.mu.Unlock()
+			if outer != nil {
+				_ = outer.Close() // Stop accepting into a failed HTTP sink.
+			}
+		}
 	}()
 	defer s.httpListener.Close()
 
@@ -72,6 +112,9 @@ func (s *inboundDemuxServer) Serve(ln net.Listener) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if serveErr := s.httpServeError(); serveErr != nil {
+				return serveErr
+			}
 			if s.isShuttingDown() {
 				return http.ErrServerClosed
 			}
@@ -106,28 +149,65 @@ func inboundDemuxAcceptRetryDelay(err error, prev time.Duration) (time.Duration,
 	return next, true
 }
 
-func (s *inboundDemuxServer) Shutdown(ctx context.Context) error {
+func (s *inboundDemuxServer) httpServeError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.httpServeErr
+}
+
+func (s *inboundDemuxServer) takeHTTPShutdownError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.httpServeErr == nil || s.httpShutdownErrReported {
+		return nil
+	}
+	s.httpShutdownErrReported = true
+	// Keep the original error available to the outer Serve loop. Shutdown
+	// archives it once without hiding the failed sink from its accept owner.
+	return s.httpServeErr
+}
+
+func (s *inboundDemuxServer) Shutdown(ctx context.Context, preserveConnections bool) (result error) {
+	defer func() { result = errors.Join(result, s.takeHTTPShutdownError()) }()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.mu.Lock()
 	s.shuttingDown = true
 	outer := s.outer
 	cancelBase := s.cancelBase
 	s.mu.Unlock()
-
-	if cancelBase != nil {
+	if cancelBase != nil && !preserveConnections {
 		cancelBase()
 	}
 	if outer != nil {
 		_ = outer.Close()
 	}
-	s.closeSniffConns()
 
 	httpErr := error(nil)
 	if s.httpServer != nil {
 		if err := s.httpServer.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			httpErr = err
-			_ = s.httpServer.Close()
+			if !preserveConnections {
+				_ = s.httpServer.Close()
+			}
 		}
 	}
+	if preserveConnections {
+		drainErr := s.waitForConnectionDrain(ctx)
+		if cancelBase != nil {
+			cancelBase()
+		}
+		_ = s.httpListener.Close()
+		if drainErr != nil {
+			log.Printf("Resin endpoint drain timed out with %d active and %d sniffing connections",
+				s.activeConnCount(), s.sniffConnCount())
+		} else {
+			log.Printf("Resin endpoint drained all accepted connections")
+		}
+		return errors.Join(httpErr, drainErr)
+	}
+	s.closeSniffConns()
 	// http.Server.Shutdown does not close hijacked connections such as CONNECT
 	// and WebSocket tunnels. Close anything still tracked after graceful HTTP
 	// shutdown so disabling an endpoint also terminates its established tunnels.
@@ -136,6 +216,8 @@ func (s *inboundDemuxServer) Shutdown(ctx context.Context) error {
 	waitDone := make(chan struct{})
 	go func() {
 		s.workerWG.Wait()
+		s.handlerWG.Wait()
+		s.httpServeWG.Wait()
 		close(waitDone)
 	}()
 
@@ -150,12 +232,60 @@ func (s *inboundDemuxServer) Shutdown(ctx context.Context) error {
 		if s.httpServer != nil {
 			_ = s.httpServer.Close()
 		}
-		<-waitDone
 		if httpErr == nil {
 			return ctx.Err()
 		}
 		return httpErr
 	}
+}
+
+func (s *inboundDemuxServer) waitForConnectionDrain(ctx context.Context) error {
+	workersDone := make(chan struct{})
+	go func() {
+		s.workerWG.Wait()
+		s.handlerWG.Wait()
+		s.httpServeWG.Wait()
+		close(workersDone)
+	}()
+	select {
+	case <-workersDone:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	// Once all accepted-connection workers have returned, no connection can be
+	// added to activeConns. HTTP CONNECT connections may still be owned by the
+	// net/http hijack goroutine, so wait for their close hooks as well.
+	for {
+		s.mu.Lock()
+		active := len(s.activeConns)
+		changed := s.activeChanged
+		if changed == nil {
+			changed = make(chan struct{})
+			s.activeChanged = changed
+		}
+		s.mu.Unlock()
+		if active == 0 {
+			return nil
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (s *inboundDemuxServer) activeConnCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.activeConns)
+}
+
+func (s *inboundDemuxServer) sniffConnCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.sniffConns)
 }
 
 func (s *inboundDemuxServer) handleAcceptedConn(conn net.Conn) {
@@ -239,13 +369,26 @@ func (s *inboundDemuxServer) trackActiveConn(conn net.Conn) {
 	if s.activeConns == nil {
 		s.activeConns = make(map[net.Conn]struct{})
 	}
-	s.activeConns[conn] = struct{}{}
+	if _, exists := s.activeConns[conn]; !exists {
+		s.activeConns[conn] = struct{}{}
+		s.signalActiveChangeLocked()
+	}
 }
 
 func (s *inboundDemuxServer) untrackActiveConn(conn net.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.activeConns, conn)
+	if _, exists := s.activeConns[conn]; exists {
+		delete(s.activeConns, conn)
+		s.signalActiveChangeLocked()
+	}
+}
+
+func (s *inboundDemuxServer) signalActiveChangeLocked() {
+	if s.activeChanged != nil {
+		close(s.activeChanged)
+	}
+	s.activeChanged = make(chan struct{})
 }
 
 func (s *inboundDemuxServer) trackSniffConn(conn net.Conn) {
@@ -284,6 +427,7 @@ func (s *inboundDemuxServer) closeActiveConns() {
 		conns = append(conns, conn)
 	}
 	s.activeConns = make(map[net.Conn]struct{})
+	s.signalActiveChangeLocked()
 	s.mu.Unlock()
 
 	for _, conn := range conns {

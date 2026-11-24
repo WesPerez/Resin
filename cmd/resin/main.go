@@ -46,6 +46,16 @@ type topologyRuntime struct {
 const downloadUserAgent = "clash.meta"
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "migrate" {
+		if err := migrateCLI(os.Args[2:], os.Stdout); err != nil {
+			fatalf("%v", err)
+		}
+		return
+	}
+	if len(os.Args) > 1 {
+		fatalf("unknown Resin command")
+	}
+
 	if err := run(); err != nil {
 		fatalf("%v", err)
 	}

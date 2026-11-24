@@ -86,6 +86,35 @@ func TestInboundMux_RoutesTokenAPINamespaceToTokenActionHandler(t *testing.T) {
 	}
 }
 
+func TestInboundMux_RecoveryNamespaceUsesProxyCapability(t *testing.T) {
+	for _, allow := range []bool{true, false} {
+		endpoint := service.NewDefaultEndpoint(0)
+		endpoint.AllowManagement = false
+		endpoint.AllowProxy = allow
+		mux := newEndpointInboundMux(func() model.Endpoint { return endpoint }, "tok",
+			tagHandler("forward", http.StatusOK), tagHandler("reverse", http.StatusOK),
+			tagHandler("admin", http.StatusOK), tagHandler("recovery", http.StatusOK))
+		req := httptest.NewRequest(http.MethodPost, "/proxy-api/v1/Default/leases/sub2-test/actions/acquire", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if allow && rec.Header().Get("X-Route") != "recovery" {
+			t.Fatal("recovery went through admin or reverse proxy")
+		}
+		if !allow && rec.Code != http.StatusForbidden {
+			t.Fatalf("disabled proxy accepted recovery: %d", rec.Code)
+		}
+		req = httptest.NewRequest(http.MethodGet, "/proxy-api/v1/capabilities", nil)
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if allow && rec.Header().Get("X-Route") != "recovery" {
+			t.Fatal("capability read went through admin or reverse proxy")
+		}
+		if !allow && rec.Code != http.StatusForbidden {
+			t.Fatalf("disabled proxy accepted capability read: %d", rec.Code)
+		}
+	}
+}
+
 func TestInboundMux_RoutesAPIForControlPlanePaths(t *testing.T) {
 	mux := newInboundMux(
 		"tok",

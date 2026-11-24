@@ -163,7 +163,7 @@ func TestInboundDemux_RoutesHTTPToHTTPServer(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := demux.Shutdown(ctx); err != nil {
+	if err := demux.Shutdown(ctx, false); err != nil {
 		t.Fatalf("shutdown: %v", err)
 	}
 
@@ -233,7 +233,7 @@ func TestInboundDemux_RetriesTemporaryAcceptError(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := demux.Shutdown(ctx); err != nil {
+	if err := demux.Shutdown(ctx, false); err != nil {
 		t.Fatalf("shutdown: %v", err)
 	}
 
@@ -298,7 +298,7 @@ func TestInboundDemux_IdleConnectionDoesNotBlockSubsequentAccepts(t *testing.T) 
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := demux.Shutdown(ctx); err != nil {
+	if err := demux.Shutdown(ctx, false); err != nil {
 		t.Fatalf("shutdown: %v", err)
 	}
 
@@ -342,7 +342,7 @@ func TestInboundDemux_ShutdownClosesIdleSniffConnectionsPromptly(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		shutdownDone <- demux.Shutdown(ctx)
+		shutdownDone <- demux.Shutdown(ctx, false)
 	}()
 
 	_ = idleConn.SetReadDeadline(time.Now().Add(250 * time.Millisecond))
@@ -406,7 +406,7 @@ func TestInboundDemux_ShutdownUnblocksSocksHandshakePhase(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		shutdownDone <- demux.Shutdown(ctx)
+		shutdownDone <- demux.Shutdown(ctx, false)
 	}()
 
 	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
@@ -481,7 +481,7 @@ func TestInboundDemux_ShutdownTimeoutForceClosesActiveHTTPConnections(t *testing
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		defer cancel()
-		shutdownDone <- demux.Shutdown(ctx)
+		shutdownDone <- demux.Shutdown(ctx, false)
 	}()
 
 	select {
@@ -553,7 +553,7 @@ func TestInboundDemux_ShutdownTimeoutForceClosesActiveHTTPConnection(t *testing.
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	err = demux.Shutdown(ctx)
+	err = demux.Shutdown(ctx, false)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("shutdown error: got %v, want context deadline exceeded", err)
 	}
@@ -650,7 +650,7 @@ func TestInboundDemux_ShutdownClosesHijackedHTTPConnection(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := demux.Shutdown(ctx); err != nil {
+	if err := demux.Shutdown(ctx, false); err != nil {
 		t.Fatalf("shutdown: %v", err)
 	}
 
@@ -661,6 +661,248 @@ func TestInboundDemux_ShutdownClosesHijackedHTTPConnection(t *testing.T) {
 	}
 	waitForDemuxConnState(t, demux, 0, 0)
 
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Fatalf("serve error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for demux server to stop")
+	}
+}
+
+func TestInboundDemux_DrainPreservesHijackedHTTPConnection(t *testing.T) {
+	hijackedConnCh := make(chan net.Conn, 1)
+	handlerErrCh := make(chan error, 1)
+	httpServer := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				handlerErrCh <- errors.New("response writer does not support hijacking")
+				return
+			}
+			conn, rw, err := hijacker.Hijack()
+			if err != nil {
+				handlerErrCh <- err
+				return
+			}
+			if _, err := rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+				_ = conn.Close()
+				handlerErrCh <- err
+				return
+			}
+			if err := rw.Flush(); err != nil {
+				_ = conn.Close()
+				handlerErrCh <- err
+				return
+			}
+			hijackedConnCh <- conn
+		}),
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	demux := newInboundDemuxServer(httpServer, &stubSocksHandler{})
+	errCh := make(chan error, 1)
+	go func() { errCh <- demux.Serve(ln) }()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial http conn: %v", err)
+	}
+	defer clientConn.Close()
+	if _, err := io.WriteString(clientConn, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"); err != nil {
+		t.Fatalf("write CONNECT request: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(clientConn), &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatalf("read CONNECT response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT status: got %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var serverConn net.Conn
+	select {
+	case serverConn = <-hijackedConnCh:
+	case err := <-handlerErrCh:
+		t.Fatalf("hijack handler: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for HTTP connection to be hijacked")
+	}
+	defer serverConn.Close()
+	waitForDemuxConnState(t, demux, 1, 0)
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		shutdownDone <- demux.Shutdown(ctx, true)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for !demux.isShuttingDown() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !demux.isShuttingDown() {
+		t.Fatal("demux did not enter draining state")
+	}
+	if conn, err := net.DialTimeout("tcp", ln.Addr().String(), 100*time.Millisecond); err == nil {
+		_ = conn.Close()
+		t.Fatal("new connection succeeded after drain started")
+	}
+
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("drain returned before hijacked connection closed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if _, err := clientConn.Write([]byte("ping")); err != nil {
+		t.Fatalf("write through draining tunnel: %v", err)
+	}
+	buf := make([]byte, 4)
+	_ = serverConn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := io.ReadFull(serverConn, buf); err != nil {
+		t.Fatalf("read through draining tunnel: %v", err)
+	}
+	if string(buf) != "ping" {
+		t.Fatalf("tunnel payload = %q, want ping", buf)
+	}
+	if _, err := serverConn.Write([]byte("pong")); err != nil {
+		t.Fatalf("write reverse through draining tunnel: %v", err)
+	}
+	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := io.ReadFull(clientConn, buf); err != nil {
+		t.Fatalf("read reverse through draining tunnel: %v", err)
+	}
+	if string(buf) != "pong" {
+		t.Fatalf("reverse tunnel payload = %q, want pong", buf)
+	}
+
+	if err := serverConn.Close(); err != nil {
+		t.Fatalf("close hijacked conn: %v", err)
+	}
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("drain shutdown: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("drain did not finish after hijacked connection closed")
+	}
+	waitForDemuxConnState(t, demux, 0, 0)
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Fatalf("serve error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for demux server to stop")
+	}
+}
+
+func TestInboundDemux_DrainClosesIdleHTTPKeepAlivePromptly(t *testing.T) {
+	idleCh := make(chan struct{}, 1)
+	httpServer := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}),
+		ConnState: func(_ net.Conn, state http.ConnState) {
+			if state == http.StateIdle {
+				select {
+				case idleCh <- struct{}{}:
+				default:
+				}
+			}
+		},
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	demux := newInboundDemuxServer(httpServer, &stubSocksHandler{})
+	errCh := make(chan error, 1)
+	go func() { errCh <- demux.Serve(ln) }()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial HTTP conn: %v", err)
+	}
+	defer clientConn.Close()
+	if _, err := io.WriteString(clientConn, "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n"); err != nil {
+		t.Fatalf("write HTTP request: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(clientConn), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatalf("read HTTP response: %v", err)
+	}
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("HTTP status: got %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+	_ = resp.Body.Close()
+	waitForDemuxConnState(t, demux, 1, 0)
+	select {
+	case <-idleCh:
+	case <-time.After(time.Second):
+		t.Fatal("HTTP connection did not become idle")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	started := time.Now()
+	if err := demux.Shutdown(ctx, true); err != nil {
+		t.Fatalf("drain shutdown: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("idle keep-alive delayed drain for %s", elapsed)
+	}
+
+	_ = clientConn.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 1)
+	if _, err := clientConn.Read(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("idle keep-alive should close during drain, got %v", err)
+	}
+	waitForDemuxConnState(t, demux, 0, 0)
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Fatalf("serve error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for demux server to stop")
+	}
+}
+
+func TestInboundDemux_DrainTimeoutLeavesActiveConnectionOpen(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	demux := newInboundDemuxServer(&http.Server{Handler: http.NotFoundHandler()}, &stubSocksHandler{})
+	errCh := make(chan error, 1)
+	go func() { errCh <- demux.Serve(ln) }()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientConn.Close()
+	waitForDemuxConnState(t, demux, 1, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if err := demux.Shutdown(ctx, true); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("drain timeout error = %v, want context deadline exceeded", err)
+	}
+	if _, err := clientConn.Write([]byte{0x05}); err != nil {
+		t.Fatalf("preserved connection was closed on drain timeout: %v", err)
+	}
+	if err := clientConn.Close(); err != nil {
+		t.Fatalf("close preserved connection: %v", err)
+	}
 	select {
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -783,7 +1025,7 @@ func TestInboundDemux_RoutesSocks5ByFirstByte(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := demux.Shutdown(ctx); err != nil {
+	if err := demux.Shutdown(ctx, false); err != nil {
 		t.Fatalf("shutdown: %v", err)
 	}
 
@@ -847,7 +1089,7 @@ func TestInboundDemux_PreservesHTTPFirstByteAfterPeek(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := demux.Shutdown(ctx); err != nil {
+	if err := demux.Shutdown(ctx, false); err != nil {
 		t.Fatalf("shutdown: %v", err)
 	}
 
@@ -900,7 +1142,7 @@ func TestInboundDemux_TryStartConnWorkerStopsOnceShutdownBegins(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		shutdownDone <- demux.Shutdown(ctx)
+		shutdownDone <- demux.Shutdown(ctx, false)
 	}()
 
 	select {

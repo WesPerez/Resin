@@ -1,6 +1,7 @@
 package state
 
 import (
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -19,9 +20,13 @@ type CacheFlushWorker struct {
 	intervalFn  func() time.Duration
 	checkTick   time.Duration // how often to check conditions
 
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
-	stopOnce sync.Once
+	stopCh      chan struct{}
+	wg          sync.WaitGroup
+	stopOnce    sync.Once
+	lifecycleMu sync.Mutex
+	flushMu     sync.Mutex
+	started     bool
+	stopped     bool
 }
 
 // NewCacheFlushWorker creates a flush worker that pulls threshold/interval
@@ -56,6 +61,12 @@ func NewCacheFlushWorker(
 
 // Start launches the background flush goroutine.
 func (w *CacheFlushWorker) Start() {
+	w.lifecycleMu.Lock()
+	defer w.lifecycleMu.Unlock()
+	if w.started || w.stopped {
+		return
+	}
+	w.started = true
 	w.wg.Add(1)
 	go w.run()
 }
@@ -63,8 +74,28 @@ func (w *CacheFlushWorker) Start() {
 // Stop signals the worker to stop and performs a final flush.
 // Blocks until the goroutine exits.
 func (w *CacheFlushWorker) Stop() {
+	if err := w.StopAndFlush(); err != nil {
+		log.Printf("[state] final flush error: %v", err)
+	}
+}
+
+// StopAndFlush stops the periodic writer, then performs an error-returning
+// final transaction. Callers MUST first stop and join all mutation sources;
+// this is not a write barrier for the router, API or asynchronous callbacks.
+// A successful retry supersedes an earlier periodic flush failure.
+func (w *CacheFlushWorker) StopAndFlush() error {
+	w.lifecycleMu.Lock()
+	defer w.lifecycleMu.Unlock()
+	w.stopped = true
 	w.stopOnce.Do(func() { close(w.stopCh) })
 	w.wg.Wait()
+	if err := w.flush(); err != nil {
+		return err
+	}
+	if pending := w.engine.DirtyCount(); pending != 0 {
+		return fmt.Errorf("state: final flush left %d dirty entries; mutation sources are not quiescent", pending)
+	}
+	return nil
 }
 
 func (w *CacheFlushWorker) run() {
@@ -78,8 +109,7 @@ func (w *CacheFlushWorker) run() {
 	for {
 		select {
 		case <-w.stopCh:
-			// Final flush before exit.
-			w.doFlush()
+			// Only StopAndFlush owns the final transaction and its error.
 			return
 		case <-ticker.C:
 			dirty := w.engine.DirtyCount()
@@ -98,7 +128,13 @@ func (w *CacheFlushWorker) run() {
 }
 
 func (w *CacheFlushWorker) doFlush() {
-	if err := w.engine.FlushDirtySets(w.readers); err != nil {
+	if err := w.flush(); err != nil {
 		log.Printf("[state] flush error (entries re-merged): %v", err)
 	}
+}
+
+func (w *CacheFlushWorker) flush() error {
+	w.flushMu.Lock()
+	defer w.flushMu.Unlock()
+	return w.engine.FlushDirtySets(w.readers)
 }
